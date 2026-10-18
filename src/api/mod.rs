@@ -333,7 +333,13 @@ async fn api_frame_handler(
 ) -> Response {
     let source = if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+        // Wait up to 3 seconds for tracks to be populated if just starting
+        for _ in 0..30 {
+            if !stream.get_tracks().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
         format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, query.src)
     } else {
         query.src.clone()
@@ -364,8 +370,13 @@ async fn api_webrtc_handler(
 ) -> Response {
     if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        // Wait a brief moment for producer RTSP handshake to complete if just started
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        // Wait up to 3 seconds for producer to establish RTSP recording if starting
+        for _ in 0..30 {
+            if !stream.get_tracks().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
 
         match state.webrtc.handle_whep(stream, &body).await {
             Ok(answer_sdp) => (

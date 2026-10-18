@@ -244,7 +244,14 @@ impl FfmpegManager {
         cmd.args(["-hide_banner", "-v", "error"]);
 
         if resolved.starts_with("rtsp://") {
-            cmd.args(["-rtsp_transport", "tcp"]);
+            cmd.args([
+                "-fflags",
+                "nobuffer",
+                "-flags",
+                "low_delay",
+                "-rtsp_transport",
+                "tcp",
+            ]);
         }
 
         cmd.args(["-i", &resolved, "-vframes", "1", "-f", "image2", "-c:v", "mjpeg", "-"]);
@@ -256,7 +263,11 @@ impl FfmpegManager {
         let mut stdout = child.stdout.take().context("No stdout")?;
         let mut buffer = Vec::new();
 
-        stdout.read_to_end(&mut buffer).await?;
+        let read_res = tokio::time::timeout(tokio::time::Duration::from_secs(12), stdout.read_to_end(&mut buffer)).await;
+        if read_res.is_err() {
+            let _ = child.kill().await;
+            bail!("FFmpeg snapshot timed out");
+        }
         let status = child.wait().await?;
 
         if !status.success() || buffer.is_empty() {
