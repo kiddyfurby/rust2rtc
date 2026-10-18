@@ -245,12 +245,10 @@ impl FfmpegManager {
 
         if resolved.starts_with("rtsp://") {
             cmd.args([
-                "-fflags",
-                "nobuffer",
-                "-flags",
-                "low_delay",
                 "-rtsp_transport",
                 "tcp",
+                "-skip_frame",
+                "nokey",
             ]);
         }
 
