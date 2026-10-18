@@ -376,45 +376,112 @@ fn extract_stream_name(path: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TrackDraft {
+    kind: MediaKind,
+    pt: u8,
+    name: String,
+    clock_rate: u32,
+    channels: Option<u8>,
+    fmtp: Option<String>,
+}
+
+impl TrackDraft {
+    fn new(kind: MediaKind, pt: u8) -> Self {
+        let (name, clock_rate, channels) = match (kind, pt) {
+            (MediaKind::Audio, 0) => ("PCMU".to_string(), 8000, Some(1)),
+            (MediaKind::Audio, 8) => ("PCMA".to_string(), 8000, Some(1)),
+            (MediaKind::Audio, 111) => ("OPUS".to_string(), 48000, Some(2)),
+            (MediaKind::Audio, _) => ("PCMA".to_string(), 8000, Some(1)),
+            (MediaKind::Video, 96) => ("H264".to_string(), 90000, None),
+            (MediaKind::Video, _) => ("H264".to_string(), 90000, None),
+        };
+
+        Self {
+            kind,
+            pt,
+            name,
+            clock_rate,
+            channels,
+            fmtp: None,
+        }
+    }
+
+    fn to_track(&self) -> Arc<Track> {
+        let codec = Codec {
+            name: self.name.to_uppercase(),
+            clock_rate: self.clock_rate,
+            channels: self.channels,
+            payload_type: self.pt,
+            fmtp: self.fmtp.clone(),
+        };
+        let cap = if self.kind == MediaKind::Video { 2048 } else { 256 };
+        Arc::new(Track::new(codec, self.kind, cap))
+    }
+}
+
 /// Simple parser for SDP payload types and tracks
 fn parse_sdp_tracks(sdp: &str) -> Vec<Arc<Track>> {
     let mut tracks = Vec::new();
-    let mut current_kind = MediaKind::Video;
-    let mut current_pt = 96u8;
+    let mut current_draft: Option<TrackDraft> = None;
 
     for line in sdp.lines() {
         let line = line.trim();
         if let Some(m) = line.strip_prefix("m=") {
+            if let Some(draft) = current_draft.take() {
+                tracks.push(draft.to_track());
+            }
+
             let parts: Vec<&str> = m.split_whitespace().collect();
             if !parts.is_empty() {
-                current_kind = match parts[0] {
+                let kind = match parts[0] {
                     "audio" => MediaKind::Audio,
                     _ => MediaKind::Video,
                 };
-                if parts.len() >= 4 {
-                    current_pt = parts[3].parse::<u8>().unwrap_or(96);
-                }
+                let pt = if parts.len() >= 4 {
+                    parts[3].parse::<u8>().unwrap_or(96)
+                } else {
+                    96
+                };
+                current_draft = Some(TrackDraft::new(kind, pt));
             }
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             // e.g. a=rtpmap:96 H264/90000
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
             if parts.len() >= 2 {
-                let pt = parts[0].parse::<u8>().unwrap_or(current_pt);
-                let (name, rate_chan) = parts[1].split_once('/').unwrap_or((parts[1], "90000"));
-                let rate = rate_chan.split('/').next().unwrap_or("90000").parse::<u32>().unwrap_or(90000);
+                if let Ok(pt) = parts[0].parse::<u8>() {
+                    let (name, rate_chan) = parts[1].split_once('/').unwrap_or((parts[1], "90000"));
+                    let rate = rate_chan.split('/').next().unwrap_or("90000").parse::<u32>().unwrap_or(90000);
+                    let chan = rate_chan.split('/').nth(1).and_then(|c| c.parse::<u8>().ok());
 
-                let codec = Codec {
-                    name: name.to_uppercase(),
-                    clock_rate: rate,
-                    channels: if current_kind == MediaKind::Audio { Some(1) } else { None },
-                    payload_type: pt,
-                    fmtp: None,
-                };
-
-                let cap = if current_kind == MediaKind::Video { 2048 } else { 256 };
-                tracks.push(Arc::new(Track::new(codec, current_kind, cap)));
+                    if let Some(ref mut draft) = current_draft {
+                        if draft.pt == pt || draft.name.is_empty() {
+                            draft.pt = pt;
+                            draft.name = name.to_uppercase();
+                            draft.clock_rate = rate;
+                            if draft.kind == MediaKind::Audio {
+                                draft.channels = Some(chan.unwrap_or(1));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(fmtp) = line.strip_prefix("a=fmtp:") {
+            // e.g. a=fmtp:96 sprop-vps=...; sprop-sps=...
+            if let Some((pt_str, params)) = fmtp.split_once(' ') {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    if let Some(ref mut draft) = current_draft {
+                        if draft.pt == pt {
+                            draft.fmtp = Some(params.trim().to_string());
+                        }
+                    }
+                }
             }
         }
+    }
+
+    if let Some(draft) = current_draft.take() {
+        tracks.push(draft.to_track());
     }
 
     if tracks.is_empty() {
