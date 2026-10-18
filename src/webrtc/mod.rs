@@ -78,6 +78,23 @@ impl WebRtcManager {
             RtpCodecKind::Video,
         )?;
 
+        let h265_codec = RTCRtpCodec {
+            mime_type: rtc::peer_connection::configuration::media_engine::MIME_TYPE_HEVC.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line: "".to_owned(),
+            rtcp_feedback: vec![],
+        };
+
+        media_engine.register_codec(
+            rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                rtp_codec: h265_codec.clone(),
+                payload_type: 98,
+                ..Default::default()
+            },
+            RtpCodecKind::Video,
+        )?;
+
         let opus_codec = RTCRtpCodec {
             mime_type: MIME_TYPE_OPUS.to_owned(),
             clock_rate: 48000,
@@ -133,8 +150,33 @@ impl WebRtcManager {
             .await?;
 
         let tracks = stream.get_tracks().await;
+        let is_stream_hevc = tracks.iter().any(|t| {
+            t.kind == MediaKind::Video
+                && (t.codec.name.to_uppercase().contains("265")
+                    || t.codec.name.to_uppercase().contains("HEVC"))
+        });
+
+        let offer_upper = offer_sdp.to_uppercase();
+        let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
+
+        if is_stream_hevc && !offer_has_hevc {
+            anyhow::bail!(
+                "Camera stream is H.265 (HEVC), but this browser's WebRTC engine does not support H.265. Use Safari or view the H.264 sub-stream ({}_sub)",
+                stream.name
+            );
+        }
+
         for track in tracks {
             if track.kind == MediaKind::Video {
+                let is_hevc = track.codec.name.to_uppercase().contains("265")
+                    || track.codec.name.to_uppercase().contains("HEVC");
+
+                let (video_codec, payload_type) = if is_hevc {
+                    (h265_codec.clone(), 98)
+                } else {
+                    (h264_codec.clone(), 96)
+                };
+
                 let video_ssrc = crate::core::generate_id();
                 let video_track: Arc<TrackLocalStaticRTP> =
                     Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
@@ -147,7 +189,7 @@ impl WebRtcManager {
                                 ssrc: Some(video_ssrc),
                                 ..Default::default()
                             },
-                            codec: h264_codec.clone(),
+                            codec: video_codec,
                             ..Default::default()
                         }],
                     )));
@@ -164,6 +206,7 @@ impl WebRtcManager {
                         let mut bytes = BytesMut::from(&packet.raw[..]);
                         if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
                             rtp_pkt.header.ssrc = video_ssrc;
+                            rtp_pkt.header.payload_type = payload_type;
                             if vtrack.write_rtp(rtp_pkt).await.is_err() {
                                 break;
                             }

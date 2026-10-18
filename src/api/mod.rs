@@ -189,8 +189,23 @@ async fn index_handler() -> Html<&'static str> {
                 });
                 activePeerConnections.set(streamName, pc);
 
-                pc.addTransceiver('video', { direction: 'recvonly' });
+                const vTrans = pc.addTransceiver('video', { direction: 'recvonly' });
                 pc.addTransceiver('audio', { direction: 'recvonly' });
+
+                if (window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities) {
+                    const caps = RTCRtpReceiver.getCapabilities('video');
+                    if (caps && caps.codecs) {
+                        const hasH265 = caps.codecs.some(c => c.mimeType.toLowerCase().includes('h265') || c.mimeType.toLowerCase().includes('hevc'));
+                        if (hasH265) {
+                            const sorted = caps.codecs.slice().sort((a, b) => {
+                                const aH = a.mimeType.toLowerCase().includes('h265') || a.mimeType.toLowerCase().includes('hevc');
+                                const bH = b.mimeType.toLowerCase().includes('h265') || b.mimeType.toLowerCase().includes('hevc');
+                                return (bH ? 1 : 0) - (aH ? 1 : 0);
+                            });
+                            try { vTrans.setCodecPreferences(sorted); } catch (e) { console.warn(e); }
+                        }
+                    }
+                }
 
                 pc.ontrack = (event) => {
                     if (event.streams && event.streams[0]) {
