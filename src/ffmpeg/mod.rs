@@ -238,18 +238,23 @@ impl FfmpegManager {
     }
 
     /// Generate a snapshot JPEG image for a given input source
-    pub async fn take_snapshot(&self, source: &str, rtsp_port: u16) -> Result<Bytes> {
+    pub async fn take_snapshot(&self, source: &str, rtsp_port: u16, is_hevc: bool) -> Result<Bytes> {
         let resolved = resolve_source(source, rtsp_port);
         let mut cmd = Command::new(&self.bin);
         cmd.args(["-hide_banner", "-v", "error"]);
 
         if resolved.starts_with("rtsp://") {
-            cmd.args([
-                "-rtsp_transport",
-                "tcp",
-                "-skip_frame",
-                "nokey",
-            ]);
+            cmd.args(["-rtsp_transport", "tcp"]);
+            if is_hevc {
+                cmd.args(["-skip_frame", "nokey"]);
+            } else {
+                cmd.args([
+                    "-fflags",
+                    "nobuffer",
+                    "-flags",
+                    "low_delay",
+                ]);
+            }
         }
 
         cmd.args(["-i", &resolved, "-vframes", "1", "-f", "image2", "-c:v", "mjpeg", "-"]);

@@ -331,7 +331,7 @@ async fn api_frame_handler(
     State(state): State<AppState>,
     Query(query): Query<FrameQuery>,
 ) -> Response {
-    let source = if let Some(stream) = state.streams.get(&query.src).await {
+    let (source, is_hevc) = if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
         // Wait up to 3 seconds for tracks to be populated if just starting
         for _ in 0..30 {
@@ -340,12 +340,18 @@ async fn api_frame_handler(
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
-        format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, query.src)
+        let tracks = stream.get_tracks().await;
+        let is_hevc = tracks.iter().any(|t| {
+            t.kind == crate::core::MediaKind::Video
+                && (t.codec.name.to_uppercase().contains("265")
+                    || t.codec.name.to_uppercase().contains("HEVC"))
+        });
+        (format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, query.src), is_hevc)
     } else {
-        query.src.clone()
+        (query.src.clone(), false)
     };
 
-    match state.ffmpeg.take_snapshot(&source, state.rtsp_port).await {
+    match state.ffmpeg.take_snapshot(&source, state.rtsp_port, is_hevc).await {
         Ok(jpeg_bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "image/jpeg")],
