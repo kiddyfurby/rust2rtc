@@ -1,9 +1,10 @@
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
+use crate::webrtc::WebRtcManager;
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use tracing::error;
 pub struct AppState {
     pub streams: Arc<StreamManager>,
     pub ffmpeg: Arc<FfmpegManager>,
+    pub webrtc: Arc<WebRtcManager>,
     pub rtsp_port: u16,
 }
 
@@ -29,6 +31,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/streams", get(api_streams_handler))
         .route("/api/ffmpeg", get(api_ffmpeg_handler))
         .route("/api/frame.jpeg", get(api_frame_handler))
+        .route("/api/webrtc", post(api_webrtc_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -76,7 +79,7 @@ async fn index_handler() -> Html<&'static str> {
         }
         .stream-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
             gap: 20px;
         }
         .card {
@@ -102,14 +105,14 @@ async fn index_handler() -> Html<&'static str> {
         }
         .preview {
             width: 100%;
-            height: 180px;
+            height: 200px;
             background: #000;
             display: flex;
             align-items: center;
             justify-content: center;
             position: relative;
         }
-        .preview img {
+        .preview img, .preview video {
             width: 100%;
             height: 100%;
             object-fit: cover;
@@ -131,19 +134,29 @@ async fn index_handler() -> Html<&'static str> {
         .links {
             margin-top: 12px;
             display: flex;
+            flex-wrap: wrap;
             gap: 8px;
         }
-        a.btn {
+        a.btn, button.btn {
             background: #21262d;
             border: 1px solid var(--border);
             color: var(--accent);
             text-decoration: none;
-            padding: 6px 10px;
+            padding: 6px 12px;
             border-radius: 6px;
             font-size: 12px;
+            cursor: pointer;
         }
-        a.btn:hover {
+        a.btn:hover, button.btn:hover {
             background: #30363d;
+        }
+        button.btn-primary {
+            background: #238636;
+            color: #fff;
+            border-color: #2ea043;
+        }
+        button.btn-primary:hover {
+            background: #2ea043;
         }
     </style>
 </head>
@@ -151,7 +164,7 @@ async fn index_handler() -> Html<&'static str> {
     <header>
         <div>
             <h1>🦀 rust2rtc</h1>
-            <div style="font-size: 13px; color: #8b949e; margin-top: 4px;">Zero-copy streaming server & external FFmpeg runner in Rust</div>
+            <div style="font-size: 13px; color: #8b949e; margin-top: 4px;">High-Performance WebRTC & RTSP Media Gateway in Rust</div>
         </div>
         <div id="status" class="tag">Active</div>
     </header>
@@ -159,36 +172,118 @@ async fn index_handler() -> Html<&'static str> {
     <div id="streams" class="stream-grid">Loading streams...</div>
 
     <script>
+        const activePeerConnections = new Map();
+
+        async function playWebRtc(streamName, previewEl) {
+            try {
+                if (activePeerConnections.has(streamName)) {
+                    activePeerConnections.get(streamName).close();
+                    activePeerConnections.delete(streamName);
+                }
+
+                previewEl.innerHTML = '<video autoplay playsinline muted controls style="width:100%; height:100%; object-fit:cover;"></video>';
+                const videoEl = previewEl.querySelector('video');
+
+                const pc = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+                activePeerConnections.set(streamName, pc);
+
+                pc.addTransceiver('video', { direction: 'recvonly' });
+                pc.addTransceiver('audio', { direction: 'recvonly' });
+
+                pc.ontrack = (event) => {
+                    if (event.streams && event.streams[0]) {
+                        videoEl.srcObject = event.streams[0];
+                    } else {
+                        const inboundStream = new MediaStream();
+                        inboundStream.addTrack(event.track);
+                        videoEl.srcObject = inboundStream;
+                    }
+                    videoEl.play().catch(e => console.warn('Autoplay prevented:', e));
+                };
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                await new Promise(resolve => {
+                    if (pc.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        const check = () => {
+                            if (pc.iceGatheringState === 'complete') {
+                                pc.removeEventListener('icegatheringstatechange', check);
+                                resolve();
+                            }
+                        };
+                        pc.addEventListener('icegatheringstatechange', check);
+                        setTimeout(resolve, 800);
+                    }
+                });
+
+                const res = await fetch(`/api/webrtc?src=${encodeURIComponent(streamName)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/sdp' },
+                    body: pc.localDescription.sdp
+                });
+
+                if (!res.ok) {
+                    throw new Error(`WHEP error ${res.status}: ${await res.text()}`);
+                }
+
+                const answerSdp = await res.text();
+                await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+            } catch (err) {
+                console.error(err);
+                previewEl.innerHTML = `<div style="color:#f85149; padding:12px; font-size:12px;">WebRTC Error: ${err.message}</div>`;
+            }
+        }
+
         async function loadStreams() {
             try {
                 const res = await fetch('/api/streams');
                 const streams = await res.json();
                 const container = document.getElementById('streams');
                 if (streams.length === 0) {
-                    container.innerHTML = '<div style="color: #8b949e">No streams configured. Add them to rust2rtc.yaml</div>';
+                    container.innerHTML = '<div style="color: #8b949e">No streams configured.</div>';
+                    return;
+                }
+
+                // If already initialized cards, only update dynamic numbers to avoid resetting active video players
+                if (container.querySelectorAll('.card').length === streams.length) {
+                    streams.forEach(s => {
+                        const metaEl = document.getElementById(`meta-${s.name}`);
+                        if (metaEl) {
+                            metaEl.innerHTML = `
+                                <div>Consumers: <b>${s.consumers}</b></div>
+                                <div>Packets: <b>${s.packets_recv}</b> | Bytes: <b>${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</b></div>
+                            `;
+                        }
+                    });
                     return;
                 }
 
                 container.innerHTML = streams.map(s => {
                     const tracksHtml = s.tracks.map(t => `<span class="badge">${t.kind}: ${t.codec}</span>`).join(' ');
                     return `
-                    <div class="card">
+                    <div class="card" id="card-${s.name}">
                         <div class="card-header">
                             <span>${s.name}</span>
                             <span class="badge" style="background: ${s.active ? '#238636' : '#6e7681'}">${s.active ? 'LIVE' : 'IDLE'}</span>
                         </div>
-                        <div class="preview">
+                        <div class="preview" id="preview-${s.name}">
                             <img src="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" onerror="this.style.display='none'" alt="Snapshot" />
                         </div>
                         <div class="card-body">
                             <div>${tracksHtml || '<span class="badge">on-demand</span>'}</div>
-                            <div class="meta">
+                            <div class="meta" id="meta-${s.name}">
                                 <div>Consumers: <b>${s.consumers}</b></div>
                                 <div>Packets: <b>${s.packets_recv}</b> | Bytes: <b>${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</b></div>
                             </div>
                             <div class="links">
+                                <button class="btn btn-primary" onclick="playWebRtc('${s.name}', document.getElementById('preview-${s.name}'))">▶ WebRTC Live</button>
                                 <a class="btn" href="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" target="_blank">Snapshot</a>
-                                <a class="btn" href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP Stream</a>
+                                <a class="btn" href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP</a>
                             </div>
                         </div>
                     </div>
@@ -221,7 +316,6 @@ async fn api_frame_handler(
     State(state): State<AppState>,
     Query(query): Query<FrameQuery>,
 ) -> Response {
-    // If query.src is configured stream name, ensure started and snapshot from loopback RTSP
     let source = if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
@@ -245,5 +339,39 @@ async fn api_frame_handler(
             )
                 .into_response()
         }
+    }
+}
+
+async fn api_webrtc_handler(
+    State(state): State<AppState>,
+    Query(query): Query<FrameQuery>,
+    body: String,
+) -> Response {
+    if let Some(stream) = state.streams.get(&query.src).await {
+        let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
+        // Wait a brief moment for producer RTSP handshake to complete if just started
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        match state.webrtc.handle_whep(stream, &body).await {
+            Ok(answer_sdp) => (
+                StatusCode::CREATED,
+                [
+                    (header::CONTENT_TYPE, "application/sdp"),
+                    (header::LOCATION, "/api/webrtc"),
+                ],
+                answer_sdp,
+            )
+                .into_response(),
+            Err(e) => {
+                error!("WebRTC WHEP error: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("WebRTC error: {}", e),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        (StatusCode::NOT_FOUND, "Stream not found").into_response()
     }
 }

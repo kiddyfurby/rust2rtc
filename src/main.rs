@@ -4,6 +4,7 @@ mod core;
 mod ffmpeg;
 mod rtsp;
 mod streams;
+mod webrtc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -107,9 +108,18 @@ async fn main() -> Result<()> {
         config.api.listen.clone()
     };
 
+    let webrtc_candidates = config
+        .webrtc
+        .as_ref()
+        .map(|w| w.candidates.clone())
+        .unwrap_or_default();
+
+    let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(webrtc_candidates));
+
     let app_state = api::AppState {
         streams: Arc::clone(&stream_manager),
         ffmpeg: Arc::clone(&ffmpeg_manager),
+        webrtc: Arc::clone(&webrtc_manager),
         rtsp_port,
     };
 
