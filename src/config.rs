@@ -12,6 +12,14 @@ pub struct Config {
     pub rtsp: RtspConfig,
     #[serde(default)]
     pub ffmpeg: FfmpegConfig,
+    #[serde(default)]
+    pub webrtc: Option<WebRtcConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebRtcConfig {
+    #[serde(default)]
+    pub candidates: Vec<String>,
 }
 
 impl Default for Config {
@@ -21,6 +29,7 @@ impl Default for Config {
             api: ApiConfig::default(),
             rtsp: RtspConfig::default(),
             ffmpeg: FfmpegConfig::default(),
+            webrtc: None,
         }
     }
 }

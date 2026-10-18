@@ -230,7 +230,7 @@ async fn api_frame_handler(
         query.src.clone()
     };
 
-    match state.ffmpeg.take_snapshot(&source).await {
+    match state.ffmpeg.take_snapshot(&source, state.rtsp_port).await {
         Ok(jpeg_bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "image/jpeg")],
