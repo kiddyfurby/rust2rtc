@@ -1,0 +1,426 @@
+#![allow(dead_code)]
+
+use crate::core::{Codec, MediaKind, RtpPacket, Track};
+use crate::streams::StreamManager;
+use anyhow::{bail, Context, Result};
+use bytes::{Buf, Bytes, BytesMut};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tracing::{debug, error, info, trace, warn};
+
+#[derive(Debug, Clone)]
+pub struct RtspRequest {
+    pub method: String,
+    pub uri: String,
+    pub path: String,
+    pub headers: HashMap<String, String>,
+    pub body: Bytes,
+}
+
+impl RtspRequest {
+    pub fn cseq(&self) -> &str {
+        self.headers.get("cseq").map(|s| s.as_str()).unwrap_or("0")
+    }
+}
+
+pub struct RtspServer {
+    listen_addr: String,
+    streams: Arc<StreamManager>,
+}
+
+impl RtspServer {
+    pub fn new(listen_addr: String, streams: Arc<StreamManager>) -> Self {
+        Self {
+            listen_addr,
+            streams,
+        }
+    }
+
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        let listener = TcpListener::bind(&self.listen_addr)
+            .await
+            .with_context(|| format!("Failed to bind RTSP on {}", self.listen_addr))?;
+
+        info!("RTSP server listening on {}", self.listen_addr);
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, remote_addr)) => {
+                    let server = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.handle_connection(stream, remote_addr).await {
+                            trace!(remote = %remote_addr, "RTSP connection closed: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("RTSP accept error: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn handle_connection(
+        &self,
+        mut stream: TcpStream,
+        _remote_addr: SocketAddr,
+    ) -> Result<()> {
+        let mut buffer = BytesMut::with_capacity(8192);
+        let session_id = "12345678";
+        let mut _active_stream_id: Option<String> = None;
+        let mut _is_publisher = false;
+        let mut track_channels: HashMap<u8, Arc<Track>> = HashMap::new();
+
+        loop {
+            // Check if buffer contains interleaved binary packet ($)
+            if !buffer.is_empty() && buffer[0] == b'$' {
+                if buffer.len() < 4 {
+                    let n = stream.read_buf(&mut buffer).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                let _channel = buffer[1];
+                let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
+
+                if buffer.len() < 4 + length {
+                    let n = stream.read_buf(&mut buffer).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    continue;
+                }
+
+                // Consume packet
+                let _dollar = buffer.get_u8();
+                let ch = buffer.get_u8();
+                let _len = buffer.get_u16();
+                let packet_bytes = buffer.split_to(length).freeze();
+
+                // Channel % 2 == 0 is RTP (channel + 1 is RTCP)
+                if ch % 2 == 0 {
+                    if let Some(track) = track_channels.get(&ch) {
+                        if let Some(rtp) = RtpPacket::parse(packet_bytes) {
+                            track.send(rtp);
+                        } else {
+                            trace!(ch = ch, len = length, "RtpPacket parse returned None");
+                        }
+                    } else {
+                        trace!(ch = ch, "No track channel found for ch");
+                    }
+                }
+                continue;
+            }
+
+            // Otherwise, read RTSP text request header
+            if let Some(pos) = find_crlf_crlf(&buffer) {
+                let header_bytes = buffer.split_to(pos + 4);
+                let (method, uri, path, headers) = parse_rtsp_headers(&header_bytes)?;
+
+                let content_length = headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+
+                while buffer.len() < content_length {
+                    let n = stream.read_buf(&mut buffer).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                }
+
+                let body = buffer.split_to(content_length).freeze();
+                let req = RtspRequest {
+                    method: method.clone(),
+                    uri,
+                    path: path.clone(),
+                    headers,
+                    body,
+                };
+
+                let stream_id = extract_stream_name(&path);
+                _active_stream_id = Some(stream_id.clone());
+
+                match method.as_str() {
+                    "OPTIONS" => {
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\
+                            Public: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, TEARDOWN\r\n\r\n",
+                            req.cseq()
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                    }
+                    "ANNOUNCE" => {
+                        _is_publisher = true;
+                        info!(stream = %stream_id, "RTSP publisher announced (FFmpeg/producer)");
+
+                        // Parse SDP from announce body
+                        let sdp_str = String::from_utf8_lossy(&req.body);
+                        debug!(sdp = %sdp_str, "Received SDP on ANNOUNCE");
+                        let tracks = parse_sdp_tracks(&sdp_str);
+
+                        let stream_obj = self.streams.get_or_create(&stream_id).await;
+                        stream_obj.clear_tracks().await;
+
+                        for (idx, track) in tracks.into_iter().enumerate() {
+                            let ch = (idx * 2) as u8;
+                            track_channels.insert(ch, Arc::clone(&track));
+                            stream_obj.add_track(track).await;
+                        }
+
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\r\n",
+                            req.cseq()
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                    }
+                    "DESCRIBE" => {
+                        // RTSP Consumer asking for stream SDP
+                        let stream_obj = self.streams.get_or_create(&stream_id).await;
+                        let sdp = stream_obj.generate_sdp(&self.listen_addr).await;
+
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\
+                            Content-Type: application/sdp\r\n\
+                            Content-Length: {}\r\n\r\n\
+                            {}",
+                            req.cseq(),
+                            sdp.len(),
+                            sdp
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                    }
+                    "SETUP" => {
+                        let transport = req
+                            .headers
+                            .get("transport")
+                            .cloned()
+                            .unwrap_or_else(|| "RTP/AVP/TCP;unicast;interleaved=0-1".to_string());
+
+                        // Map requested interleaved channels to track
+                        if let Some(pos) = transport.find("interleaved=") {
+                            let after = &transport[pos + 12..];
+                            let chan_str = after.split(['-', ';', ',']).next().unwrap_or("0");
+                            if let Ok(ch) = chan_str.parse::<u8>() {
+                                let stream_obj = self.streams.get_or_create(&stream_id).await;
+                                let tracks = stream_obj.get_tracks().await;
+                                let track_idx = (ch / 2) as usize;
+                                if let Some(track) = tracks.get(track_idx) {
+                                    track_channels.insert(ch, Arc::clone(track));
+                                }
+                            }
+                        }
+
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\
+                            Session: {}\r\n\
+                            Transport: {}\r\n\r\n",
+                            req.cseq(),
+                            session_id,
+                            transport
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                    }
+                    "RECORD" => {
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\
+                            Session: {}\r\n\r\n",
+                            req.cseq(),
+                            session_id
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                        info!(stream = %stream_id, "RTSP publisher recording started");
+                    }
+                    "PLAY" => {
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\
+                            Session: {}\r\n\
+                            Range: npt=0.000-\r\n\r\n",
+                            req.cseq(),
+                            session_id
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+
+                        // Spawn task to stream RTP to this consumer
+                        let stream_obj = self.streams.get_or_create(&stream_id).await;
+                        let tracks = stream_obj.get_tracks().await;
+
+                        if let Some(video_track) = tracks.first() {
+                            let mut rx = video_track.subscribe();
+                            let (mut reader, mut writer) = stream.into_split();
+
+                            tokio::spawn(async move {
+                                while let Ok(packet) = rx.recv().await {
+                                    let mut header = [0u8; 4];
+                                    header[0] = b'$';
+                                    header[1] = 0; // channel 0
+                                    let len = packet.raw.len() as u16;
+                                    header[2..4].copy_from_slice(&len.to_be_bytes());
+
+                                    if writer.write_all(&header).await.is_err() {
+                                        break;
+                                    }
+                                    if writer.write_all(&packet.raw).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+
+                            // Keep reading to handle TEARDOWN
+                            let mut dummy = [0u8; 1024];
+                            while let Ok(n) = reader.read(&mut dummy).await {
+                                if n == 0 {
+                                    break;
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    "TEARDOWN" => {
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\r\n",
+                            req.cseq()
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                        return Ok(());
+                    }
+                    _ => {
+                        warn!("Unhandled RTSP method: {}", method);
+                    }
+                }
+            } else {
+                let n = stream.read_buf(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn parse_rtsp_headers(raw: &[u8]) -> Result<(String, String, String, HashMap<String, String>)> {
+    let text = std::str::from_utf8(raw)?;
+    let mut lines = text.lines();
+
+    let req_line = lines.next().context("Empty request line")?;
+    let parts: Vec<&str> = req_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        bail!("Malformed RTSP request line: {}", req_line);
+    }
+
+    let method = parts[0].to_uppercase();
+    let uri = parts[1].to_string();
+
+    let path = if let Ok(parsed_url) = url::Url::parse(&uri) {
+        parsed_url.path().to_string()
+    } else if let Some(idx) = uri.find("://") {
+        let after_scheme = &uri[idx + 3..];
+        if let Some(slash_idx) = after_scheme.find('/') {
+            after_scheme[slash_idx..].to_string()
+        } else {
+            "/".to_string()
+        }
+    } else {
+        uri.clone()
+    };
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+        }
+    }
+
+    Ok((method, uri, path, headers))
+}
+
+fn extract_stream_name(path: &str) -> String {
+    let clean = path.trim_matches('/');
+    if let Some((first, _)) = clean.split_once('/') {
+        first.to_string()
+    } else {
+        clean.to_string()
+    }
+}
+
+/// Simple parser for SDP payload types and tracks
+fn parse_sdp_tracks(sdp: &str) -> Vec<Arc<Track>> {
+    let mut tracks = Vec::new();
+    let mut current_kind = MediaKind::Video;
+    let mut current_pt = 96u8;
+
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(m) = line.strip_prefix("m=") {
+            let parts: Vec<&str> = m.split_whitespace().collect();
+            if !parts.is_empty() {
+                current_kind = match parts[0] {
+                    "audio" => MediaKind::Audio,
+                    _ => MediaKind::Video,
+                };
+                if parts.len() >= 4 {
+                    current_pt = parts[3].parse::<u8>().unwrap_or(96);
+                }
+            }
+        } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
+            // e.g. a=rtpmap:96 H264/90000
+            let parts: Vec<&str> = rtpmap.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let pt = parts[0].parse::<u8>().unwrap_or(current_pt);
+                let (name, rate_chan) = parts[1].split_once('/').unwrap_or((parts[1], "90000"));
+                let rate = rate_chan.split('/').next().unwrap_or("90000").parse::<u32>().unwrap_or(90000);
+
+                let codec = Codec {
+                    name: name.to_uppercase(),
+                    clock_rate: rate,
+                    channels: if current_kind == MediaKind::Audio { Some(1) } else { None },
+                    payload_type: pt,
+                    fmtp: None,
+                };
+
+                let cap = if current_kind == MediaKind::Video { 2048 } else { 256 };
+                tracks.push(Arc::new(Track::new(codec, current_kind, cap)));
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        // Fallback default H264 track
+        tracks.push(Arc::new(Track::new(Codec::new_h264(), MediaKind::Video, 2048)));
+    }
+
+    tracks
+}
