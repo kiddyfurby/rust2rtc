@@ -63,7 +63,11 @@ impl Stream {
             return Ok(());
         }
 
-        let source = &self.sources[0];
+        let source = self
+            .sources
+            .iter()
+            .find(|s| !s.starts_with("multitrans://") && !s.contains("#video=mjpeg"))
+            .unwrap_or(&self.sources[0]);
         info!(stream = %self.name, source = %source, "Starting on-demand producer");
 
         let (bin, args) = ffmpeg.build_command(source, rtsp_port, &self.name);

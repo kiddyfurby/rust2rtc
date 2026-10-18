@@ -57,6 +57,8 @@ impl FfmpegManager {
             return self.build_ffmpeg_url_args(ffmpeg_url, rtsp_port, stream_id);
         }
 
+        let resolved = resolve_source(source, rtsp_port);
+
         // Default RTSP or file remux: stream via ffmpeg into rtsp loopback
         let output_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_id);
         let args = vec![
@@ -66,7 +68,7 @@ impl FfmpegManager {
             "-rtsp_transport".to_string(),
             "tcp".to_string(),
             "-i".to_string(),
-            source.to_string(),
+            resolved,
             "-c".to_string(),
             "copy".to_string(),
             "-f".to_string(),
@@ -86,10 +88,12 @@ impl FfmpegManager {
             None => (url_str, None),
         };
 
+        let resolved_input = resolve_source(raw_input, rtsp_port);
+
         let mut args = vec!["-hide_banner".to_string(), "-v".to_string(), "warning".to_string()];
 
         // If input looks like RTSP, use TCP low delay
-        if raw_input.starts_with("rtsp://") {
+        if resolved_input.starts_with("rtsp://") {
             args.extend([
                 "-fflags".to_string(),
                 "nobuffer".to_string(),
@@ -100,7 +104,7 @@ impl FfmpegManager {
             ]);
         }
 
-        args.extend(["-i".to_string(), raw_input.to_string()]);
+        args.extend(["-i".to_string(), resolved_input]);
 
         let mut has_video = false;
         let mut has_audio = false;
@@ -133,6 +137,9 @@ impl FfmpegManager {
                                         "-tune".to_string(),
                                         "zerolatency".to_string(),
                                     ]);
+                                }
+                                "mjpeg" => {
+                                    args.extend(["-c:v".to_string(), "mjpeg".to_string()]);
                                 }
                                 "copy" => {
                                     args.extend(["-c:v".to_string(), "copy".to_string()]);
@@ -174,6 +181,12 @@ impl FfmpegManager {
                                     args.extend(["-c:a".to_string(), v.to_string()]);
                                 }
                             }
+                        }
+                        "raw" => {
+                            args.extend(shell_words(v));
+                        }
+                        "height" => {
+                            args.extend(["-vf".to_string(), format!("scale=-2:{}", v)]);
                         }
                         _ => {}
                     }
@@ -225,15 +238,16 @@ impl FfmpegManager {
     }
 
     /// Generate a snapshot JPEG image for a given input source
-    pub async fn take_snapshot(&self, source: &str) -> Result<Bytes> {
+    pub async fn take_snapshot(&self, source: &str, rtsp_port: u16) -> Result<Bytes> {
+        let resolved = resolve_source(source, rtsp_port);
         let mut cmd = Command::new(&self.bin);
         cmd.args(["-hide_banner", "-v", "error"]);
 
-        if source.starts_with("rtsp://") {
+        if resolved.starts_with("rtsp://") {
             cmd.args(["-rtsp_transport", "tcp"]);
         }
 
-        cmd.args(["-i", source, "-vframes", "1", "-f", "image2", "-c:v", "mjpeg", "-"]);
+        cmd.args(["-i", &resolved, "-vframes", "1", "-f", "image2", "-c:v", "mjpeg", "-"]);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -251,6 +265,31 @@ impl FfmpegManager {
 
         Ok(Bytes::from(buffer))
     }
+}
+
+pub fn resolve_source(source: &str, rtsp_port: u16) -> String {
+    if source.starts_with("onvif://") {
+        if let Ok(url) = url::Url::parse(source) {
+            let host = url.host_str().unwrap_or("127.0.0.1");
+            let user = url.username();
+            let pass = url.password().unwrap_or("");
+            return format!("rtsp://{}:{}@{}/Preview_01_main", user, pass, host);
+        }
+    }
+
+    if source.starts_with("tapo://") {
+        if let Ok(url) = url::Url::parse(source) {
+            let host = url.host_str().unwrap_or("127.0.0.1");
+            return format!("rtsp://frigate:REDACTED_PASSWORD@{}/stream1", host);
+        }
+    }
+
+    if !source.contains("://") && !source.starts_with("exec:") && !source.starts_with("ffmpeg:") {
+        // References another stream by name
+        return format!("rtsp://127.0.0.1:{}/{}", rtsp_port, source);
+    }
+
+    source.to_string()
 }
 
 /// Helper function to generate an MD5 stream hash path like go2rtc
