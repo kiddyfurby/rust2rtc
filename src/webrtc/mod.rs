@@ -258,10 +258,11 @@ impl WebRtcManager {
             );
         }
 
-        let mut video_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, bool, Option<Vec<u8>>, u8)> = None;
+        let mut video_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, bool, bool, Option<Vec<u8>>, u8)> = None;
+        let mut audio_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, u8)> = None;
 
-        for track in tracks {
-            if track.kind == MediaKind::Video {
+        for track in &tracks {
+            if track.kind == MediaKind::Video && video_track_info.is_none() {
                 let is_hevc = track.codec.name.to_uppercase().contains("265")
                     || track.codec.name.to_uppercase().contains("HEVC");
 
@@ -311,8 +312,42 @@ impl WebRtcManager {
                     None
                 };
 
-                video_track_info = Some((video_track, rx, video_ssrc, is_hevc, param_set_packet_payload, default_pt));
-                break;
+                video_track_info = Some((video_track, rx, video_ssrc, is_hevc, is_high, param_set_packet_payload, default_pt));
+            } else if track.kind == MediaKind::Audio && audio_track_info.is_none() {
+                let name = track.codec.name.to_uppercase();
+                let (audio_codec, default_pt) = if name.contains("OPUS") {
+                    (opus_codec.clone(), 111)
+                } else if name.contains("PCMU") {
+                    (pcmu_codec.clone(), 0)
+                } else {
+                    (pcma_codec.clone(), 8)
+                };
+
+                let audio_ssrc = crate::core::generate_id();
+                let audio_track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
+                    format!("stream-{}", stream.name),
+                    format!("audio-track-{}", stream.name),
+                    "audio".to_string(),
+                    RtpCodecKind::Audio,
+                    vec![RTCRtpEncodingParameters {
+                        rtp_coding_parameters: RTCRtpCodingParameters {
+                            ssrc: Some(audio_ssrc),
+                            ..Default::default()
+                        },
+                        codec: audio_codec,
+                        ..Default::default()
+                    }],
+                )));
+
+                if let Err(e) = peer_connection
+                    .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
+                    .await
+                {
+                    tracing::warn!("Failed to add audio track: {}", e);
+                } else {
+                    let rx = track.subscribe();
+                    audio_track_info = Some((audio_track, rx, audio_ssrc, default_pt));
+                }
             }
         }
 
@@ -334,17 +369,15 @@ impl WebRtcManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Failed to generate local SDP answer"))?;
 
-        // Determine the negotiated payload type from local SDP
-        let negotiated_pt = extract_negotiated_video_pt(&local_desc.sdp);
-
         // Spawn video RTP forwarder after the track is bound
-        if let Some((vtrack, mut rx, video_ssrc, is_hevc, param_set_payload, default_pt)) = video_track_info {
-            let actual_pt = negotiated_pt.unwrap_or(default_pt);
+        if let Some((vtrack, mut rx, video_ssrc, is_hevc, is_high, mut param_set_payload, default_pt)) = video_track_info {
+            let actual_pt = find_negotiated_video_pt(&local_desc.sdp, is_hevc, is_high, default_pt);
+            tracing::info!(stream = %stream.name, pt = actual_pt, is_hevc = is_hevc, "Starting WebRTC video forwarder");
 
             tokio::spawn(async move {
                 let mut seq: u16 = 0;
                 let mut sent_first_keyframe = false;
-                let mut drop_count = 0;
+                let mut last_was_param_set = false;
 
                 while let Ok(packet) = rx.recv().await {
                     let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
@@ -353,18 +386,23 @@ impl WebRtcManager {
                         continue;
                     };
 
-                    let keyframe = is_keyframe(is_hevc, payload_slice);
+                    let (is_keyframe, is_param_set) = is_keyframe_or_param_set(is_hevc, payload_slice);
+
+                    // Dynamically cache STAP-A parameter sets if seen in stream
+                    if is_param_set && !is_hevc && payload_slice[0] & 0x1F == 24 {
+                        param_set_payload = Some(payload_slice.to_vec());
+                    }
 
                     if !sent_first_keyframe {
-                        if !keyframe && drop_count < 90 {
-                            drop_count += 1;
+                        // Do not drop parameter sets or keyframes
+                        if !is_keyframe && !is_param_set {
                             continue;
                         }
                         sent_first_keyframe = true;
                     }
 
-                    // Before keyframes, inject the parameter sets packet (STAP-A / AP)
-                    if keyframe {
+                    // Before keyframes, inject the parameter sets packet (STAP-A / AP) if not immediately preceded by parameter sets
+                    if is_keyframe && !last_was_param_set {
                         if let Some(ref ps_bytes) = param_set_payload {
                             let ps_rtp = rtp::packet::Packet {
                                 header: rtp::header::Header {
@@ -373,6 +411,7 @@ impl WebRtcManager {
                                     sequence_number: seq,
                                     timestamp: packet.timestamp,
                                     ssrc: video_ssrc,
+                                    marker: false,
                                     ..Default::default()
                                 },
                                 payload: Bytes::copy_from_slice(ps_bytes),
@@ -381,6 +420,8 @@ impl WebRtcManager {
                             let _ = vtrack.write_rtp(ps_rtp).await;
                         }
                     }
+
+                    last_was_param_set = is_param_set;
 
                     let mut bytes = BytesMut::from(&packet.raw[..]);
                     if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
@@ -397,50 +438,143 @@ impl WebRtcManager {
             });
         }
 
+        // Spawn audio RTP forwarder if audio track was negotiated
+        if let Some((atrack, mut rx, audio_ssrc, default_pt)) = audio_track_info {
+            let actual_audio_pt = find_negotiated_audio_pt(&local_desc.sdp, default_pt);
+            tracing::info!(stream = %stream.name, pt = actual_audio_pt, "Starting WebRTC audio forwarder");
+
+            tokio::spawn(async move {
+                let mut seq: u16 = 0;
+                while let Ok(packet) = rx.recv().await {
+                    let mut bytes = BytesMut::from(&packet.raw[..]);
+                    if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
+                        rtp_pkt.header.ssrc = audio_ssrc;
+                        rtp_pkt.header.payload_type = actual_audio_pt;
+                        rtp_pkt.header.sequence_number = seq;
+                        seq = seq.wrapping_add(1);
+
+                        let _ = atrack.write_rtp(rtp_pkt).await;
+                    }
+                }
+            });
+        }
+
         Ok(local_desc.sdp)
     }
 }
 
-fn extract_negotiated_video_pt(sdp: &str) -> Option<u8> {
+fn find_negotiated_video_pt(sdp: &str, is_hevc: bool, is_high: bool, default_pt: u8) -> u8 {
+    let mut rtpmap = std::collections::HashMap::new();
+    let mut fmtp = std::collections::HashMap::new();
+
     for line in sdp.lines() {
         let line = line.trim();
-        if let Some(m) = line.strip_prefix("m=video ") {
-            let parts: Vec<&str> = m.split_whitespace().collect();
-            if parts.len() >= 3 {
-                return parts[2].parse::<u8>().ok();
+        if let Some(r) = line.strip_prefix("a=rtpmap:") {
+            if let Some((pt_str, rest)) = r.split_once(' ') {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    rtpmap.insert(pt, rest.to_uppercase());
+                }
+            }
+        } else if let Some(f) = line.strip_prefix("a=fmtp:") {
+            if let Some((pt_str, rest)) = f.split_once(' ') {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    fmtp.insert(pt, rest.to_string());
+                }
             }
         }
     }
-    None
+
+    if is_hevc {
+        for (&pt, name) in &rtpmap {
+            if name.contains("H265") || name.contains("HEVC") {
+                return pt;
+            }
+        }
+        return default_pt;
+    }
+
+    if is_high {
+        for (&pt, params) in &fmtp {
+            if params.contains("6400") {
+                return pt;
+            }
+        }
+    } else {
+        for (&pt, params) in &fmtp {
+            if params.contains("42") {
+                return pt;
+            }
+        }
+    }
+
+    for (&pt, name) in &rtpmap {
+        if name.contains("H264") {
+            return pt;
+        }
+    }
+
+    default_pt
 }
 
-fn is_keyframe(is_hevc: bool, payload: &[u8]) -> bool {
+fn find_negotiated_audio_pt(sdp: &str, default_pt: u8) -> u8 {
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(r) = line.strip_prefix("a=rtpmap:") {
+            if let Some((pt_str, rest)) = r.split_once(' ') {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    let upper = rest.to_uppercase();
+                    if default_pt == 111 && upper.contains("OPUS") {
+                        return pt;
+                    } else if default_pt == 8 && upper.contains("PCMA") {
+                        return pt;
+                    } else if default_pt == 0 && upper.contains("PCMU") {
+                        return pt;
+                    }
+                }
+            }
+        }
+    }
+    default_pt
+}
+
+fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
     if payload.is_empty() {
-        return false;
+        return (false, false);
     }
     if is_hevc {
         let nalu_type = (payload[0] >> 1) & 0x3F;
+        if nalu_type == 32 || nalu_type == 33 || nalu_type == 34 || nalu_type == 48 {
+            return (false, true); // VPS, SPS, PPS, or AP
+        }
         if (19..=21).contains(&nalu_type) {
-            return true;
+            return (true, false); // IDR / CRA
         }
         if nalu_type == 49 && payload.len() >= 3 {
             let start = (payload[2] & 0x80) != 0;
             let fu_type = payload[2] & 0x3F;
-            return start && (19..=21).contains(&fu_type);
+            if (19..=21).contains(&fu_type) {
+                return (start, false);
+            }
         }
     } else {
         let nalu_type = payload[0] & 0x1F;
+        if nalu_type == 7 || nalu_type == 8 || nalu_type == 24 {
+            return (false, true); // SPS, PPS, or STAP-A
+        }
         if nalu_type == 5 {
-            return true;
+            return (true, false); // IDR slice
         }
         if nalu_type == 28 && payload.len() >= 2 {
             let start = (payload[1] & 0x80) != 0;
             let fu_type = payload[1] & 0x1F;
-            return start && fu_type == 5;
+            if fu_type == 5 {
+                return (start, false);
+            }
         }
     }
-    false
+    (false, false)
 }
+
 
 pub fn extract_h264_sps_pps(fmtp: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
