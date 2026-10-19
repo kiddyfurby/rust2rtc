@@ -181,8 +181,11 @@ async fn index_handler() -> Html<&'static str> {
                     activePeerConnections.delete(streamName);
                 }
 
-                previewEl.innerHTML = '<video autoplay playsinline muted controls style="width:100%; height:100%; object-fit:cover;"></video>';
+                previewEl.innerHTML = '<video autoplay playsinline muted controls style="width:100%; height:100%; object-fit:cover; background:#000;"></video>';
                 const videoEl = previewEl.querySelector('video');
+
+                const mediaStream = new MediaStream();
+                videoEl.srcObject = mediaStream;
 
                 const pc = new RTCPeerConnection({
                     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
@@ -190,7 +193,14 @@ async fn index_handler() -> Html<&'static str> {
                 activePeerConnections.set(streamName, pc);
 
                 const vTrans = pc.addTransceiver('video', { direction: 'recvonly' });
-                pc.addTransceiver('audio', { direction: 'recvonly' });
+                const aTrans = pc.addTransceiver('audio', { direction: 'recvonly' });
+
+                if (vTrans && vTrans.receiver && vTrans.receiver.track) {
+                    mediaStream.addTrack(vTrans.receiver.track);
+                }
+                if (aTrans && aTrans.receiver && aTrans.receiver.track) {
+                    mediaStream.addTrack(aTrans.receiver.track);
+                }
 
                 if (window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities) {
                     const caps = RTCRtpReceiver.getCapabilities('video');
@@ -208,15 +218,18 @@ async fn index_handler() -> Html<&'static str> {
                 }
 
                 pc.ontrack = (event) => {
-                    if (event.streams && event.streams[0]) {
-                        videoEl.srcObject = event.streams[0];
-                    } else {
-                        const inboundStream = new MediaStream();
-                        inboundStream.addTrack(event.track);
-                        videoEl.srcObject = inboundStream;
+                    console.log(`[WebRTC:${streamName}] ontrack:`, event.track.kind, event.track.id);
+                    if (!mediaStream.getTracks().some(t => t.id === event.track.id)) {
+                        mediaStream.addTrack(event.track);
                     }
                     videoEl.play().catch(e => console.warn('Autoplay prevented:', e));
                 };
+
+                videoEl.onloadedmetadata = () => {
+                    console.log(`[WebRTC:${streamName}] Metadata loaded: ${videoEl.videoWidth}x${videoEl.videoHeight}`);
+                };
+                videoEl.onplaying = () => console.log(`[WebRTC:${streamName}] Video playing`);
+                videoEl.onerror = (e) => console.error(`[WebRTC:${streamName}] Video error:`, e);
 
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
@@ -376,8 +389,8 @@ async fn api_webrtc_handler(
 ) -> Response {
     if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        // Wait up to 3 seconds for producer to establish RTSP recording if starting
-        for _ in 0..30 {
+        // Wait up to 5 seconds for producer to establish RTSP recording if starting
+        for _ in 0..50 {
             if !stream.get_tracks().await.is_empty() {
                 break;
             }
