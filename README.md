@@ -76,7 +76,7 @@ The following features have been implemented and verified in live testing:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/rust2rtc.git
+git clone https://github.com/kiddyfurby/rust2rtc.git
 cd rust2rtc
 
 # Build optimized release binary
