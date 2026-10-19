@@ -31,7 +31,24 @@
 
 ---
 
-## 📋 Status & Roadmap
+## 🧪 Tested Environment & Implemented Features
+
+The following features have been implemented and verified in live testing:
+
+| Feature | Protocol / Codec | Server Environment | Client / Browser | Test Result & Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **H.264 WebRTC Live** | H.264 (Baseline, High Profile) | macOS (Darwin) | Google Chrome (macOS) | ✅ **Verified** – Low latency, instant playout clock & rendering |
+| **H.265 WebRTC Live** | H.265 (HEVC) | macOS (Darwin) | Safari / HEVC-enabled Chrome | ✅ **Verified** – Negotiated via WebRTC when browser supports HEVC |
+| **H.264 Snapshots** | H.264 (`/api/frame.jpeg`) | macOS (Darwin) | HTTP Client / Browser | ✅ **Verified** – Low-delay instant capture (`-flags low_delay`) |
+| **H.265 Snapshots** | H.265 (`/api/frame.jpeg`) | macOS (Darwin) | HTTP Client / Browser | ✅ **Verified** – Keyframe extraction without grey artifacts (`-skip_frame nokey`) |
+| **RTSP TCP Relay** | RTSP Interleaved TCP (`:8554`) | macOS (Darwin) | FFmpeg / RTSP Clients | ✅ **Verified** – Interleaved channel demuxing & broadcast |
+| **Multi-Source (`multitrans`)**| `multitrans://` & fallback lists | macOS (Darwin) | Internal Engine | ✅ **Verified** – Source fallback and candidate selection |
+| **FFmpeg On-Demand** | `ffmpeg:stream#params` | macOS (Darwin) | External FFmpeg | ✅ **Verified** – Audio transcoding to Opus, video filtering, scaling |
+| **Web Dashboard** | HTTP / HTML5 / JS (`:1984`) | macOS (Darwin) | Google Chrome (macOS) | ✅ **Verified** – Live stream cards, bitrates, snapshot previews |
+
+---
+
+## 📋 General Status & Roadmap
 
 | Feature | `go2rtc` | `rust2rtc` | Status |
 | :--- | :---: | :---: | :---: |
