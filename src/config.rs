@@ -14,12 +14,47 @@ pub struct Config {
     pub ffmpeg: FfmpegConfig,
     #[serde(default)]
     pub webrtc: Option<WebRtcConfig>,
+    #[serde(default)]
+    pub sip: Option<SipConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WebRtcConfig {
     #[serde(default)]
     pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SipConfig {
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub local_ip: Option<String>,
+    #[serde(default)]
+    pub accounts: HashMap<String, SipAccountYamlConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SipAccountYamlConfig {
+    pub extension: String,
+    pub auth_user: String,
+    pub password: String,
+    #[serde(default = "default_display_name")]
+    pub display_name: String,
+    #[serde(default)]
+    pub ring_group: Option<String>,
+    #[serde(default = "default_auto_answer")]
+    pub auto_answer: bool,
+}
+
+fn default_display_name() -> String {
+    "Camera Doorbell".to_string()
+}
+
+fn default_auto_answer() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -30,6 +65,7 @@ impl Default for Config {
             rtsp: RtspConfig::default(),
             ffmpeg: FfmpegConfig::default(),
             webrtc: None,
+            sip: None,
         }
     }
 }

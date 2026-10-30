@@ -1,0 +1,401 @@
+#![allow(dead_code)]
+
+use super::message::{
+    build_sdp, compute_digest_response, extract_param, parse_sdp_media, SipMessage, SipMethod,
+};
+use super::session::SipCallSession;
+use crate::streams::Stream;
+use anyhow::{bail, Context, Result};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
+
+#[derive(Debug, Clone)]
+pub struct SipAccountConfig {
+    pub stream_name: String,
+    pub server: String,
+    pub domain: String,
+    pub extension: String,
+    pub auth_user: String,
+    pub password: String,
+    pub display_name: String,
+    pub ring_group: Option<String>,
+    pub auto_answer: bool,
+    pub local_ip: String,
+}
+
+pub struct SipCameraAccount {
+    pub config: SipAccountConfig,
+    pub socket: Arc<UdpSocket>,
+    stream: Arc<Stream>,
+    active_call: Arc<Mutex<Option<SipCallSession>>>,
+    cseq: AtomicU32,
+    local_tag: String,
+}
+
+impl SipCameraAccount {
+    pub async fn new(config: SipAccountConfig, stream: Arc<Stream>) -> Result<Self> {
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("Failed to bind SIP UDP socket")?;
+        let local_addr = socket.local_addr()?;
+        info!(
+            stream = %config.stream_name,
+            ext = %config.extension,
+            port = local_addr.port(),
+            "SIP Camera UA initialized"
+        );
+
+        let local_tag = uuid::Uuid::new_v4().to_string()[..8].to_string();
+
+        Ok(Self {
+            config,
+            socket: Arc::new(socket),
+            stream,
+            active_call: Arc::new(Mutex::new(None)),
+            cseq: AtomicU32::new(1),
+            local_tag,
+        })
+    }
+
+    /// Run the background listener loop and periodic registration
+    pub async fn run(self: Arc<Self>) -> Result<()> {
+        let account = Arc::clone(&self);
+
+        // 1. Spawn Registration Loop
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = account.register().await {
+                    warn!(stream = %account.config.stream_name, "SIP registration error: {}", e);
+                }
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            }
+        });
+
+        // 2. Incoming UDP packet listener
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.socket.recv_from(&mut buf).await {
+                Ok((len, peer_addr)) => {
+                    let raw = String::from_utf8_lossy(&buf[..len]);
+                    match SipMessage::parse(&raw) {
+                        Ok(msg) => {
+                            let account = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                if let Err(e) = account.handle_message(msg, peer_addr).await {
+                                    debug!("SIP handle message error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            debug!("Ignored invalid SIP packet from {}: {}", peer_addr, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("SIP UDP socket error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Perform SIP registration with digest authentication challenge
+    pub async fn register(&self) -> Result<()> {
+        let server_addr: SocketAddr = tokio::net::lookup_host(&self.config.server)
+            .await?
+            .next()
+            .context("Failed to resolve SIP server address")?;
+
+        let local_port = self.socket.local_addr()?.port();
+        let from_uri = format!("sip:{}@{}", self.config.extension, self.config.domain);
+        let to_uri = from_uri.clone();
+        let contact = format!("sip:{}@{}:{}", self.config.extension, self.config.local_ip, local_port);
+        let call_id = format!("reg-{}@{}", uuid::Uuid::new_v4(), self.config.local_ip);
+
+        let seq = self.cseq.fetch_add(1, Ordering::SeqCst);
+        let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+
+        // Step 1: Initial REGISTER
+        let mut reg_msg = SipMessage::new_request(SipMethod::Register, &format!("sip:{}", self.config.domain));
+        reg_msg.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch));
+        reg_msg.set_header("From", &format!("<{}>;tag={}", from_uri, self.local_tag));
+        reg_msg.set_header("To", &format!("<{}>", to_uri));
+        reg_msg.set_header("Call-ID", &call_id);
+        reg_msg.set_header("CSeq", &format!("{} REGISTER", seq));
+        reg_msg.set_header("Contact", &format!("<{}>;expires=300", contact));
+        reg_msg.set_header("Max-Forwards", "70");
+        reg_msg.set_header("User-Agent", "rust2rtc");
+
+        self.socket.send_to(reg_msg.serialize().as_bytes(), server_addr).await?;
+
+        // Wait for response (401 or 200)
+        let mut buf = [0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
+            .await
+            .context("SIP registration timeout")??;
+
+        let raw = String::from_utf8_lossy(&buf[..len]);
+        let resp = SipMessage::parse(&raw)?;
+
+        if resp.status_code == Some(200) {
+            info!(stream = %self.config.stream_name, ext = %self.config.extension, "SIP registered successfully");
+            return Ok(());
+        }
+
+        if resp.status_code == Some(401) || resp.status_code == Some(407) {
+            let auth_hdr = resp
+                .get_header("www-authenticate")
+                .or_else(|| resp.get_header("proxy-authenticate"))
+                .context("Missing WWW-Authenticate in 401 response")?;
+
+            let realm = extract_param(auth_hdr, "realm=").unwrap_or_else(|| self.config.domain.clone());
+            let nonce = extract_param(auth_hdr, "nonce=").context("Missing nonce in 401 response")?;
+
+            let uri = format!("sip:{}", self.config.domain);
+            let digest_resp = compute_digest_response(
+                &self.config.auth_user,
+                &realm,
+                &self.config.password,
+                "REGISTER",
+                &uri,
+                &nonce,
+            );
+
+            let auth_val = format!(
+                r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}""#,
+                self.config.auth_user, realm, nonce, uri, digest_resp
+            );
+
+            let seq2 = self.cseq.fetch_add(1, Ordering::SeqCst);
+            let branch2 = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+
+            let mut auth_reg = SipMessage::new_request(SipMethod::Register, &uri);
+            auth_reg.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch2));
+            auth_reg.set_header("From", &format!("<{}>;tag={}", from_uri, self.local_tag));
+            auth_reg.set_header("To", &format!("<{}>", to_uri));
+            auth_reg.set_header("Call-ID", &call_id);
+            auth_reg.set_header("CSeq", &format!("{} REGISTER", seq2));
+            auth_reg.set_header("Contact", &format!("<{}>;expires=300", contact));
+            auth_reg.set_header("Authorization", &auth_val);
+            auth_reg.set_header("Max-Forwards", "70");
+            auth_reg.set_header("User-Agent", "rust2rtc");
+
+            self.socket.send_to(auth_reg.serialize().as_bytes(), server_addr).await?;
+
+            let (len2, _) = tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
+                .await
+                .context("SIP authenticated registration timeout")??;
+
+            let raw2 = String::from_utf8_lossy(&buf[..len2]);
+            let resp2 = SipMessage::parse(&raw2)?;
+
+            if resp2.status_code == Some(200) {
+                info!(stream = %self.config.stream_name, ext = %self.config.extension, "SIP registered successfully with auth");
+                return Ok(());
+            } else {
+                bail!("SIP registration rejected with status {:?}", resp2.status_code);
+            }
+        }
+
+        bail!("SIP unexpected response: {:?}", resp.status_code);
+    }
+
+    /// Handle incoming SIP request or response
+    async fn handle_message(&self, msg: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+        if msg.is_response {
+            debug!(code = ?msg.status_code, "Received SIP response");
+            return Ok(());
+        }
+
+        match msg.method {
+            Some(SipMethod::Invite) => self.handle_invite(msg, peer_addr).await,
+            Some(SipMethod::Ack) => {
+                debug!("Received SIP ACK - Call connected");
+                Ok(())
+            }
+            Some(SipMethod::Bye) => self.handle_bye(msg, peer_addr).await,
+            Some(SipMethod::Cancel) => self.handle_cancel(msg, peer_addr).await,
+            Some(SipMethod::Options) => self.handle_options(msg, peer_addr).await,
+            _ => {
+                debug!("Unhandled SIP method: {:?}", msg.method);
+                Ok(())
+            }
+        }
+    }
+
+    /// Handle incoming call (e.g. from ESPHome intercom dialing doorbell)
+    async fn handle_invite(&self, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+        let call_id = req.get_header("call-id").unwrap_or("unknown").to_string();
+        info!(
+            call_id = %call_id,
+            from = ?req.get_header("from"),
+            stream = %self.config.stream_name,
+            "Incoming SIP call received"
+        );
+
+        // 1. Send 100 Trying
+        let trying = self.create_reply(&req, 100, "Trying");
+        self.socket.send_to(trying.serialize().as_bytes(), peer_addr).await?;
+
+        // 2. Send 180 Ringing
+        let ringing = self.create_reply(&req, 180, "Ringing");
+        self.socket.send_to(ringing.serialize().as_bytes(), peer_addr).await?;
+
+        // 3. Parse SDP Media from caller
+        let media_info = parse_sdp_media(&req.body);
+        let remote_ip = media_info
+            .connection_ip
+            .unwrap_or_else(|| peer_addr.ip().to_string());
+
+        let remote_audio_addr = match media_info.audio_port {
+            Some(port) => format!("{}:{}", remote_ip, port).parse::<SocketAddr>()?,
+            None => bail!("Caller SDP did not specify audio port"),
+        };
+
+        let remote_video_addr = media_info
+            .video_port
+            .and_then(|p| format!("{}:{}", remote_ip, p).parse::<SocketAddr>().ok());
+
+        // 4. Start media bridge session
+        let session = SipCallSession::start(
+            call_id.clone(),
+            Arc::clone(&self.stream),
+            &self.config.local_ip,
+            remote_audio_addr,
+            remote_video_addr,
+        )
+        .await?;
+
+        let audio_port = session.local_audio_port;
+        let video_port = session.local_video_port;
+
+        // Store active call
+        let mut active = self.active_call.lock().await;
+        *active = Some(session);
+
+        // 5. Send 200 OK with Answer SDP
+        let answer_sdp = build_sdp(&self.config.local_ip, audio_port, video_port);
+        let local_port = self.socket.local_addr()?.port();
+        let contact = format!("sip:{}@{}:{}", self.config.extension, self.config.local_ip, local_port);
+
+        let mut ok_resp = self.create_reply(&req, 200, "OK");
+        ok_resp.set_header("Contact", &format!("<{}>", contact));
+        ok_resp.set_header("Content-Type", "application/sdp");
+        ok_resp.set_header("Content-Length", &answer_sdp.len().to_string());
+        ok_resp.body = answer_sdp;
+
+        self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
+        info!(call_id = %call_id, "SIP call answered with 200 OK");
+
+        Ok(())
+    }
+
+    /// Handle BYE (call hung up)
+    async fn handle_bye(&self, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+        let call_id = req.get_header("call-id").unwrap_or("unknown");
+        info!(call_id = %call_id, "SIP call terminated by peer (BYE)");
+
+        let mut active = self.active_call.lock().await;
+        if let Some(mut session) = active.take() {
+            session.stop().await;
+        }
+
+        let ok_resp = self.create_reply(&req, 200, "OK");
+        self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
+        Ok(())
+    }
+
+    /// Handle CANCEL
+    async fn handle_cancel(&self, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+        let ok_resp = self.create_reply(&req, 200, "OK");
+        self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
+
+        let mut active = self.active_call.lock().await;
+        if let Some(mut session) = active.take() {
+            session.stop().await;
+        }
+        Ok(())
+    }
+
+    /// Handle OPTIONS (keepalive ping)
+    async fn handle_options(&self, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+        let ok_resp = self.create_reply(&req, 200, "OK");
+        self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
+        Ok(())
+    }
+
+    /// Trigger an outbound call to an extension or ring group (e.g. Doorbell button pressed)
+    pub async fn trigger_outbound_call(&self, target_extension: &str) -> Result<()> {
+        let server_addr: SocketAddr = tokio::net::lookup_host(&self.config.server)
+            .await?
+            .next()
+            .context("Failed to resolve SIP server address")?;
+
+        let local_port = self.socket.local_addr()?.port();
+        let from_uri = format!("sip:{}@{}", self.config.extension, self.config.domain);
+        let to_uri = format!("sip:{}@{}", target_extension, self.config.domain);
+        let contact = format!("sip:{}@{}:{}", self.config.extension, self.config.local_ip, local_port);
+        let call_id = format!("call-{}@{}", uuid::Uuid::new_v4(), self.config.local_ip);
+
+        let seq = self.cseq.fetch_add(1, Ordering::SeqCst);
+        let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+
+        // Temporary audio port for offer
+        let dummy_audio_port = 20000;
+        let offer_sdp = build_sdp(&self.config.local_ip, dummy_audio_port, None);
+
+        let mut invite = SipMessage::new_request(SipMethod::Invite, &to_uri);
+        invite.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch));
+        invite.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, from_uri, self.local_tag));
+        invite.set_header("To", &format!("<{}>", to_uri));
+        invite.set_header("Call-ID", &call_id);
+        invite.set_header("CSeq", &format!("{} INVITE", seq));
+        invite.set_header("Contact", &format!("<{}>", contact));
+        invite.set_header("Content-Type", "application/sdp");
+        invite.set_header("Content-Length", &offer_sdp.len().to_string());
+        invite.set_header("Max-Forwards", "70");
+        invite.set_header("User-Agent", "rust2rtc");
+        invite.body = offer_sdp;
+
+        info!(
+            target = %target_extension,
+            stream = %self.config.stream_name,
+            "Calling ESPHome / Ring Group via SIP"
+        );
+        self.socket.send_to(invite.serialize().as_bytes(), server_addr).await?;
+
+        Ok(())
+    }
+
+    fn create_reply(&self, req: &SipMessage, code: u16, reason: &str) -> SipMessage {
+        let mut resp = SipMessage::new_response(code, reason);
+        if let Some(via) = req.get_header("via") {
+            resp.set_header("Via", via);
+        }
+        if let Some(from) = req.get_header("from") {
+            resp.set_header("From", from);
+        }
+        if let Some(to) = req.get_header("to") {
+            if to.contains("tag=") {
+                resp.set_header("To", to);
+            } else {
+                resp.set_header("To", &format!("{};tag={}", to, self.local_tag));
+            }
+        }
+        if let Some(call_id) = req.get_header("call-id") {
+            resp.set_header("Call-ID", call_id);
+        }
+        if let Some(cseq) = req.get_header("cseq") {
+            resp.set_header("CSeq", cseq);
+        }
+        resp.set_header("User-Agent", "rust2rtc");
+        resp
+    }
+}

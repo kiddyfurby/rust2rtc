@@ -16,12 +16,19 @@ pub struct AppState {
     pub streams: Arc<StreamManager>,
     pub ffmpeg: Arc<FfmpegManager>,
     pub webrtc: Arc<WebRtcManager>,
+    pub sip: Arc<crate::sip::SipManager>,
     pub rtsp_port: u16,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct FrameQuery {
     pub src: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SipCallQuery {
+    pub stream: String,
+    pub dest: Option<String>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -32,6 +39,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ffmpeg", get(api_ffmpeg_handler))
         .route("/api/frame.jpeg", get(api_frame_handler))
         .route("/api/webrtc", post(api_webrtc_handler))
+        .route("/api/sip/call", post(api_sip_call_handler))
+        .route("/api/sip/accounts", get(api_sip_accounts_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -420,3 +429,33 @@ async fn api_webrtc_handler(
         (StatusCode::NOT_FOUND, "Stream not found").into_response()
     }
 }
+
+async fn api_sip_call_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SipCallQuery>,
+) -> impl IntoResponse {
+    match state.sip.trigger_call(&query.stream, query.dest.as_deref()).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "calling",
+                "stream": query.stream,
+                "dest": query.dest,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.to_string(),
+            })),
+        ),
+    }
+}
+
+async fn api_sip_accounts_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let accounts = state.sip.list_accounts().await;
+    Json(serde_json::json!({ "accounts": accounts }))
+}
+
