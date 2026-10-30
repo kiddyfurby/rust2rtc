@@ -1,4 +1,5 @@
 mod api;
+mod backchannel;
 mod config;
 mod core;
 mod ffmpeg;

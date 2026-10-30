@@ -37,3 +37,4 @@ base64 = "0.22"
 # WebRTC
 webrtc = "0.21.1"
 rtc = "0.21.1"
+uuid = { version = "1.28.0", features = ["v4"] }

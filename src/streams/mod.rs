@@ -3,6 +3,7 @@
 use crate::core::{MediaKind, Track};
 use crate::ffmpeg::FfmpegManager;
 use anyhow::Result;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,7 @@ pub struct Stream {
     pub producer: Mutex<Option<ActiveProducer>>,
     pub bytes_recv: AtomicU64,
     pub packets_recv: AtomicU64,
+    pub backchannel: Mutex<Option<Arc<crate::backchannel::BackchannelSession>>>,
 }
 
 impl Stream {
@@ -34,7 +36,44 @@ impl Stream {
             producer: Mutex::new(None),
             bytes_recv: AtomicU64::new(0),
             packets_recv: AtomicU64::new(0),
+            backchannel: Mutex::new(None),
         }
+    }
+
+    /// Check if this stream has a configured backchannel source (Reolink ONVIF or Tapo MULTITRANS)
+    pub fn has_backchannel(&self) -> bool {
+        crate::backchannel::detect_backchannel(&self.sources).is_some()
+    }
+
+    /// Start a backchannel session on demand if not already active
+    pub async fn start_backchannel(&self) -> Result<Option<Arc<crate::backchannel::BackchannelSession>>> {
+        let mut guard = self.backchannel.lock().await;
+        if let Some(session) = &*guard {
+            return Ok(Some(Arc::clone(session)));
+        }
+
+        if let Some(session) = crate::backchannel::start_backchannel(&self.sources).await? {
+            let session_arc = Arc::new(session);
+            *guard = Some(Arc::clone(&session_arc));
+            Ok(Some(session_arc))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Stop the active backchannel session
+    pub async fn stop_backchannel(&self) {
+        let mut guard = self.backchannel.lock().await;
+        *guard = None;
+    }
+
+    /// Send audio payload to the backchannel speaker
+    pub async fn send_backchannel_audio(&self, payload: Bytes, is_pcmu: bool) -> Result<()> {
+        let guard = self.backchannel.lock().await;
+        if let Some(session) = &*guard {
+            session.send_audio(payload, is_pcmu).await?;
+        }
+        Ok(())
     }
 
     pub async fn add_track(&self, track: Arc<Track>) {
