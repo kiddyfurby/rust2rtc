@@ -4,6 +4,7 @@ mod config;
 mod core;
 mod ffmpeg;
 mod rtsp;
+mod sip;
 mod streams;
 mod webrtc;
 
@@ -117,10 +118,39 @@ async fn main() -> Result<()> {
 
     let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(webrtc_candidates));
 
+    // Initialize SIP Manager
+    let sip_manager = Arc::new(sip::SipManager::new(Arc::clone(&stream_manager)));
+
+    if let Some(sip_cfg) = &config.sip {
+        let server = sip_cfg.server.as_deref().unwrap_or("127.0.0.1:5060");
+        let domain = sip_cfg.domain.as_deref().unwrap_or("homeassistant.local");
+        let default_ip = detect_local_ip(server);
+        let local_ip = sip_cfg.local_ip.as_deref().unwrap_or(&default_ip);
+
+        for (stream_name, acc_cfg) in &sip_cfg.accounts {
+            let client_cfg = sip::client::SipAccountConfig {
+                stream_name: stream_name.clone(),
+                server: server.to_string(),
+                domain: domain.to_string(),
+                extension: acc_cfg.extension.clone(),
+                auth_user: acc_cfg.auth_user.clone(),
+                password: acc_cfg.password.clone(),
+                display_name: acc_cfg.display_name.clone(),
+                ring_group: acc_cfg.ring_group.clone(),
+                auto_answer: acc_cfg.auto_answer,
+                local_ip: local_ip.to_string(),
+            };
+            if let Err(e) = sip_manager.add_account(client_cfg).await {
+                error!(stream = %stream_name, "Failed to initialize SIP account: {}", e);
+            }
+        }
+    }
+
     let app_state = api::AppState {
         streams: Arc::clone(&stream_manager),
         ffmpeg: Arc::clone(&ffmpeg_manager),
         webrtc: Arc::clone(&webrtc_manager),
+        sip: Arc::clone(&sip_manager),
         rtsp_port,
     };
 
@@ -167,3 +197,33 @@ async fn shutdown_signal() {
 
     info!("Shutdown signal received, shutting down gracefully...");
 }
+
+fn detect_local_ip(server: &str) -> String {
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        let target = if let Ok(mut addrs) = server.split(':').next().unwrap_or("8.8.8.8").to_string().add_port_str("5060") {
+            addrs.next()
+        } else {
+            None
+        };
+        if let Some(addr) = target {
+            if socket.connect(addr).is_ok() {
+                if let Ok(local) = socket.local_addr() {
+                    return local.ip().to_string();
+                }
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+trait AddPortStr {
+    fn add_port_str(&self, port: &str) -> std::io::Result<std::vec::IntoIter<std::net::SocketAddr>>;
+}
+
+impl AddPortStr for String {
+    fn add_port_str(&self, port: &str) -> std::io::Result<std::vec::IntoIter<std::net::SocketAddr>> {
+        use std::net::ToSocketAddrs;
+        format!("{}:{}", self, port).to_socket_addrs()
+    }
+}
+
