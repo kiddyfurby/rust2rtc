@@ -296,13 +296,27 @@ fn hex_md5(input: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct SdpMediaInfo {
     pub audio_port: Option<u16>,
+    pub audio_payload_types: Vec<u8>,
     pub video_port: Option<u16>,
     pub connection_ip: Option<String>,
+}
+
+impl SdpMediaInfo {
+    /// Pick the preferred G.711 payload type (0 = PCMU, 8 = PCMA) offered by the peer
+    pub fn preferred_g711_pt(&self) -> u8 {
+        for &pt in &self.audio_payload_types {
+            if pt == 0 || pt == 8 {
+                return pt;
+            }
+        }
+        0
+    }
 }
 
 pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
     let mut info = SdpMediaInfo {
         audio_port: None,
+        audio_payload_types: Vec::new(),
         video_port: None,
         connection_ip: None,
     };
@@ -312,14 +326,23 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
     for line in sdp.lines() {
         let line = line.trim();
         if let Some(c) = line.strip_prefix("c=IN IP4 ") {
-            if global_c_ip.is_none() {
-                global_c_ip = Some(c.trim().to_string());
+            let ip = c.trim();
+            if !ip.is_empty() && ip != "0.0.0.0" {
+                global_c_ip = Some(ip.to_string());
             }
         } else if let Some(m) = line.strip_prefix("m=audio ") {
-            let port_str = m.split_whitespace().next().unwrap_or("0");
+            let mut parts = m.split_whitespace();
+            let port_str = parts.next().unwrap_or("0");
             if let Ok(p) = port_str.parse::<u16>() {
                 if p > 0 {
                     info.audio_port = Some(p);
+                }
+            }
+            // Skip transport (e.g., RTP/AVP)
+            let _transport = parts.next();
+            for pt_str in parts {
+                if let Ok(pt) = pt_str.parse::<u8>() {
+                    info.audio_payload_types.push(pt);
                 }
             }
         } else if let Some(m) = line.strip_prefix("m=video ") {
@@ -340,19 +363,37 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
 pub fn build_sdp(
     local_ip: &str,
     audio_port: u16,
+    audio_pt: u8,
     video_port: Option<u16>,
 ) -> String {
+    let audio_section = if audio_pt == 8 {
+        format!(
+            "m=audio {} RTP/AVP 8 0\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=ptime:20\r\n\
+            a=sendrecv\r\n",
+            audio_port
+        )
+    } else {
+        format!(
+            "m=audio {} RTP/AVP 0 8\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:8 PCMA/8000\r\n\
+            a=ptime:20\r\n\
+            a=sendrecv\r\n",
+            audio_port
+        )
+    };
+
     let mut sdp = format!(
         "v=0\r\n\
         o=rust2rtc 1000 1 IN IP4 {}\r\n\
         s=Talk\r\n\
         c=IN IP4 {}\r\n\
         t=0 0\r\n\
-        m=audio {} RTP/AVP 0 8\r\n\
-        a=rtpmap:0 PCMU/8000\r\n\
-        a=rtpmap:8 PCMA/8000\r\n\
-        a=sendrecv\r\n",
-        local_ip, local_ip, audio_port
+        {}",
+        local_ip, local_ip, audio_section
     );
 
     if let Some(v_port) = video_port {
