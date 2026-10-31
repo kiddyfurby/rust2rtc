@@ -1,17 +1,19 @@
 #![allow(dead_code)]
 
 use super::message::{
-    build_sdp, compute_digest_response, extract_param, parse_sdp_media, SipMessage, SipMethod,
+    build_sdp, compute_digest_response, compute_digest_response_qop, extract_param,
+    parse_sdp_media, SipMessage, SipMethod,
 };
 use super::session::SipCallSession;
 use crate::streams::Stream;
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,7 @@ pub struct SipCameraAccount {
     pub socket: Arc<UdpSocket>,
     stream: Arc<Stream>,
     active_call: Arc<Mutex<Option<SipCallSession>>>,
+    pending_responses: Arc<Mutex<HashMap<String, mpsc::Sender<SipMessage>>>>,
     cseq: AtomicU32,
     local_tag: String,
 }
@@ -57,6 +60,7 @@ impl SipCameraAccount {
             socket: Arc::new(socket),
             stream,
             active_call: Arc::new(Mutex::new(None)),
+            pending_responses: Arc::new(Mutex::new(HashMap::new())),
             cseq: AtomicU32::new(1),
             local_tag,
         })
@@ -114,10 +118,19 @@ impl SipCameraAccount {
             .context("Failed to resolve SIP server address")?;
 
         let local_port = self.socket.local_addr()?.port();
-        let from_uri = format!("sip:{}@{}", self.config.extension, self.config.domain);
+        let reg_user = if !self.config.auth_user.is_empty() {
+            &self.config.auth_user
+        } else {
+            &self.config.extension
+        };
+        let from_uri = format!("sip:{}@{}", reg_user, self.config.domain);
         let to_uri = from_uri.clone();
-        let contact = format!("sip:{}@{}:{}", self.config.extension, self.config.local_ip, local_port);
+        let contact = format!("sip:{}@{}:{}", reg_user, self.config.local_ip, local_port);
         let call_id = format!("reg-{}@{}", uuid::Uuid::new_v4(), self.config.local_ip);
+
+        // Register a channel to receive SIP responses routed from the main UDP listener
+        let (tx, mut rx) = mpsc::channel::<SipMessage>(8);
+        self.pending_responses.lock().await.insert(call_id.clone(), tx);
 
         let seq = self.cseq.fetch_add(1, Ordering::SeqCst);
         let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
@@ -135,16 +148,28 @@ impl SipCameraAccount {
 
         self.socket.send_to(reg_msg.serialize().as_bytes(), server_addr).await?;
 
-        // Wait for response (401 or 200)
-        let mut buf = [0u8; 4096];
-        let (len, _) = tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
-            .await
-            .context("SIP registration timeout")??;
-
-        let raw = String::from_utf8_lossy(&buf[..len]);
-        let resp = SipMessage::parse(&raw)?;
+        // Wait for response routed by listener (skip provisional 1xx)
+        let resp = loop {
+            let msg = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    self.pending_responses.lock().await.remove(&call_id);
+                    bail!("SIP response channel closed");
+                }
+                Err(_) => {
+                    self.pending_responses.lock().await.remove(&call_id);
+                    bail!("SIP registration timeout");
+                }
+            };
+            if let Some(code) = msg.status_code {
+                if code >= 200 {
+                    break msg;
+                }
+            }
+        };
 
         if resp.status_code == Some(200) {
+            self.pending_responses.lock().await.remove(&call_id);
             info!(stream = %self.config.stream_name, ext = %self.config.extension, "SIP registered successfully");
             return Ok(());
         }
@@ -155,22 +180,74 @@ impl SipCameraAccount {
                 .or_else(|| resp.get_header("proxy-authenticate"))
                 .context("Missing WWW-Authenticate in 401 response")?;
 
-            let realm = extract_param(auth_hdr, "realm=").unwrap_or_else(|| self.config.domain.clone());
-            let nonce = extract_param(auth_hdr, "nonce=").context("Missing nonce in 401 response")?;
-
+            let realm = extract_param(auth_hdr, "realm").unwrap_or_else(|| self.config.domain.clone());
+            let nonce = extract_param(auth_hdr, "nonce").context("Missing nonce in 401 response")?;
+            let qop = extract_param(auth_hdr, "qop");
+            let opaque = extract_param(auth_hdr, "opaque");
+            let algorithm = extract_param(auth_hdr, "algorithm");
             let uri = format!("sip:{}", self.config.domain);
-            let digest_resp = compute_digest_response(
-                &self.config.auth_user,
-                &realm,
-                &self.config.password,
-                "REGISTER",
-                &uri,
-                &nonce,
+
+            info!(
+                stream = %self.config.stream_name,
+                auth_hdr = %auth_hdr,
+                realm = %realm,
+                nonce = %nonce,
+                qop = ?qop,
+                algorithm = ?algorithm,
+                "Received 401/407 authentication challenge from SIP server"
             );
 
-            let auth_val = format!(
-                r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}""#,
-                self.config.auth_user, realm, nonce, uri, digest_resp
+            let auth_val = if let Some(_qop_val) = qop.as_deref().filter(|q| q.contains("auth")) {
+                let nc = "00000001";
+                let cnonce = uuid::Uuid::new_v4().to_string()[..8].to_string();
+                let digest_resp = compute_digest_response_qop(
+                    &self.config.auth_user,
+                    &realm,
+                    &self.config.password,
+                    "REGISTER",
+                    &uri,
+                    &nonce,
+                    "auth",
+                    nc,
+                    &cnonce,
+                );
+                let mut val = format!(
+                    r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}", qop=auth, nc={}, cnonce="{}""#,
+                    self.config.auth_user, realm, nonce, uri, digest_resp, nc, cnonce
+                );
+                if let Some(op) = opaque {
+                    val.push_str(&format!(r#", opaque="{}""#, op));
+                }
+                if let Some(alg) = algorithm {
+                    val.push_str(&format!(r#", algorithm={}"#, alg));
+                }
+                val
+            } else {
+                let digest_resp = compute_digest_response(
+                    &self.config.auth_user,
+                    &realm,
+                    &self.config.password,
+                    "REGISTER",
+                    &uri,
+                    &nonce,
+                );
+                let mut val = format!(
+                    r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}""#,
+                    self.config.auth_user, realm, nonce, uri, digest_resp
+                );
+                if let Some(op) = opaque {
+                    val.push_str(&format!(r#", opaque="{}""#, op));
+                }
+                if let Some(alg) = algorithm {
+                    val.push_str(&format!(r#", algorithm={}"#, alg));
+                }
+                val
+            };
+
+            info!(
+                stream = %self.config.stream_name,
+                auth_val = %auth_val,
+                "Sending authenticated REGISTER"
             );
 
             let seq2 = self.cseq.fetch_add(1, Ordering::SeqCst);
@@ -183,27 +260,52 @@ impl SipCameraAccount {
             auth_reg.set_header("Call-ID", &call_id);
             auth_reg.set_header("CSeq", &format!("{} REGISTER", seq2));
             auth_reg.set_header("Contact", &format!("<{}>;expires=300", contact));
-            auth_reg.set_header("Authorization", &auth_val);
+            let auth_hdr_name = if resp.status_code == Some(407) {
+                "Proxy-Authorization"
+            } else {
+                "Authorization"
+            };
+            auth_reg.set_header(auth_hdr_name, &auth_val);
             auth_reg.set_header("Max-Forwards", "70");
             auth_reg.set_header("User-Agent", "rust2rtc");
 
             self.socket.send_to(auth_reg.serialize().as_bytes(), server_addr).await?;
 
-            let (len2, _) = tokio::time::timeout(Duration::from_secs(5), self.socket.recv_from(&mut buf))
-                .await
-                .context("SIP authenticated registration timeout")??;
+            let resp2 = loop {
+                let msg = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                    Ok(Some(m)) => m,
+                    Ok(None) => {
+                        self.pending_responses.lock().await.remove(&call_id);
+                        bail!("SIP response channel closed");
+                    }
+                    Err(_) => {
+                        self.pending_responses.lock().await.remove(&call_id);
+                        bail!("SIP authenticated registration timeout");
+                    }
+                };
+                if let Some(code) = msg.status_code {
+                    if code >= 200 {
+                        break msg;
+                    }
+                }
+            };
 
-            let raw2 = String::from_utf8_lossy(&buf[..len2]);
-            let resp2 = SipMessage::parse(&raw2)?;
+            self.pending_responses.lock().await.remove(&call_id);
 
             if resp2.status_code == Some(200) {
                 info!(stream = %self.config.stream_name, ext = %self.config.extension, "SIP registered successfully with auth");
                 return Ok(());
+            } else if resp2.status_code == Some(401) || resp2.status_code == Some(403) {
+                bail!(
+                    "SIP registration rejected with status {:?} (check extension '{}', auth_user '{}', and password in rust2rtc.yaml)",
+                    resp2.status_code, self.config.extension, self.config.auth_user
+                );
             } else {
                 bail!("SIP registration rejected with status {:?}", resp2.status_code);
             }
         }
 
+        self.pending_responses.lock().await.remove(&call_id);
         bail!("SIP unexpected response: {:?}", resp.status_code);
     }
 
@@ -211,6 +313,13 @@ impl SipCameraAccount {
     async fn handle_message(&self, msg: SipMessage, peer_addr: SocketAddr) -> Result<()> {
         if msg.is_response {
             debug!(code = ?msg.status_code, "Received SIP response");
+            if let Some(call_id) = msg.get_header("call-id") {
+                let pending = self.pending_responses.lock().await;
+                if let Some(tx) = pending.get(call_id.trim()) {
+                    let _ = tx.send(msg).await;
+                    return Ok(());
+                }
+            }
             return Ok(());
         }
 

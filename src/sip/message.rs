@@ -218,19 +218,44 @@ fn format_header_key(k: &str) -> String {
     }
 }
 
-pub fn extract_param(header: &str, param: &str) -> Option<String> {
-    if let Some(pos) = header.find(param) {
-        let after = &header[pos + param.len()..];
-        let trimmed = after.trim_start_matches('"');
-        if let Some(end) = trimmed.find([';', '"', ' ', '\r', '\n']) {
-            return Some(trimmed[..end].to_string());
+pub fn extract_param(header: &str, param_name: &str) -> Option<String> {
+    let target = param_name.trim_end_matches('=').to_lowercase();
+    let header_lower = header.to_lowercase();
+    let mut search_from = 0;
+
+    while let Some(rel_pos) = header_lower[search_from..].find(&target) {
+        let pos = search_from + rel_pos;
+        let before_ok = pos == 0 || {
+            let prev = header.as_bytes()[pos - 1];
+            prev == b' ' || prev == b',' || prev == b';' || prev == b'\t'
+        };
+        let after_idx = pos + target.len();
+        if before_ok && after_idx < header.len() {
+            let rem = &header[after_idx..];
+            let trimmed = rem.trim_start();
+            if trimmed.starts_with('=') {
+                let val_part = trimmed[1..].trim_start();
+                if val_part.starts_with('"') {
+                    // Quoted string: extract until closing quote
+                    let content = &val_part[1..];
+                    if let Some(end_quote) = content.find('"') {
+                        return Some(content[..end_quote].to_string());
+                    }
+                } else {
+                    // Token: ends at comma, semicolon, space, or end of string
+                    let end = val_part
+                        .find([',', ';', ' ', '\r', '\n'])
+                        .unwrap_or(val_part.len());
+                    return Some(val_part[..end].to_string());
+                }
+            }
         }
-        return Some(trimmed.to_string());
+        search_from = pos + target.len();
     }
     None
 }
 
-/// Compute HTTP / SIP MD5 Digest response
+/// Compute HTTP / SIP MD5 Digest response (without qop)
 pub fn compute_digest_response(
     username: &str,
     realm: &str,
@@ -242,6 +267,23 @@ pub fn compute_digest_response(
     let ha1 = hex_md5(&format!("{}:{}:{}", username, realm, password));
     let ha2 = hex_md5(&format!("{}:{}", method, uri));
     hex_md5(&format!("{}:{}:{}", ha1, nonce, ha2))
+}
+
+/// Compute HTTP / SIP MD5 Digest response with qop (auth)
+pub fn compute_digest_response_qop(
+    username: &str,
+    realm: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    nonce: &str,
+    qop: &str,
+    nc: &str,
+    cnonce: &str,
+) -> String {
+    let ha1 = hex_md5(&format!("{}:{}:{}", username, realm, password));
+    let ha2 = hex_md5(&format!("{}:{}", method, uri));
+    hex_md5(&format!("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, qop, ha2))
 }
 
 fn hex_md5(input: &str) -> String {
@@ -384,5 +426,28 @@ a=rtpmap:96 H264/90000\r\n";
         assert_eq!(info.connection_ip, Some("192.168.1.200".to_string()));
         assert_eq!(info.audio_port, Some(16384));
         assert_eq!(info.video_port, Some(16386));
+    }
+
+    #[test]
+    fn test_extract_param_and_digest_qop() {
+        let auth_hdr = r#"Digest realm="asterisk", nonce="1730412549/3c4155df", algorithm=MD5, qop="auth", opaque="opaque-123""#;
+        assert_eq!(extract_param(auth_hdr, "realm"), Some("asterisk".to_string()));
+        assert_eq!(extract_param(auth_hdr, "nonce"), Some("1730412549/3c4155df".to_string()));
+        assert_eq!(extract_param(auth_hdr, "qop"), Some("auth".to_string()));
+        assert_eq!(extract_param(auth_hdr, "opaque"), Some("opaque-123".to_string()));
+        assert_eq!(extract_param(auth_hdr, "algorithm"), Some("MD5".to_string()));
+
+        let resp = compute_digest_response_qop(
+            "doorbell",
+            "asterisk",
+            "secret",
+            "REGISTER",
+            "sip:192.168.1.4",
+            "1730412549/3c4155df",
+            "auth",
+            "00000001",
+            "abcdef12",
+        );
+        assert_eq!(resp.len(), 32);
     }
 }
