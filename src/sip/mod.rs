@@ -1,34 +1,59 @@
 #![allow(dead_code)]
 
 pub mod client;
+pub mod ha;
 pub mod message;
 pub mod session;
 
 use anyhow::Result;
-use client::{SipAccountConfig, SipCameraAccount};
+use client::{SipAccountConfig, SipAccountStatus, SipCameraAccount};
+use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 pub struct SipManager {
     accounts: RwLock<HashMap<String, Arc<SipCameraAccount>>>,
     stream_manager: Arc<StreamManager>,
+    ffmpeg: Arc<FfmpegManager>,
+    rtsp_port: u16,
+    used_extensions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SipManager {
-    pub fn new(stream_manager: Arc<StreamManager>) -> Self {
+    pub fn new(
+        stream_manager: Arc<StreamManager>,
+        ffmpeg: Arc<FfmpegManager>,
+        rtsp_port: u16,
+    ) -> Self {
         Self {
             accounts: RwLock::new(HashMap::new()),
             stream_manager,
+            ffmpeg,
+            rtsp_port,
+            used_extensions: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// Add and start a SIP camera account
     pub async fn add_account(&self, config: SipAccountConfig) -> Result<()> {
+        {
+            let mut used = self.used_extensions.lock().await;
+            used.insert(config.extension.clone());
+        }
         let stream = self.stream_manager.get_or_create(&config.stream_name).await;
-        let account = Arc::new(SipCameraAccount::new(config.clone(), stream).await?);
+        let account = Arc::new(
+            SipCameraAccount::new(
+                config.clone(),
+                stream,
+                self.rtsp_port,
+                Arc::clone(&self.ffmpeg),
+                Arc::clone(&self.used_extensions),
+            )
+            .await?,
+        );
 
         let stream_name = config.stream_name.clone();
         let account_clone = Arc::clone(&account);
@@ -40,7 +65,12 @@ impl SipManager {
 
         let mut accounts = self.accounts.write().await;
         accounts.insert(config.stream_name.clone(), account);
-        info!(stream = %config.stream_name, ext = %config.extension, "Added SIP Camera UA");
+        info!(
+            stream = %config.stream_name,
+            ext = %config.extension,
+            auth_user = %config.auth_user,
+            "Added SIP Camera UA"
+        );
 
         Ok(())
     }
@@ -60,9 +90,14 @@ impl SipManager {
         account.trigger_outbound_call(&destination).await
     }
 
-    /// List active SIP account stream names
-    pub async fn list_accounts(&self) -> Vec<String> {
+    /// List active SIP account statuses
+    pub async fn list_accounts(&self) -> Vec<SipAccountStatus> {
         let accounts = self.accounts.read().await;
-        accounts.keys().cloned().collect()
+        let mut statuses = Vec::with_capacity(accounts.len());
+        for acc in accounts.values() {
+            statuses.push(acc.status().await);
+        }
+        statuses.sort_by(|a, b| a.extension.cmp(&b.extension));
+        statuses
     }
 }

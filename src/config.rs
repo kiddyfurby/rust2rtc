@@ -33,20 +33,41 @@ pub struct SipConfig {
     #[serde(default)]
     pub local_ip: Option<String>,
     #[serde(default)]
+    pub ha_url: Option<String>,
+    #[serde(default)]
+    pub ha_token: Option<String>,
+    #[serde(default)]
+    pub auto_register_streams: bool,
+    #[serde(default = "default_base_extension")]
+    pub base_extension: u16,
+    #[serde(default = "default_auto_password")]
+    pub auto_password: String,
+    #[serde(default)]
     pub accounts: HashMap<String, SipAccountYamlConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SipAccountYamlConfig {
-    pub extension: String,
-    pub auth_user: String,
-    pub password: String,
+    #[serde(default)]
+    pub extension: Option<String>,
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default = "default_display_name")]
     pub display_name: String,
     #[serde(default)]
     pub ring_group: Option<String>,
     #[serde(default = "default_auto_answer")]
     pub auto_answer: bool,
+}
+
+fn default_base_extension() -> u16 {
+    101
+}
+
+fn default_auto_password() -> String {
+    "MySecretPassword123".to_string()
 }
 
 fn default_display_name() -> String {

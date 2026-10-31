@@ -72,10 +72,10 @@ async fn main() -> Result<()> {
     let stream_manager = Arc::new(StreamManager::new());
 
     // Register configured streams
-    for (name, stream_cfg) in config.streams {
+    for (name, stream_cfg) in &config.streams {
         let sources = stream_cfg.to_vec();
         info!(stream = %name, sources = ?sources, "Registering stream");
-        stream_manager.add_configured_stream(name, sources).await;
+        stream_manager.add_configured_stream(name.clone(), sources).await;
     }
 
     // Determine RTSP port
@@ -119,7 +119,11 @@ async fn main() -> Result<()> {
     let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(webrtc_candidates));
 
     // Initialize SIP Manager
-    let sip_manager = Arc::new(sip::SipManager::new(Arc::clone(&stream_manager)));
+    let sip_manager = Arc::new(sip::SipManager::new(
+        Arc::clone(&stream_manager),
+        Arc::clone(&ffmpeg_manager),
+        rtsp_port,
+    ));
 
     if let Some(sip_cfg) = &config.sip {
         let server = sip_cfg.server.as_deref().unwrap_or("127.0.0.1:5060");
@@ -127,21 +131,106 @@ async fn main() -> Result<()> {
         let default_ip = detect_local_ip(server);
         let local_ip = sip_cfg.local_ip.as_deref().unwrap_or(&default_ip);
 
-        for (stream_name, acc_cfg) in &sip_cfg.accounts {
+        let server_host = server.split(':').next().unwrap_or("127.0.0.1");
+        let default_ha_url = format!("http://{}:8123", server_host);
+        let ha_url = sip_cfg.ha_url.as_deref().unwrap_or(&default_ha_url);
+        let ha_token = sip_cfg
+            .ha_token
+            .clone()
+            .or_else(|| std::env::var("HA_TOKEN").ok())
+            .or_else(|| std::env::var("SUPERVISOR_TOKEN").ok());
+
+        let ha_client = ha_token
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|token| sip::ha::HaVoipClient::new(ha_url, token));
+
+        if ha_client.is_some() {
+            info!(ha_url = %ha_url, "Home Assistant voip_stack auto-provisioning enabled");
+        }
+
+        let mut used_exts = std::collections::HashSet::new();
+        for acc in sip_cfg.accounts.values() {
+            if let Some(ext) = &acc.extension {
+                used_exts.insert(ext.clone());
+            }
+        }
+
+        let mut next_ext = sip_cfg.base_extension;
+        let mut alloc_ext = || -> String {
+            loop {
+                let candidate = next_ext.to_string();
+                next_ext += 1;
+                if !used_exts.contains(&candidate) {
+                    used_exts.insert(candidate.clone());
+                    return candidate;
+                }
+            }
+        };
+
+        // 1. Add explicitly configured SIP accounts (sorted for deterministic extension assignment)
+        let mut explicit_names: Vec<_> = sip_cfg.accounts.keys().cloned().collect();
+        explicit_names.sort();
+
+        for stream_name in explicit_names {
+            let acc_cfg = &sip_cfg.accounts[&stream_name];
+            let extension = acc_cfg.extension.clone().unwrap_or_else(&mut alloc_ext);
+            let auth_user = acc_cfg
+                .auth_user
+                .clone()
+                .unwrap_or_else(|| format!("camera_{}", stream_name));
+            let password = acc_cfg
+                .password
+                .clone()
+                .unwrap_or_else(|| sip_cfg.auto_password.clone());
+
             let client_cfg = sip::client::SipAccountConfig {
                 stream_name: stream_name.clone(),
                 server: server.to_string(),
                 domain: domain.to_string(),
-                extension: acc_cfg.extension.clone(),
-                auth_user: acc_cfg.auth_user.clone(),
-                password: acc_cfg.password.clone(),
+                extension,
+                auth_user,
+                password,
                 display_name: acc_cfg.display_name.clone(),
                 ring_group: acc_cfg.ring_group.clone(),
                 auto_answer: acc_cfg.auto_answer,
                 local_ip: local_ip.to_string(),
+                ha_client: ha_client.clone(),
             };
             if let Err(e) = sip_manager.add_account(client_cfg).await {
                 error!(stream = %stream_name, "Failed to initialize SIP account: {}", e);
+            }
+        }
+
+        // 2. Auto-register remaining primary camera streams if enabled
+        if sip_cfg.auto_register_streams {
+            let mut stream_names: Vec<_> = config.streams.keys().cloned().collect();
+            stream_names.sort();
+
+            for stream_name in stream_names {
+                if stream_name.ends_with("_sub") || sip_cfg.accounts.contains_key(&stream_name) {
+                    continue;
+                }
+                let extension = alloc_ext();
+                let auth_user = format!("camera_{}", stream_name);
+                let display_name = format!("Camera {}", stream_name);
+
+                let client_cfg = sip::client::SipAccountConfig {
+                    stream_name: stream_name.clone(),
+                    server: server.to_string(),
+                    domain: domain.to_string(),
+                    extension,
+                    auth_user,
+                    password: sip_cfg.auto_password.clone(),
+                    display_name,
+                    ring_group: None,
+                    auto_answer: true,
+                    local_ip: local_ip.to_string(),
+                    ha_client: ha_client.clone(),
+                };
+                if let Err(e) = sip_manager.add_account(client_cfg).await {
+                    error!(stream = %stream_name, "Failed to auto-register SIP account: {}", e);
+                }
             }
         }
     }
