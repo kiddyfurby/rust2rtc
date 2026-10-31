@@ -98,10 +98,11 @@ impl G711Repacker {
             let chunk: Vec<u8> = self.buffer.drain(..self.packet_size).collect();
             let mut rtp_packet = BytesMut::with_capacity(12 + self.packet_size);
 
-            // RTP Header
+            // RTP Header (Marker bit only on first packet of talkspurt)
+            let marker = if self.sequence_number == 0 { 0x80 } else { 0x00 };
             rtp_packet.extend_from_slice(&[
                 0x80, // Version 2, no padding, no extension, 0 CSRC
-                self.payload_type | 0x80, // Marker bit set + payload type
+                self.payload_type | marker,
             ]);
             rtp_packet.extend_from_slice(&self.sequence_number.to_be_bytes());
             rtp_packet.extend_from_slice(&self.timestamp.to_be_bytes());

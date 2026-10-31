@@ -59,18 +59,28 @@ impl FfmpegManager {
 
         let resolved = resolve_source(source, rtsp_port);
 
-        // Default RTSP or file remux: stream via ffmpeg into rtsp loopback
+        // Default RTSP or file remux: copy video and normalize audio to 8kHz mono G.711 PCMA for WebRTC/SIP compatibility
         let output_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_id);
         let args = vec![
             "-hide_banner".to_string(),
             "-v".to_string(),
             "warning".to_string(),
+            "-fflags".to_string(),
+            "nobuffer".to_string(),
+            "-flags".to_string(),
+            "low_delay".to_string(),
             "-rtsp_transport".to_string(),
             "tcp".to_string(),
             "-i".to_string(),
             resolved,
-            "-c".to_string(),
+            "-c:v".to_string(),
             "copy".to_string(),
+            "-c:a".to_string(),
+            "pcm_alaw".to_string(),
+            "-ar".to_string(),
+            "8000".to_string(),
+            "-ac".to_string(),
+            "1".to_string(),
             "-f".to_string(),
             "rtsp".to_string(),
             "-rtsp_transport".to_string(),
@@ -282,8 +292,14 @@ impl FfmpegManager {
 }
 
 pub fn resolve_source(source: &str, rtsp_port: u16) -> String {
-    if source.starts_with("onvif://") {
-        if let Ok(url) = url::Url::parse(source) {
+    let clean_source = source
+        .split('#')
+        .next()
+        .unwrap_or(source)
+        .trim_end_matches("?backchannel=1");
+
+    if clean_source.starts_with("onvif://") {
+        if let Ok(url) = url::Url::parse(clean_source) {
             let host = url.host_str().unwrap_or("127.0.0.1");
             let user = url.username();
             let pass = url.password().unwrap_or("");
@@ -291,19 +307,19 @@ pub fn resolve_source(source: &str, rtsp_port: u16) -> String {
         }
     }
 
-    if source.starts_with("tapo://") {
-        if let Ok(url) = url::Url::parse(source) {
+    if clean_source.starts_with("tapo://") {
+        if let Ok(url) = url::Url::parse(clean_source) {
             let host = url.host_str().unwrap_or("127.0.0.1");
             return format!("rtsp://frigate:REDACTED_PASSWORD@{}/stream1", host);
         }
     }
 
-    if !source.contains("://") && !source.starts_with("exec:") && !source.starts_with("ffmpeg:") {
+    if !clean_source.contains("://") && !clean_source.starts_with("exec:") && !clean_source.starts_with("ffmpeg:") {
         // References another stream by name
-        return format!("rtsp://127.0.0.1:{}/{}", rtsp_port, source);
+        return format!("rtsp://127.0.0.1:{}/{}", rtsp_port, clean_source);
     }
 
-    source.to_string()
+    clean_source.to_string()
 }
 
 /// Helper function to generate an MD5 stream hash path like go2rtc
