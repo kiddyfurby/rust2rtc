@@ -26,7 +26,8 @@ pub struct OnvifBackchannelClient {
 
 impl OnvifBackchannelClient {
     pub fn new(raw_url: &str) -> Result<Self> {
-        let mut url = Url::parse(raw_url).context("Failed to parse RTSP/ONVIF URL")?;
+        let clean_url = raw_url.split('#').next().unwrap_or(raw_url);
+        let mut url = Url::parse(clean_url).context("Failed to parse RTSP/ONVIF URL")?;
         // If scheme is onvif, normalize to standard rtsp port 554 if needed
         if url.scheme() == "onvif" {
             let host = url.host_str().unwrap_or("127.0.0.1").to_string();
@@ -310,7 +311,8 @@ fn resolve_control_url(control: &str, base_url: &str) -> String {
     } else if control == "*" {
         base_url.to_string()
     } else {
-        let base = base_url.trim_end_matches('/');
+        let base_no_query = base_url.split('?').next().unwrap_or(base_url);
+        let base = base_no_query.trim_end_matches('/');
         format!("{}/{}", base, control.trim_start_matches('/'))
     }
 }
