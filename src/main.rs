@@ -150,7 +150,11 @@ async fn main() -> Result<()> {
         .map(|w| w.candidates.clone())
         .unwrap_or_default();
 
-    let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(webrtc_candidates));
+    let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(
+        webrtc_candidates,
+        rtsp_port,
+        ffmpeg_manager.bin().to_string(),
+    ));
 
     // Initialize SIP Manager
     let sip_manager = Arc::new(sip::SipManager::new(
