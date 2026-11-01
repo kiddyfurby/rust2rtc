@@ -742,29 +742,40 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     let copy_audio = has_aac && allow_audio;
                     let transcode_audio = !has_aac && allow_audio;
 
-                    let (mime, copy_video) = if has_h265 {
+                    let copy_video = if has_h265 {
+                        client_codecs.contains("hvc1")
+                    } else {
+                        true
+                    };
+
+                    let video_track = stream.get_tracks().await.into_iter().find(|t| t.kind == crate::core::MediaKind::Video);
+                    let use_native_fmp4 = copy_video && !has_h265 && video_track.is_some();
+
+                    let mime = if use_native_fmp4 {
+                        "video/mp4; codecs=\"avc1.640029\""
+                    } else if has_h265 {
                         if client_codecs.contains("hvc1") {
                             if allow_audio {
-                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\"", true)
+                                "video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\""
                             } else {
-                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0\"", true)
+                                "video/mp4; codecs=\"hvc1.1.6.L153.B0\""
                             }
                         } else {
                             if allow_audio {
-                                ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", false)
+                                "video/mp4; codecs=\"avc1.640029,mp4a.40.2\""
                             } else {
-                                ("video/mp4; codecs=\"avc1.640029\"", false)
+                                "video/mp4; codecs=\"avc1.640029\""
                             }
                         }
                     } else {
                         if allow_audio {
-                            ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", true)
+                            "video/mp4; codecs=\"avc1.640029,mp4a.40.2\""
                         } else {
-                            ("video/mp4; codecs=\"avc1.640029\"", true)
+                            "video/mp4; codecs=\"avc1.640029\""
                         }
                     };
 
-                    info!(stream = %src_name, mime = %mime, copy_video = copy_video, copy_audio = copy_audio, transcode_audio = transcode_audio, "Starting MSE fMP4 stream");
+                    info!(stream = %src_name, mime = %mime, copy_video = copy_video, use_native_fmp4 = use_native_fmp4, "Starting MSE fMP4 stream");
 
                     let reply = WsMessage {
                         msg_type: "mse".to_string(),
@@ -778,11 +789,10 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         h.abort();
                     }
 
-                    let video_track = stream.get_tracks().await.into_iter().find(|t| t.kind == crate::core::MediaKind::Video);
                     let tx_mse = tx.clone();
                     let stream_name = src_name.clone();
 
-                    if copy_video && !has_h265 && video_track.is_some() {
+                    if use_native_fmp4 {
                         // Pure-Rust in-process fMP4 multiplexer (Zero FFmpeg subprocess)
                         let vtrack = video_track.unwrap();
                         info!(stream = %stream_name, "Starting pure-Rust in-process MSE fMP4 stream (no FFmpeg)");
