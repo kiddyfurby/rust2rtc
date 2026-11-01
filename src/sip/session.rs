@@ -465,11 +465,11 @@ impl SipCallSession {
                             "-c:v".to_string(),
                             "mjpeg".to_string(),
                             "-q:v".to_string(),
-                            "4".to_string(),
+                            "5".to_string(),
                             "-r".to_string(),
                             "15".to_string(),
                             "-vf".to_string(),
-                            "scale='min(800,iw)':-2".to_string(),
+                            "scale='min(640,iw)':-2".to_string(),
                             "-pix_fmt".to_string(),
                             "yuvj420p".to_string(),
                             "-huffman".to_string(),
@@ -505,7 +505,9 @@ impl SipCallSession {
                         let mut pkt_count = 0u64;
                         let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
                         let out_ssrc = 0x52544302u32;
-                        let mut timestamp: u32 = (uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32;
+                        let base_timestamp: u32 = (uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32;
+                        let start_time = tokio::time::Instant::now();
+                        let mut next_frame_time = tokio::time::Instant::now();
 
                         loop {
                             let n = match stdout.read(&mut chunk).await {
@@ -522,7 +524,10 @@ impl SipCallSession {
 
                             stream_buf.extend_from_slice(&chunk[..n]);
 
-                            // Frame and packetize full JPEG images between SOI (0xFF, 0xD8) and EOI (0xFF, 0xD9)
+                            // Extract complete frames. If backlog has accumulated, drop stale frames and keep only the latest live frame
+                            let mut latest_frame: Option<Vec<u8>> = None;
+                            let mut dropped_count = 0;
+
                             while let Some(soi_pos) = find_marker(&stream_buf, &[0xFF, 0xD8]) {
                                 if soi_pos > 0 {
                                     stream_buf.drain(..soi_pos);
@@ -532,43 +537,55 @@ impl SipCallSession {
                                 }
                                 if let Some(eoi_rel) = find_marker(&stream_buf[2..], &[0xFF, 0xD9]) {
                                     let eoi_pos = 2 + eoi_rel + 2;
-                                    let jpeg_frame = &stream_buf[..eoi_pos];
-
-                                    if let Some(packets) = crate::sip::rfc2435::packetize_jpeg_rtp(
-                                        jpeg_frame,
-                                        &mut out_seq,
-                                        timestamp,
-                                        out_ssrc,
-                                        1200,
-                                    ) {
-                                        let (primary, alt) = *tx_v_targets.lock().await;
-                                        for pkt in packets {
-                                            if let Err(e) = video_socket.send_to(&pkt, primary).await {
-                                                debug!("Error forwarding RFC 2435 JPEG RTP: {}", e);
-                                                break;
-                                            }
-                                            if let Some(alt_addr) = alt {
-                                                if alt_addr != primary {
-                                                    let _ = video_socket.send_to(&pkt, alt_addr).await;
-                                                }
-                                            }
-                                            pkt_count += 1;
-                                        }
-                                        timestamp = timestamp.wrapping_add(6000); // 15 fps clock advance
-                                        if pkt_count == 1 || pkt_count % 300 == 0 {
-                                            info!(
-                                                call_id = %call_id_video,
-                                                packets_sent = pkt_count,
-                                                target = %primary,
-                                                "Actively streaming RFC 2435 JPEG RTP to SIP peer"
-                                            );
-                                        }
+                                    if latest_frame.is_some() {
+                                        dropped_count += 1;
                                     }
-
+                                    latest_frame = Some(stream_buf[..eoi_pos].to_vec());
                                     stream_buf.drain(..eoi_pos);
                                 } else {
                                     // Incomplete frame, wait for more data
                                     break;
+                                }
+                            }
+
+                            if dropped_count > 0 {
+                                debug!(call_id = %call_id_video, dropped = dropped_count, "Dropped stale buffered JPEG frames to keep zero latency");
+                            }
+
+                            if let Some(jpeg_frame) = latest_frame {
+                                // Pace transmission to real-time 15 fps (66ms)
+                                tokio::time::sleep_until(next_frame_time).await;
+                                next_frame_time = tokio::time::Instant::now() + Duration::from_millis(66);
+
+                                let timestamp = base_timestamp.wrapping_add((start_time.elapsed().as_micros() * 9 / 100) as u32);
+                                if let Some(packets) = crate::sip::rfc2435::packetize_jpeg_rtp(
+                                    &jpeg_frame,
+                                    &mut out_seq,
+                                    timestamp,
+                                    out_ssrc,
+                                    1200,
+                                ) {
+                                    let (primary, alt) = *tx_v_targets.lock().await;
+                                    for pkt in packets {
+                                        if let Err(e) = video_socket.send_to(&pkt, primary).await {
+                                            debug!("Error forwarding RFC 2435 JPEG RTP: {}", e);
+                                            break;
+                                        }
+                                        if let Some(alt_addr) = alt {
+                                            if alt_addr != primary {
+                                                let _ = video_socket.send_to(&pkt, alt_addr).await;
+                                            }
+                                        }
+                                        pkt_count += 1;
+                                    }
+                                    if pkt_count == 1 || pkt_count % 300 == 0 {
+                                        info!(
+                                            call_id = %call_id_video,
+                                            packets_sent = pkt_count,
+                                            target = %primary,
+                                            "Actively streaming RFC 2435 JPEG RTP to SIP peer"
+                                        );
+                                    }
                                 }
                             }
 
