@@ -405,7 +405,7 @@ async fn index_handler() -> Html<&'static str> {
 async fn api_info_handler(State(state): State<AppState>) -> Response {
     let resp = serde_json::json!({
         "version": "1.9.14",
-        "revision": "rust2rtc-0.2.0",
+        "revision": concat!("rust2rtc-", env!("CARGO_PKG_VERSION")),
         "host": "127.0.0.1:1984",
         "rtsp": {
             "listen": format!(":{}", state.rtsp_port),
