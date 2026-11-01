@@ -216,6 +216,101 @@ impl Stream {
             tracks: track_infos,
         }
     }
+
+    /// Convert to go2rtc-compatible stream schema for Home Assistant / Frigate / advanced-camera-card
+    pub async fn to_go2rtc(&self) -> Go2rtcStream {
+        let tracks = self.tracks.read().await;
+        let mut total_consumers = 0;
+        let mut total_packets = self.packets_recv.load(Ordering::Relaxed);
+        let mut total_bytes = self.bytes_recv.load(Ordering::Relaxed);
+        let mut medias = Vec::new();
+
+        for track in tracks.iter() {
+            total_consumers += track.consumer_count();
+            total_packets += track.packets_total.load(Ordering::Relaxed);
+            total_bytes += track.bytes_total.load(Ordering::Relaxed);
+            medias.push(format!(
+                "{:?}, sendonly, {}/{}",
+                track.kind, track.codec.name, track.codec.clock_rate
+            ));
+        }
+
+        let is_active = self.producer.lock().await.is_some() || !tracks.is_empty();
+        let source_url = self.sources.first().cloned().unwrap_or_else(|| "unknown".to_string());
+
+        let mut producers = Vec::new();
+        if is_active {
+            producers.push(Go2rtcProducer {
+                id: Some(1),
+                producer_type: "RTSP active producer".to_string(),
+                url: source_url,
+                remote_addr: None,
+                medias: medias.clone(),
+                recv: total_bytes,
+                recv_packets: Some(total_packets),
+            });
+        } else if !self.sources.is_empty() {
+            producers.push(Go2rtcProducer {
+                id: None,
+                producer_type: "configured".to_string(),
+                url: source_url,
+                remote_addr: None,
+                medias: vec![],
+                recv: 0,
+                recv_packets: Some(0),
+            });
+        }
+
+        let mut consumers = Vec::new();
+        if total_consumers > 0 {
+            consumers.push(Go2rtcConsumer {
+                id: Some(2),
+                consumer_type: "WebRTC / RTSP client".to_string(),
+                remote_addr: None,
+                medias,
+                send: Some(total_bytes),
+            });
+        }
+
+        Go2rtcStream {
+            producers,
+            consumers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Go2rtcProducer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(rename = "type")]
+    pub producer_type: String,
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    pub medias: Vec<String>,
+    pub recv: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recv_packets: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Go2rtcConsumer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    #[serde(rename = "type")]
+    pub consumer_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    pub medias: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub send: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Go2rtcStream {
+    pub producers: Vec<Go2rtcProducer>,
+    pub consumers: Vec<Go2rtcConsumer>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -277,5 +372,47 @@ impl StreamManager {
             list.push(stream.to_info().await);
         }
         list
+    }
+
+    pub async fn get_go2rtc_streams(&self) -> HashMap<String, Go2rtcStream> {
+        let map = self.streams.read().await;
+        let mut result = HashMap::new();
+        for (name, stream) in map.iter() {
+            result.insert(name.clone(), stream.to_go2rtc().await);
+        }
+        result
+    }
+
+    pub async fn get_go2rtc_stream(&self, name: &str) -> Option<Go2rtcStream> {
+        let map = self.streams.read().await;
+        if let Some(stream) = map.get(name) {
+            Some(stream.to_go2rtc().await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn delete(&self, name: &str) -> bool {
+        let mut map = self.streams.write().await;
+        map.remove(name).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_go2rtc_stream_schema() {
+        let stream = Stream::new("doorbell".to_string(), vec!["rtsp://192.168.1.10/stream".to_string()]);
+        let go2rtc_info = stream.to_go2rtc().await;
+
+        let json_val = serde_json::to_value(&go2rtc_info).expect("serialize to json");
+        assert!(json_val.get("producers").is_some());
+        assert!(json_val.get("consumers").is_some());
+
+        let producers = json_val.get("producers").unwrap().as_array().unwrap();
+        assert_eq!(producers.len(), 1);
+        assert_eq!(producers[0].get("url").unwrap(), "rtsp://192.168.1.10/stream");
     }
 }
