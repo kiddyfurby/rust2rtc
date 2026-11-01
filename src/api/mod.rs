@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncReadExt;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info};
@@ -573,15 +574,27 @@ async fn api_ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, query, state))
 }
 
-async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) {
-    let default_src = query.src.or(query.name);
+async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
+    let default_src = query.src.or(query.name).or(query.val);
+    let (mut ws_sink, mut ws_stream) = socket.split();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(256);
 
-    while let Some(msg_result) = socket.recv().await {
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if ws_sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut mse_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    while let Some(msg_result) = ws_stream.next().await {
         let msg = match msg_result {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(p)) => {
-                let _ = socket.send(Message::Pong(p)).await;
+                let _ = tx.send(Message::Pong(p)).await;
                 continue;
             }
             Ok(_) => continue,
@@ -615,7 +628,7 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                         value: Some(serde_json::Value::String("Empty SDP offer".to_string())),
                     };
                     if let Ok(json_str) = serde_json::to_string(&err_reply) {
-                        let _ = socket.send(Message::Text(json_str.into())).await;
+                        let _ = tx.send(Message::Text(json_str.into())).await;
                     }
                     continue;
                 }
@@ -637,7 +650,7 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                                 value: Some(serde_json::Value::String(answer_sdp)),
                             };
                             if let Ok(json_str) = serde_json::to_string(&answer_msg) {
-                                let _ = socket.send(Message::Text(json_str.into())).await;
+                                let _ = tx.send(Message::Text(json_str.into())).await;
                             }
                             // Signal end of ICE candidates (compatible with go2rtc WebRTC client)
                             let cand_msg = WsMessage {
@@ -645,7 +658,7 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                                 value: Some(serde_json::Value::String(String::new())),
                             };
                             if let Ok(json_str) = serde_json::to_string(&cand_msg) {
-                                let _ = socket.send(Message::Text(json_str.into())).await;
+                                let _ = tx.send(Message::Text(json_str.into())).await;
                             }
                         }
                         Err(e) => {
@@ -655,7 +668,7 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                                 value: Some(serde_json::Value::String(format!("WebRTC error: {}", e))),
                             };
                             if let Ok(json_str) = serde_json::to_string(&err_msg) {
-                                let _ = socket.send(Message::Text(json_str.into())).await;
+                                let _ = tx.send(Message::Text(json_str.into())).await;
                             }
                         }
                     }
@@ -665,7 +678,7 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                         value: Some(serde_json::Value::String(format!("Stream '{}' not found", src_name))),
                     };
                     if let Ok(json_str) = serde_json::to_string(&err_msg) {
-                        let _ = socket.send(Message::Text(json_str.into())).await;
+                        let _ = tx.send(Message::Text(json_str.into())).await;
                     }
                 }
             }
@@ -673,8 +686,8 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                 debug!("Received ICE candidate via WebSocket: {:?}", ws_msg.value);
             }
             "mse" => {
-                let src_name = default_src.as_deref().unwrap_or("");
-                if let Some(stream) = state.streams.get(src_name).await {
+                let src_name = default_src.as_deref().unwrap_or("").to_string();
+                if let Some(stream) = state.streams.get(&src_name).await {
                     let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
                     for _ in 0..50 {
                         if !stream.get_tracks().await.is_empty() {
@@ -733,81 +746,82 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
                         value: Some(serde_json::Value::String(mime.to_string())),
                     };
                     if let Ok(json_str) = serde_json::to_string(&reply) {
-                        let _ = socket.send(Message::Text(json_str.into())).await;
+                        let _ = tx.send(Message::Text(json_str.into())).await;
+                    }
+
+                    if let Some(h) = mse_handle.take() {
+                        h.abort();
                     }
 
                     let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src_name);
-                    let mut cmd = tokio::process::Command::new(state.ffmpeg.bin());
-                    cmd.args([
-                        "-hide_banner",
-                        "-loglevel", "warning",
-                        "-rtsp_transport", "tcp",
-                        "-i", &rtsp_url,
-                    ]);
+                    let ffmpeg_bin = state.ffmpeg.bin().to_string();
+                    let tx_mse = tx.clone();
 
-                    if copy_video {
-                        cmd.args(["-c:v", "copy"]);
-                    } else {
-                        cmd.args(["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]);
-                    }
+                    mse_handle = Some(tokio::spawn(async move {
+                        let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+                        cmd.kill_on_drop(true);
+                        cmd.args([
+                            "-hide_banner",
+                            "-loglevel", "warning",
+                            "-fflags", "nobuffer",
+                            "-flags", "low_delay",
+                            "-rtsp_transport", "tcp",
+                            "-i", &rtsp_url,
+                        ]);
 
-                    if copy_audio {
-                        cmd.args(["-c:a", "copy"]);
-                    } else {
-                        cmd.arg("-an");
-                    }
-
-                    cmd.args([
-                        "-f", "mp4",
-                        "-movflags", "empty_moov+default_base_moof+frag_keyframe",
-                        "-flush_packets", "1",
-                        "-reset_timestamps", "1",
-                        "pipe:1",
-                    ]);
-                    cmd.stdout(std::process::Stdio::piped());
-                    cmd.stderr(std::process::Stdio::null());
-
-                    let mut child = match cmd.spawn() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Failed to spawn FFmpeg for MSE stream {}: {}", src_name, e);
-                            continue;
+                        if copy_video {
+                            cmd.args(["-c:v", "copy"]);
+                        } else {
+                            cmd.args(["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]);
                         }
-                    };
 
-                    if let Some(mut stdout) = child.stdout.take() {
-                        let mut buf = vec![0u8; 8192];
-                        loop {
-                            tokio::select! {
-                                read_res = stdout.read(&mut buf) => {
-                                    match read_res {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            if socket.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                                                break;
-                                            }
+                        if copy_audio {
+                            cmd.args(["-c:a", "copy"]);
+                        } else {
+                            cmd.arg("-an");
+                        }
+
+                        cmd.args([
+                            "-f", "mp4",
+                            "-movflags", "empty_moov+default_base_moof+frag_every_frame",
+                            "-flush_packets", "1",
+                            "-reset_timestamps", "1",
+                            "pipe:1",
+                        ]);
+                        cmd.stdout(std::process::Stdio::piped());
+                        cmd.stderr(std::process::Stdio::null());
+
+                        let mut child = match cmd.spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("Failed to spawn FFmpeg for MSE stream {}: {}", src_name, e);
+                                return;
+                            }
+                        };
+
+                        if let Some(mut stdout) = child.stdout.take() {
+                            let mut buf = vec![0u8; 8192];
+                            loop {
+                                match stdout.read(&mut buf).await {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if tx_mse.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                                            break;
                                         }
-                                        Err(_) => break,
                                     }
-                                }
-                                ws_msg = socket.recv() => {
-                                    match ws_msg {
-                                        Some(Ok(Message::Close(_))) | None => break,
-                                        _ => {}
-                                    }
+                                    Err(_) => break,
                                 }
                             }
                         }
-                    }
-                    let _ = child.kill().await;
-                    return;
+                        let _ = child.kill().await;
+                    }));
                 } else {
                     let err_msg = WsMessage {
                         msg_type: "error".to_string(),
                         value: Some(serde_json::Value::String(format!("Stream '{}' not found", src_name))),
                     };
                     if let Ok(json_str) = serde_json::to_string(&err_msg) {
-                        let _ = socket.send(Message::Text(json_str.into())).await;
+                        let _ = tx.send(Message::Text(json_str.into())).await;
                     }
                 }
             }
@@ -816,6 +830,11 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
             }
         }
     }
+
+    if let Some(h) = mse_handle {
+        h.abort();
+    }
+    writer_task.abort();
 }
 
 async fn api_sip_call_handler(
