@@ -6,6 +6,8 @@
 
 It serves as a **drop-in binary replacement for `go2rtc`** across the smart home ecosystem — working out of the box with **[Frigate NVR](https://frigate.video/)**, **[Advanced Camera Card](https://card.camera/)**, **Home Assistant**, and WebRTC client libraries like `video-rtc.js`.
 
+In addition, `rust2rtc` functions as a **high-performance bidirectional SIP bridge**, bridging standard RTSP Wi-Fi / IP cameras (such as Reolink, Tapo, TP-Link, Yi) to SIP endpoints. This allows you to **see live video and talk directly with your cameras** from VoIP phones, SIP softphones, smart panels, and hardware intercom devices like **[ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/)**.
+
 > [!NOTE]
 > **Project Notice**: `rust2rtc` is an active, high-performance rewrite of `go2rtc`. The core RTSP relay, WebRTC (WHEP + WebSocket), in-process AAC/G.711 to Opus transcoding, native fMP4 (MSE), SIP intercom/backchannel, and snapshot pipelines are fully working and verified in production environments. Contributions, issues, and PRs are warmly welcomed!
 
@@ -45,7 +47,9 @@ It serves as a **drop-in binary replacement for `go2rtc`** across the smart home
 - **📸 High-Speed Snapshots**:
   - Instant JPEG frame capture via `/api/frame.jpeg?src=<stream>` for both H.264 and H.265 (HEVC) streams.
   - Optimized pipeline with low-delay decoding and track readiness polling.
-- **📞 SIP Gateway & Intercom Integration**:
+- **📞 Bidirectional SIP Bridge & Intercom Gateway**:
+  - **Bridge RTSP Cameras to SIP**: Exposes ordinary RTSP Wi-Fi / IP cameras as interactive SIP intercom extensions that can be dialed, viewed, and spoken to from VoIP phones or smart screens.
+  - **Hardware Intercom Support**: Seamlessly stream live video and two-way audio to [**ESPHome Intercom**](https://github.com/n-IA-hane/esphome-intercom/), Grandstream, Akuvox, and low-power ESP32 panels.
   - Asynchronous SIP protocol engine supporting standard Digest MD5 authentication, auto-registration, Keep-Alive `OPTIONS` pings, and graceful unregistration (`REGISTER Expires: 0`) on shutdown.
   - Inbound call handling with symmetric RTP and Call-ID response routing.
   - Auto-configuration of Home Assistant SIP integration via REST API with dynamic account provisioning.
@@ -54,7 +58,7 @@ It serves as a **drop-in binary replacement for `go2rtc`** across the smart home
   - High-fidelity PCM / G.711a (PCMA) / G.711u (PCMU) transcoding and repacking into standard 20ms audio frames (160 samples @ 8kHz).
 - **📺 Video over SIP (H.264 & RFC 2435 JPEG RTP)**:
   - **H.264 Video Relay**: SSRC normalization, dynamic payload type rewriting, and SPS/PPS parameter set injection for SIP video phones.
-  - **RFC 2435 JPEG RTP Streaming**: Hardware-friendly MJPEG RTP streaming for low-power smart panels and intercom screens (e.g. Waveshare ESP32-P4 Touch panels, Grandstream, Akuvox).
+  - **RFC 2435 JPEG RTP Streaming**: Hardware-friendly MJPEG RTP streaming for low-power smart panels and intercom screens (e.g. Waveshare ESP32-P4 Touch panels running [**ESPHome Intercom**](https://github.com/n-IA-hane/esphome-intercom/), Grandstream, Akuvox).
   - Real-time 15 fps frame pacing and backlog-dropping pipeline to ensure zero lag and prevent socket buffer bloat.
 - **🖥️ Built-in Web Dashboard**:
   - Web UI on port `:1984` featuring auto-refreshing snapshot tiles, stream statistics (packets, bytes, active consumers), and instant WebRTC live preview.
@@ -297,6 +301,20 @@ Works out-of-the-box with:
 - Native snapshot capture (`GET /api/frame.jpeg?src=<stream>`)
 - WebRTC WHEP endpoint (`POST /api/webrtc?src=<stream>`)
 - Dynamic stream provisioning (`POST / PUT / DELETE /api/streams`)
+
+#### 4. Bidirectional SIP Intercom Bridge ([ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/))
+`rust2rtc` acts as a full-duplex SIP-to-RTSP media bridge, enabling any SIP endpoint, VoIP handset, softphone, or smart wall panel to interact directly with standard RTSP Wi-Fi / IP cameras:
+- **See & Talk with Wi-Fi Cameras**: Exposes RTSP camera feeds (such as Reolink, Tapo, TP-Link, Yi) as dialable SIP extensions (e.g., ext `101`, `102`). Calling a camera extension instantly starts real-time video streaming and bidirectional talkback.
+- **Hardware Intercom Support ([ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/))**: Fully tested with ESP32-based intercom screens and wall panels (e.g. Waveshare ESP32-P4 Touch, ESP32-S3). Displays low-latency RFC 2435 JPEG RTP or H.264 video while providing synchronized two-way audio.
+- **Automated PBX Registration**: Configure the `sip:` section with your SIP PBX (FreePBX, Asterisk, or Home Assistant VoIP Integration) with `auto_register_streams: true` to automatically assign and register extensions for all streams with zero manual SIP config.
+
+```yaml
+sip:
+  server: "192.168.1.5:5060"     # IP of your SIP PBX or Home Assistant VoIP
+  auto_register_streams: true    # Automatically registers extensions 101, 102...
+  base_extension: 101
+  auto_password: "IntercomPassword123"
+```
 
 ---
 
