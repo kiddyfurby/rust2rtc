@@ -109,16 +109,20 @@ impl RtspClient {
         let mut auth_info: Option<AuthMethod> = None;
         let mut session_id: Option<String> = None;
         let mut content_base = clean_url.clone();
+        let mut buffer = BytesMut::with_capacity(65536);
 
         // 1. Send OPTIONS
         let (_, _opt_headers, opt_code) = Self::send_request_with_auth(
             &mut tcp,
+            &mut buffer,
             "OPTIONS",
             &clean_url,
             &mut cseq,
             &username,
             &password,
             &mut auth_info,
+            None,
+            None,
             None,
             None,
         ).await?;
@@ -130,6 +134,7 @@ impl RtspClient {
         // 2. Send DESCRIBE
         let (sdp_body, desc_headers, desc_code) = Self::send_request_with_auth(
             &mut tcp,
+            &mut buffer,
             "DESCRIBE",
             &clean_url,
             &mut cseq,
@@ -138,6 +143,8 @@ impl RtspClient {
             &mut auth_info,
             session_id.as_deref(),
             Some(&[("Accept", "application/sdp")]),
+            None,
+            None,
         ).await?;
 
         if desc_code != 200 {
@@ -149,7 +156,8 @@ impl RtspClient {
         }
 
         let sdp_str = String::from_utf8_lossy(&sdp_body);
-        let sdp_tracks = parse_sdp_tracks_with_control(&sdp_str, &content_base);
+        let existing_tracks = stream.get_tracks().await;
+        let sdp_tracks = parse_sdp_tracks_with_control(&sdp_str, &content_base, &existing_tracks);
         if sdp_tracks.is_empty() {
             bail!("No supported media tracks found in camera SDP: {}", sdp_str);
         }
@@ -167,6 +175,7 @@ impl RtspClient {
             let transport_header = format!("RTP/AVP/TCP;unicast;interleaved={}-{}", rtp_ch, rtcp_ch);
             let (_, setup_headers, setup_code) = Self::send_request_with_auth(
                 &mut tcp,
+                &mut buffer,
                 "SETUP",
                 &t_info.control,
                 &mut cseq,
@@ -175,6 +184,8 @@ impl RtspClient {
                 &mut auth_info,
                 session_id.as_deref(),
                 Some(&[("Transport", &transport_header)]),
+                None,
+                None,
             ).await?;
 
             if setup_code != 200 {
@@ -201,22 +212,28 @@ impl RtspClient {
             bail!("Failed to SETUP any media tracks on camera {}", clean_url);
         }
 
-        // 4. Update Stream with native tracks
-        stream.clear_tracks().await;
-        for t in &registered_tracks {
-            info!(
-                stream = %stream.name,
-                kind = ?t.kind,
-                codec = %t.codec.name,
-                pt = t.codec.payload_type,
-                "Registered in-process camera media track"
-            );
-            stream.add_track(Arc::clone(t)).await;
+        // 4. Update Stream with native tracks (reusing existing if unchanged)
+        let current_tracks = stream.get_tracks().await;
+        let same = current_tracks.len() == registered_tracks.len()
+            && current_tracks.iter().zip(&registered_tracks).all(|(a, b)| Arc::ptr_eq(a, b));
+        if !same {
+            stream.clear_tracks().await;
+            for t in &registered_tracks {
+                info!(
+                    stream = %stream.name,
+                    kind = ?t.kind,
+                    codec = %t.codec.name,
+                    pt = t.codec.payload_type,
+                    "Registered in-process camera media track"
+                );
+                stream.add_track(Arc::clone(t)).await;
+            }
         }
 
         // 5. Send PLAY
         let (_, _, play_code) = Self::send_request_with_auth(
             &mut tcp,
+            &mut buffer,
             "PLAY",
             &clean_url,
             &mut cseq,
@@ -225,6 +242,8 @@ impl RtspClient {
             &mut auth_info,
             session_id.as_deref(),
             Some(&[("Range", "npt=0.000-")]),
+            Some(&channel_map),
+            Some(&stream),
         ).await?;
 
         if play_code != 200 {
@@ -234,7 +253,6 @@ impl RtspClient {
         info!(stream = %stream.name, "RTSP PLAY active, streaming in-process interleaved RTP");
 
         // 6. Interleaved RTP packet loop
-        let mut buffer = BytesMut::with_capacity(65536);
         let mut keepalive_timer = tokio::time::interval(Duration::from_secs(25));
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -280,21 +298,38 @@ impl RtspClient {
                 _ = &mut *cancel_rx => {
                     info!(stream = %stream.name, "Stopping in-process RTSP stream (cancellation received)");
                     if let Some(ref sess) = session_id {
-                        let _ = Self::send_raw_request(&mut tcp, "TEARDOWN", &clean_url, &mut cseq, Some(sess), None, None).await;
+                        let _ = Self::send_raw_request(
+                            &mut tcp,
+                            &mut buffer,
+                            "TEARDOWN",
+                            &clean_url,
+                            &mut cseq,
+                            Some(sess),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ).await;
                     }
                     return Ok(true);
                 }
                 _ = keepalive_timer.tick() => {
                     // Send RTSP keepalive (GET_PARAMETER or OPTIONS)
                     trace!(stream = %stream.name, "Sending RTSP keepalive");
-                    let _ = Self::send_raw_request(
-                        &mut tcp,
-                        "GET_PARAMETER",
-                        &clean_url,
-                        &mut cseq,
-                        session_id.as_deref(),
-                        auth_info.as_ref().and_then(|a| a.generate_header("GET_PARAMETER", &clean_url, &username, &password)).as_deref(),
-                        None
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(2000),
+                        Self::send_raw_request(
+                            &mut tcp,
+                            &mut buffer,
+                            "GET_PARAMETER",
+                            &clean_url,
+                            &mut cseq,
+                            session_id.as_deref(),
+                            auth_info.as_ref().and_then(|a| a.generate_header("GET_PARAMETER", &clean_url, &username, &password)).as_deref(),
+                            None,
+                            Some(&channel_map),
+                            Some(&stream),
+                        ),
                     ).await;
                 }
                 read_res = tcp.read_buf(&mut buffer) => {
@@ -319,6 +354,7 @@ impl RtspClient {
     /// Send an RTSP request, handling 401 Unauthorized challenge automatically
     async fn send_request_with_auth(
         tcp: &mut TcpStream,
+        buffer: &mut BytesMut,
         method: &str,
         url: &str,
         cseq: &mut u32,
@@ -327,17 +363,22 @@ impl RtspClient {
         auth_info: &mut Option<AuthMethod>,
         session: Option<&str>,
         extra_headers: Option<&[(&str, &str)]>,
+        channel_map: Option<&HashMap<u8, Arc<Track>>>,
+        stream: Option<&Arc<Stream>>,
     ) -> Result<(Vec<u8>, HashMap<String, String>, u16)> {
         // Try initial request with existing auth header if known
         let auth_hdr = auth_info.as_ref().and_then(|a| a.generate_header(method, url, user, pass));
         let (body, headers, status) = Self::send_raw_request(
             tcp,
+            buffer,
             method,
             url,
             cseq,
             session,
             auth_hdr.as_deref(),
             extra_headers,
+            channel_map,
+            stream,
         ).await?;
 
         if status == 401 {
@@ -347,12 +388,15 @@ impl RtspClient {
                     let new_auth_hdr = auth_info.as_ref().and_then(|a| a.generate_header(method, url, user, pass));
                     return Self::send_raw_request(
                         tcp,
+                        buffer,
                         method,
                         url,
                         cseq,
                         session,
                         new_auth_hdr.as_deref(),
                         extra_headers,
+                        channel_map,
+                        stream,
                     ).await;
                 }
             }
@@ -361,15 +405,18 @@ impl RtspClient {
         Ok((body, headers, status))
     }
 
-    /// Send a single raw RTSP request and parse the response
+    /// Send a single raw RTSP request and parse the response, draining any interleaved binary RTP/RTCP packets
     async fn send_raw_request(
         tcp: &mut TcpStream,
+        buffer: &mut BytesMut,
         method: &str,
         url: &str,
         cseq: &mut u32,
         session: Option<&str>,
         auth_header: Option<&str>,
         extra_headers: Option<&[(&str, &str)]>,
+        channel_map: Option<&HashMap<u8, Arc<Track>>>,
+        stream: Option<&Arc<Stream>>,
     ) -> Result<(Vec<u8>, HashMap<String, String>, u16)> {
         let cur_cseq = *cseq;
         *cseq += 1;
@@ -390,53 +437,86 @@ impl RtspClient {
 
         tcp.write_all(req.as_bytes()).await.context("Failed to send RTSP request")?;
 
-        // Read response
-        let mut resp_buf = BytesMut::with_capacity(4096);
         let mut content_length = 0usize;
         let mut status_code = 0u16;
         let mut headers = HashMap::new();
 
         loop {
-            // Find CRLFCRLF
-            if let Some(pos) = find_crlf_crlf(&resp_buf) {
-                let header_bytes = resp_buf.split_to(pos + 4);
-                let header_str = String::from_utf8_lossy(&header_bytes);
-                let mut lines = header_str.lines();
+            // 1. Process/drain any interleaved binary packets ($) preceding or interleaved with RTSP response
+            while !buffer.is_empty() && buffer[0] == b'$' {
+                if buffer.len() < 4 {
+                    break;
+                }
+                let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
+                if buffer.len() < 4 + length {
+                    break;
+                }
 
-                if let Some(status_line) = lines.next() {
-                    let parts: Vec<&str> = status_line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        status_code = parts[1].parse::<u16>().unwrap_or(0);
+                let _dollar = buffer.get_u8();
+                let ch = buffer.get_u8();
+                let _len = buffer.get_u16();
+                let packet_bytes = buffer.split_to(length).freeze();
+
+                if let Some(cmap) = channel_map {
+                    if let Some(track) = cmap.get(&ch) {
+                        if let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
+                            if let Some(st) = stream {
+                                st.packets_recv.fetch_add(1, Ordering::Relaxed);
+                                st.bytes_recv.fetch_add(packet_bytes.len() as u64, Ordering::Relaxed);
+                            }
+                            track.send(rtp);
+                        }
                     }
                 }
-
-                for line in lines {
-                    if let Some((k, v)) = line.split_once(':') {
-                        headers.insert(k.trim().to_lowercase(), v.trim().to_string());
-                    }
-                }
-
-                if let Some(len_str) = headers.get("content-length") {
-                    content_length = len_str.parse::<usize>().unwrap_or(0);
-                }
-                break;
             }
 
-            let n = tcp.read_buf(&mut resp_buf).await.context("Failed reading RTSP response")?;
+            // 2. Discard leading newlines/whitespace
+            while !buffer.is_empty() && (buffer[0] == b'\r' || buffer[0] == b'\n' || buffer[0] == b' ') {
+                let _ = buffer.get_u8();
+            }
+
+            // 3. Check if buffer starts with RTSP/ and contains complete headers
+            if buffer.starts_with(b"RTSP/") {
+                if let Some(pos) = find_crlf_crlf(buffer) {
+                    let header_bytes = buffer.split_to(pos + 4);
+                    let header_str = String::from_utf8_lossy(&header_bytes);
+                    let mut lines = header_str.lines();
+
+                    if let Some(status_line) = lines.next() {
+                        let parts: Vec<&str> = status_line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            status_code = parts[1].parse::<u16>().unwrap_or(0);
+                        }
+                    }
+
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':') {
+                            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+                        }
+                    }
+
+                    if let Some(len_str) = headers.get("content-length") {
+                        content_length = len_str.parse::<usize>().unwrap_or(0);
+                    }
+                    break;
+                }
+            }
+
+            let n = tcp.read_buf(buffer).await.context("Failed reading RTSP response headers")?;
             if n == 0 {
                 bail!("Premature EOF while reading RTSP response headers");
             }
         }
 
         // Read body if expected
-        while resp_buf.len() < content_length {
-            let n = tcp.read_buf(&mut resp_buf).await.context("Failed reading RTSP response body")?;
+        while buffer.len() < content_length {
+            let n = tcp.read_buf(buffer).await.context("Failed reading RTSP response body")?;
             if n == 0 {
                 bail!("Premature EOF while reading RTSP response body");
             }
         }
 
-        let body = resp_buf.split_to(content_length).to_vec();
+        let body = buffer.split_to(content_length).to_vec();
         Ok((body, headers, status_code))
     }
 }
@@ -549,7 +629,7 @@ impl TrackDraft {
         }
     }
 
-    fn to_track_info(&self, content_base: &str) -> SdpTrackInfo {
+    fn to_track_info(&self, content_base: &str, existing_tracks: &[Arc<Track>]) -> SdpTrackInfo {
         let codec = Codec {
             name: self.name.to_uppercase(),
             clock_rate: self.clock_rate,
@@ -557,8 +637,18 @@ impl TrackDraft {
             payload_type: self.pt,
             fmtp: self.fmtp.clone(),
         };
-        let cap = if self.kind == MediaKind::Video { 2048 } else { 256 };
-        let track = Arc::new(Track::new(codec, self.kind, cap));
+
+        // Reuse existing track broadcaster if stream already had one of matching kind/codec
+        let existing = existing_tracks.iter().find(|t| {
+            t.kind == self.kind && t.codec.name.eq_ignore_ascii_case(&self.name)
+        });
+
+        let track = if let Some(et) = existing {
+            Arc::clone(et)
+        } else {
+            let cap = if self.kind == MediaKind::Video { 2048 } else { 256 };
+            Arc::new(Track::new(codec, self.kind, cap))
+        };
 
         // Resolve track control URL
         let control_url = match &self.control {
@@ -582,7 +672,7 @@ impl TrackDraft {
 }
 
 /// Parse SDP body and extract media tracks with their RTSP control URLs
-fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str) -> Vec<SdpTrackInfo> {
+fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks: &[Arc<Track>]) -> Vec<SdpTrackInfo> {
     let mut tracks = Vec::new();
     let mut current_draft: Option<TrackDraft> = None;
 
@@ -590,21 +680,24 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str) -> Vec<SdpTrackI
         let line = line.trim();
         if let Some(m) = line.strip_prefix("m=") {
             if let Some(draft) = current_draft.take() {
-                tracks.push(draft.to_track_info(content_base));
+                tracks.push(draft.to_track_info(content_base, existing_tracks));
             }
 
             let parts: Vec<&str> = m.split_whitespace().collect();
             if !parts.is_empty() {
                 let kind = match parts[0] {
-                    "audio" => MediaKind::Audio,
-                    _ => MediaKind::Video,
+                    "audio" => Some(MediaKind::Audio),
+                    "video" => Some(MediaKind::Video),
+                    _ => None,
                 };
-                let pt = if parts.len() >= 4 {
-                    parts[3].parse::<u8>().unwrap_or(96)
-                } else {
-                    96
-                };
-                current_draft = Some(TrackDraft::new(kind, pt));
+                if let Some(kind) = kind {
+                    let pt = if parts.len() >= 4 {
+                        parts[3].parse::<u8>().unwrap_or(96)
+                    } else {
+                        96
+                    };
+                    current_draft = Some(TrackDraft::new(kind, pt));
+                }
             }
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
@@ -644,8 +737,54 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str) -> Vec<SdpTrackI
     }
 
     if let Some(draft) = current_draft.take() {
-        tracks.push(draft.to_track_info(content_base));
+        tracks.push(draft.to_track_info(content_base, existing_tracks));
     }
 
     tracks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_sdp_ignores_application_tracks() {
+        let sdp = "\
+v=0\r\n\
+o=- 1711200000 1 IN IP4 192.168.1.100\r\n\
+s=TP-LINK RTSP Server\r\n\
+t=0 0\r\n\
+m=video 0 RTP/AVP 96\r\n\
+a=rtpmap:96 H265/90000\r\n\
+a=control:track0\r\n\
+m=audio 0 RTP/AVP 8\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+a=control:track1\r\n\
+m=application/TP-LINK 0 RTP/AVP smart/1/90000\r\n\
+a=control:track3\r\n";
+
+        let tracks = parse_sdp_tracks_with_control(sdp, "rtsp://192.168.1.100/stream1/", &[]);
+        assert_eq!(tracks.len(), 2, "Should only have 2 tracks (video and audio), ignoring application");
+        assert_eq!(tracks[0].kind, MediaKind::Video);
+        assert_eq!(tracks[0].track.codec.name, "H265");
+        assert_eq!(tracks[0].control, "rtsp://192.168.1.100/stream1/track0");
+        assert_eq!(tracks[1].kind, MediaKind::Audio);
+        assert_eq!(tracks[1].track.codec.name, "PCMA");
+        assert_eq!(tracks[1].control, "rtsp://192.168.1.100/stream1/track1");
+    }
+
+    #[test]
+    fn test_parse_sdp_reuses_existing_tracks() {
+        let sdp = "\
+m=video 0 RTP/AVP 96\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=control:track0\r\n";
+
+        let existing_video = Arc::new(Track::new(Codec::new_h264(), MediaKind::Video, 100));
+        let existing = vec![Arc::clone(&existing_video)];
+
+        let tracks = parse_sdp_tracks_with_control(sdp, "rtsp://192.168.1.100/stream1/", &existing);
+        assert_eq!(tracks.len(), 1);
+        assert!(Arc::ptr_eq(&tracks[0].track, &existing_video), "Must reuse the existing Track Arc reference");
+    }
 }
