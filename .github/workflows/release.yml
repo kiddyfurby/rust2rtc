@@ -53,11 +53,16 @@ jobs:
         run: |
           if [ "${{ matrix.use_zig }}" = "true" ]; then
             cargo zigbuild --release --target ${{ matrix.target }}
-            cp target/${{ matrix.target }}/release/rust2rtc ${{ matrix.artifact_name }}
           else
             cargo build --release --target ${{ matrix.target }}
-            cp target/release/rust2rtc ${{ matrix.artifact_name }}
           fi
+
+          if [ -f "target/${{ matrix.target }}/release/rust2rtc" ]; then
+            cp "target/${{ matrix.target }}/release/rust2rtc" "${{ matrix.artifact_name }}"
+          elif [ -f "target/release/rust2rtc" ]; then
+            cp "target/release/rust2rtc" "${{ matrix.artifact_name }}"
+          fi
+
           chmod +x ${{ matrix.artifact_name }}
           tar -czvf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
           zip -9 ${{ matrix.artifact_name }}.zip ${{ matrix.artifact_name }}
