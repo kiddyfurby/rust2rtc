@@ -1,15 +1,16 @@
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
 use crate::webrtc::WebRtcManager;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -46,6 +47,14 @@ pub struct StreamPayload {
     pub sources: Option<Vec<String>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WsMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index_handler))
@@ -60,6 +69,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ffmpeg", get(api_ffmpeg_handler))
         .route("/api/frame.jpeg", get(api_frame_handler))
         .route("/api/webrtc", post(api_webrtc_handler))
+        .route("/api/ws", get(api_ws_handler))
         .route("/api/sip/call", post(api_sip_call_handler))
         .route("/api/sip/accounts", get(api_sip_accounts_handler))
         .layer(CorsLayer::permissive())
@@ -553,6 +563,120 @@ async fn api_webrtc_handler(
     }
 }
 
+async fn api_ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<StreamsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_ws(socket, query, state))
+}
+
+async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) {
+    let default_src = query.src.or(query.name);
+
+    while let Some(msg_result) = socket.recv().await {
+        let msg = match msg_result {
+            Ok(Message::Text(text)) => text,
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(p)) => {
+                let _ = socket.send(Message::Pong(p)).await;
+                continue;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                debug!("WebSocket receive error: {}", e);
+                break;
+            }
+        };
+
+        let ws_msg: WsMessage = match serde_json::from_str(&msg) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!("Invalid WebSocket JSON: {}", e);
+                continue;
+            }
+        };
+
+        match ws_msg.msg_type.as_str() {
+            "webrtc/offer" => {
+                let offer_sdp = match ws_msg.value {
+                    Some(serde_json::Value::String(s)) => s,
+                    Some(serde_json::Value::Object(map)) => {
+                        map.get("sdp").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    }
+                    _ => String::new(),
+                };
+
+                if offer_sdp.is_empty() {
+                    let err_reply = WsMessage {
+                        msg_type: "error".to_string(),
+                        value: Some(serde_json::Value::String("Empty SDP offer".to_string())),
+                    };
+                    if let Ok(json_str) = serde_json::to_string(&err_reply) {
+                        let _ = socket.send(Message::Text(json_str.into())).await;
+                    }
+                    continue;
+                }
+
+                let src_name = default_src.as_deref().unwrap_or("");
+                if let Some(stream) = state.streams.get(src_name).await {
+                    let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
+                    for _ in 0..50 {
+                        if !stream.get_tracks().await.is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+
+                    match state.webrtc.handle_whep(stream, &offer_sdp).await {
+                        Ok(answer_sdp) => {
+                            let answer_msg = WsMessage {
+                                msg_type: "webrtc/answer".to_string(),
+                                value: Some(serde_json::Value::String(answer_sdp)),
+                            };
+                            if let Ok(json_str) = serde_json::to_string(&answer_msg) {
+                                let _ = socket.send(Message::Text(json_str.into())).await;
+                            }
+                            // Signal end of ICE candidates (compatible with go2rtc WebRTC client)
+                            let cand_msg = WsMessage {
+                                msg_type: "webrtc/candidate".to_string(),
+                                value: Some(serde_json::Value::String(String::new())),
+                            };
+                            if let Ok(json_str) = serde_json::to_string(&cand_msg) {
+                                let _ = socket.send(Message::Text(json_str.into())).await;
+                            }
+                        }
+                        Err(e) => {
+                            error!("WebRTC WebSocket error for stream {}: {}", src_name, e);
+                            let err_msg = WsMessage {
+                                msg_type: "error".to_string(),
+                                value: Some(serde_json::Value::String(format!("WebRTC error: {}", e))),
+                            };
+                            if let Ok(json_str) = serde_json::to_string(&err_msg) {
+                                let _ = socket.send(Message::Text(json_str.into())).await;
+                            }
+                        }
+                    }
+                } else {
+                    let err_msg = WsMessage {
+                        msg_type: "error".to_string(),
+                        value: Some(serde_json::Value::String(format!("Stream '{}' not found", src_name))),
+                    };
+                    if let Ok(json_str) = serde_json::to_string(&err_msg) {
+                        let _ = socket.send(Message::Text(json_str.into())).await;
+                    }
+                }
+            }
+            "webrtc/candidate" => {
+                debug!("Received ICE candidate via WebSocket: {:?}", ws_msg.value);
+            }
+            other => {
+                debug!("Received unhandled WebSocket message type: {}", other);
+            }
+        }
+    }
+}
+
 async fn api_sip_call_handler(
     State(state): State<AppState>,
     Query(query): Query<SipCallQuery>,
@@ -580,5 +704,29 @@ async fn api_sip_accounts_handler(
 ) -> impl IntoResponse {
     let accounts = state.sip.list_accounts().await;
     Json(serde_json::json!({ "accounts": accounts }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ws_message_serialization() {
+        let offer_json = r#"{"type":"webrtc/offer","value":"v=0\r\no=-..."}"#;
+        let parsed: WsMessage = serde_json::from_str(offer_json).expect("parse offer");
+        assert_eq!(parsed.msg_type, "webrtc/offer");
+        assert_eq!(
+            parsed.value.unwrap().as_str().unwrap(),
+            "v=0\r\no=-..."
+        );
+
+        let answer = WsMessage {
+            msg_type: "webrtc/answer".to_string(),
+            value: Some(serde_json::Value::String("v=0\r\no=rust2rtc...".to_string())),
+        };
+        let encoded = serde_json::to_string(&answer).expect("encode answer");
+        assert!(encoded.contains(r#""type":"webrtc/answer""#));
+        assert!(encoded.contains(r#""value":"v=0\r\no=rust2rtc...""#));
+    }
 }
 
