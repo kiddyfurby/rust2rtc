@@ -482,11 +482,20 @@ impl WebRtcManager {
 
                     last_was_param_set = is_param_set;
 
-                    let mut bytes = BytesMut::from(&packet.raw[..]);
-                    if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
-                        rtp_pkt.header.ssrc = video_ssrc;
-                        rtp_pkt.header.payload_type = actual_pt;
-                        rtp_pkt.header.sequence_number = seq;
+                    let chunks = fragment_payload_for_webrtc(is_hevc, payload_slice, packet.marker);
+                    for (chunk_bytes, chunk_marker) in chunks {
+                        let rtp_pkt = rtp::packet::Packet {
+                            header: rtp::header::Header {
+                                version: 2,
+                                payload_type: actual_pt,
+                                sequence_number: seq,
+                                timestamp: packet.timestamp,
+                                ssrc: video_ssrc,
+                                marker: chunk_marker,
+                                ..Default::default()
+                            },
+                            payload: chunk_bytes,
+                        };
                         seq = seq.wrapping_add(1);
 
                         if vtrack.write_rtp(rtp_pkt).await.is_err() {
@@ -739,4 +748,193 @@ pub fn build_h265_ap(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
     payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     payload.extend_from_slice(pps);
     payload
+}
+
+/// Re-fragment oversized video payloads into safe MTU slices (<= 1180 bytes)
+/// to prevent IP fragmentation and UDP packet loss across WebRTC paths.
+pub fn fragment_payload_for_webrtc(
+    is_hevc: bool,
+    payload: &[u8],
+    marker: bool,
+) -> Vec<(Bytes, bool)> {
+    const MAX_CHUNK: usize = 1170; // Guaranteed safe under 1280 MTU with IP/UDP/SRTP headers
+
+    if payload.len() <= MAX_CHUNK {
+        return vec![(Bytes::copy_from_slice(payload), marker)];
+    }
+
+    let mut result = Vec::new();
+
+    if !is_hevc {
+        // H.264 (RFC 6184)
+        let nalu_type = payload[0] & 0x1F;
+        if nalu_type == 28 && payload.len() >= 2 {
+            // FU-A packet
+            let indicator = payload[0];
+            let fu_header = payload[1];
+            let s_bit = (fu_header & 0x80) != 0;
+            let e_bit = (fu_header & 0x40) != 0;
+            let r_and_type = fu_header & 0x3F;
+
+            let data = &payload[2..];
+            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 2).collect();
+            let total = chunks.len();
+
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let is_first = idx == 0;
+                let is_last = idx == total - 1;
+                let chunk_s = if is_first { s_bit } else { false };
+                let chunk_e = if is_last { e_bit } else { false };
+                let new_fu = (if chunk_s { 0x80 } else { 0 })
+                    | (if chunk_e { 0x40 } else { 0 })
+                    | r_and_type;
+
+                let mut out = Vec::with_capacity(2 + chunk.len());
+                out.push(indicator);
+                out.push(new_fu);
+                out.extend_from_slice(chunk);
+                result.push((Bytes::from(out), is_last && marker));
+            }
+        } else if nalu_type < 24 && payload.len() > 1 {
+            // Single NAL unit needing fragmentation into FU-A
+            let nal_header = payload[0];
+            let indicator = (nal_header & 0xE0) | 28;
+            let nal_type = nal_header & 0x1F;
+
+            let data = &payload[1..];
+            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 2).collect();
+            let total = chunks.len();
+
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let is_first = idx == 0;
+                let is_last = idx == total - 1;
+                let new_fu = (if is_first { 0x80 } else { 0 })
+                    | (if is_last { 0x40 } else { 0 })
+                    | nal_type;
+
+                let mut out = Vec::with_capacity(2 + chunk.len());
+                out.push(indicator);
+                out.push(new_fu);
+                out.extend_from_slice(chunk);
+                result.push((Bytes::from(out), is_last && marker));
+            }
+        } else {
+            // STAP-A or unknown; pass through
+            result.push((Bytes::copy_from_slice(payload), marker));
+        }
+    } else {
+        // H.265 (HEVC RFC 7798)
+        let nalu_type = (payload[0] >> 1) & 0x3F;
+        if nalu_type == 49 && payload.len() >= 3 {
+            // Fragmentation Unit (FU)
+            let h0 = payload[0];
+            let h1 = payload[1];
+            let fu_header = payload[2];
+            let s_bit = (fu_header & 0x80) != 0;
+            let e_bit = (fu_header & 0x40) != 0;
+            let fu_type = fu_header & 0x3F;
+
+            let data = &payload[3..];
+            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 3).collect();
+            let total = chunks.len();
+
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let is_first = idx == 0;
+                let is_last = idx == total - 1;
+                let chunk_s = if is_first { s_bit } else { false };
+                let chunk_e = if is_last { e_bit } else { false };
+                let new_fu = (if chunk_s { 0x80 } else { 0 })
+                    | (if chunk_e { 0x40 } else { 0 })
+                    | fu_type;
+
+                let mut out = Vec::with_capacity(3 + chunk.len());
+                out.push(h0);
+                out.push(h1);
+                out.push(new_fu);
+                out.extend_from_slice(chunk);
+                result.push((Bytes::from(out), is_last && marker));
+            }
+        } else if nalu_type < 48 && payload.len() > 2 {
+            // Single NAL unit needing fragmentation into FU
+            let h0 = payload[0];
+            let h1 = payload[1];
+            let fu_h0 = (h0 & 0x81) | (49 << 1);
+            let fu_h1 = h1;
+            let nal_type = (h0 >> 1) & 0x3F;
+
+            let data = &payload[2..];
+            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 3).collect();
+            let total = chunks.len();
+
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let is_first = idx == 0;
+                let is_last = idx == total - 1;
+                let new_fu = (if is_first { 0x80 } else { 0 })
+                    | (if is_last { 0x40 } else { 0 })
+                    | nal_type;
+
+                let mut out = Vec::with_capacity(3 + chunk.len());
+                out.push(fu_h0);
+                out.push(fu_h1);
+                out.push(new_fu);
+                out.extend_from_slice(chunk);
+                result.push((Bytes::from(out), is_last && marker));
+            }
+        } else {
+            result.push((Bytes::copy_from_slice(payload), marker));
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fragment_payload_h264_fua() {
+        // Create an oversized FU-A packet (e.g. 1460 bytes) with S=1, E=0, type=5 (IDR)
+        let mut raw = vec![0x7c, 0x85]; // Indicator: 28, FU header: S=1, type=5
+        raw.extend(vec![0xAA; 1458]);
+
+        let chunks = fragment_payload_for_webrtc(false, &raw, false);
+        assert_eq!(chunks.len(), 2);
+
+        // Chunk 0: <= 1170 bytes, S=1, E=0
+        assert!(chunks[0].0.len() <= 1170);
+        assert_eq!(chunks[0].0[0], 0x7c);
+        assert_eq!(chunks[0].0[1], 0x85); // S=1, E=0, type=5
+        assert!(!chunks[0].1);
+
+        // Chunk 1: <= 1170 bytes, S=0, E=0
+        assert!(chunks[1].0.len() <= 1170);
+        assert_eq!(chunks[1].0[0], 0x7c);
+        assert_eq!(chunks[1].0[1], 0x05); // S=0, E=0, type=5
+        assert!(!chunks[1].1);
+
+        // Reassembled payload length must match original
+        let total_data = (chunks[0].0.len() - 2) + (chunks[1].0.len() - 2);
+        assert_eq!(total_data, 1458);
+    }
+
+    #[test]
+    fn test_fragment_payload_h264_single_nal() {
+        // Single NAL unit of 2000 bytes (NAL type 1: non-IDR slice)
+        let mut raw = vec![0x61]; // NRI=3, Type=1
+        raw.extend(vec![0xBB; 1999]);
+
+        let chunks = fragment_payload_for_webrtc(false, &raw, true);
+        assert_eq!(chunks.len(), 2);
+
+        // Chunk 0: S=1, E=0
+        assert_eq!(chunks[0].0[0] & 0x1F, 28); // FU-A
+        assert_eq!(chunks[0].0[1], 0x81); // S=1, type=1
+        assert!(!chunks[0].1); // marker false on non-final chunk
+
+        // Chunk 1: S=0, E=1, marker true
+        assert_eq!(chunks[1].0[0] & 0x1F, 28);
+        assert_eq!(chunks[1].0[1], 0x41); // E=1, type=1
+        assert!(chunks[1].1); // marker true on final chunk
+    }
 }

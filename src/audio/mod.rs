@@ -107,9 +107,9 @@ impl AudioTranscoder {
             self.out_ts = packet_ts_48k;
             self.last_source_ts = Some(packet.timestamp);
         } else {
-            // Re-sync if camera clock drifts or jumps significantly (> 1 second = 48000 ticks)
+            // Re-sync only if camera clock drifts or jumps significantly (> 5 seconds = 240,000 ticks)
             let diff = packet_ts_48k.wrapping_sub(self.out_ts);
-            if diff > 48000 && diff < (u32::MAX - 48000) {
+            if diff > 240_000 && diff < (u32::MAX - 240_000) {
                 self.out_ts = packet_ts_48k;
             }
         }
