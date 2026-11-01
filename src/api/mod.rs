@@ -839,18 +839,21 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         }
                     }
 
-                    let client_codecs = ws_msg
-                        .value
-                        .as_ref()
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let client_codecs: Vec<String> = match &ws_msg.value {
+                        Some(serde_json::Value::String(s)) => vec![s.clone()],
+                        Some(serde_json::Value::Array(arr)) => {
+                            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let client_codecs_str = client_codecs.join(",");
 
-                    let allow_audio = has_audio && client_codecs.contains("mp4a");
+                    let allow_audio = has_audio && client_codecs_str.contains("mp4a");
                     let copy_audio = has_aac && allow_audio;
                     let transcode_audio = !has_aac && allow_audio;
 
                     let copy_video = if has_h265 {
-                        client_codecs.contains("hvc1")
+                        client_codecs.is_empty() || client_codecs_str.contains("hvc1")
                     } else {
                         true
                     };
@@ -858,31 +861,53 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     let video_track = stream.get_tracks().await.into_iter().find(|t| t.kind == crate::core::MediaKind::Video);
                     let use_native_fmp4 = copy_video && video_track.is_some();
 
+                    // Dynamically resolve H.264 profile-level-id from stream track (e.g., 640033 for 5MP doorbell vs 640029 for 1080p)
+                    let h264_profile_level = video_track
+                        .as_ref()
+                        .and_then(|t| t.codec.fmtp.as_deref())
+                        .and_then(|f| {
+                            for part in f.split(';') {
+                                let part = part.trim();
+                                if let Some((k, v)) = part.split_once('=') {
+                                    if k.trim().eq_ignore_ascii_case("profile-level-id") {
+                                        let v = v.trim();
+                                        if v.len() == 6 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+                                            return Some(v.to_lowercase());
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or_else(|| "640029".to_string());
+
+                    let h264_avc1 = format!("avc1.{}", h264_profile_level);
+
                     let mime = if use_native_fmp4 {
                         if has_h265 {
-                            "video/mp4; codecs=\"hvc1.1.6.L153.B0\""
+                            "video/mp4; codecs=\"hvc1.1.6.L153.B0\"".to_string()
                         } else {
-                            "video/mp4; codecs=\"avc1.640029\""
+                            format!("video/mp4; codecs=\"{}\"", h264_avc1)
                         }
                     } else if has_h265 {
-                        if client_codecs.contains("hvc1") {
+                        if client_codecs_str.contains("hvc1") {
                             if allow_audio {
-                                "video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\""
+                                "video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\"".to_string()
                             } else {
-                                "video/mp4; codecs=\"hvc1.1.6.L153.B0\""
+                                "video/mp4; codecs=\"hvc1.1.6.L153.B0\"".to_string()
                             }
                         } else {
                             if allow_audio {
-                                "video/mp4; codecs=\"avc1.640029,mp4a.40.2\""
+                                format!("video/mp4; codecs=\"{},mp4a.40.2\"", h264_avc1)
                             } else {
-                                "video/mp4; codecs=\"avc1.640029\""
+                                format!("video/mp4; codecs=\"{}\"", h264_avc1)
                             }
                         }
                     } else {
                         if allow_audio {
-                            "video/mp4; codecs=\"avc1.640029,mp4a.40.2\""
+                            format!("video/mp4; codecs=\"{},mp4a.40.2\"", h264_avc1)
                         } else {
-                            "video/mp4; codecs=\"avc1.640029\""
+                            format!("video/mp4; codecs=\"{}\"", h264_avc1)
                         }
                     };
 

@@ -120,6 +120,15 @@ impl WebRtcManager {
             },
         ];
 
+        let h264_high_51 = RTCRtpCodec {
+            mime_type: MIME_TYPE_H264.to_owned(),
+            clock_rate: 90000,
+            channels: 0,
+            sdp_fmtp_line:
+                "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640033".to_owned(),
+            rtcp_feedback: video_feedback.clone(),
+        };
+
         let h264_high = RTCRtpCodec {
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
@@ -181,6 +190,14 @@ impl WebRtcManager {
                 RtpCodecKind::Video,
             )?;
         } else {
+            media_engine.register_codec(
+                rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                    rtp_codec: h264_high_51.clone(),
+                    payload_type: 102,
+                    ..Default::default()
+                },
+                RtpCodecKind::Video,
+            )?;
             media_engine.register_codec(
                 rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
                     rtp_codec: h264_high.clone(),
@@ -308,10 +325,13 @@ impl WebRtcManager {
                 let is_hevc = track.codec.name.to_uppercase().contains("265")
                     || track.codec.name.to_uppercase().contains("HEVC");
 
+                let is_high_51 = track.codec.fmtp.as_deref().map_or(false, |f| f.contains("640033"));
                 let is_high = track.codec.fmtp.as_deref().map_or(true, |f| f.contains("6400"));
 
                 let (video_codec, default_pt) = if is_hevc {
                     (h265_codec.clone(), 100)
+                } else if is_high_51 {
+                    (h264_high_51.clone(), 102)
                 } else if is_high {
                     (h264_high.clone(), 98)
                 } else {
@@ -399,8 +419,8 @@ impl WebRtcManager {
         let answer = peer_connection.create_answer(None).await?;
         peer_connection.set_local_description(answer).await?;
 
-        // Wait briefly for host/LAN ICE candidate gathering (150ms avoids blocking on unreachable VLAN STUN interfaces)
-        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(150), gather_complete_rx.recv()).await;
+        // Wait briefly for host/LAN/STUN ICE candidate gathering (up to 500ms)
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(500), gather_complete_rx.recv()).await;
 
         let local_desc = peer_connection
             .local_description()
