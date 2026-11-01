@@ -3,6 +3,7 @@
 use crate::backchannel::pcm::{
     transcode_alaw_to_ulaw, transcode_ulaw_to_alaw, G711Repacker,
 };
+use super::message::VideoCodecKind;
 use crate::core::{MediaKind, RtpPacket};
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::Stream;
@@ -12,7 +13,9 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
+use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -23,6 +26,7 @@ pub struct SipCallSession {
     pub local_audio_port: u16,
     pub local_video_port: Option<u16>,
     tasks: Vec<JoinHandle<()>>,
+    transcode_child: Arc<Mutex<Option<Child>>>,
     stream: Arc<Stream>,
 }
 
@@ -40,6 +44,7 @@ impl SipCallSession {
         negotiated_audio_pt: u8,
         remote_video_addr: Option<SocketAddr>,
         alt_video_addr: Option<SocketAddr>,
+        negotiated_video_codec: VideoCodecKind,
         negotiated_video_pt: u8,
     ) -> Result<Self> {
         // Bind local UDP socket on 0.0.0.0 so kernel routes across any interface/VLAN
@@ -219,8 +224,9 @@ impl SipCallSession {
             }
         }));
 
-        // 3. Task: Send doorbell camera video (H.264) -> ESPHome / HA Softphone
+        // 3. Task: Send doorbell camera video (H.264 or RFC 2435 JPEG) -> ESPHome / HA Softphone
         let mut local_video_port = None;
+        let transcode_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         if let Some(remote_video) = remote_video_addr {
             let video_socket = UdpSocket::bind("0.0.0.0:0")
                 .await
@@ -235,6 +241,7 @@ impl SipCallSession {
                 local_video_port = v_port,
                 remote_video = %remote_video,
                 alt_video = ?alt_video_addr,
+                codec = ?negotiated_video_codec,
                 video_pt = negotiated_video_pt,
                 "Initializing SIP video forwarder"
             );
@@ -272,140 +279,306 @@ impl SipCallSession {
                 }
             }));
 
-            tasks.push(tokio::spawn(async move {
-                let mut video_track = None;
-                for _ in 0..80 {
-                    let tracks = stream_video.get_tracks().await;
-                    if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
-                        video_track = Some(Arc::clone(t));
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                if let Some(video_track) = video_track {
-                    info!(
-                        call_id = %call_id_video,
-                        stream = %stream_video.name,
-                        codec = %video_track.codec.name,
-                        source_pt = video_track.codec.payload_type,
-                        negotiated_pt = negotiated_video_pt,
-                        remote_video = %remote_video,
-                        "Attached camera video track (H.264) to SIP call - streaming RTP"
-                    );
-
-                    let mut param_set_payload = video_track
-                        .codec
-                        .fmtp
-                        .as_ref()
-                        .and_then(|f| crate::webrtc::extract_h264_sps_pps(f))
-                        .map(|(sps, pps)| crate::webrtc::build_h264_stap_a(&sps, &pps));
-
-                    let mut sub = video_track.subscribe();
-                    let mut pkt_count = 0u64;
-                    let out_ssrc = 0x52544302u32;
-                    let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
-                    let mut sent_first_keyframe = false;
-                    let mut last_was_param_set = false;
-
-                    loop {
-                        let packet = match sub.recv().await {
-                            Ok(p) => p,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                debug!("Video forwarder lagged by {} packets - resuming", n);
-                                continue;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            match negotiated_video_codec {
+                VideoCodecKind::H264 => {
+                    tasks.push(tokio::spawn(async move {
+                        let mut video_track = None;
+                        for _ in 0..80 {
+                            let tracks = stream_video.get_tracks().await;
+                            if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
+                                video_track = Some(Arc::clone(t));
                                 break;
                             }
-                        };
-
-                        let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
-                            &packet.raw[packet.payload_offset..packet.payload_offset + packet.payload_len]
-                        } else {
-                            continue;
-                        };
-
-                        let (is_keyframe, is_param_set) = crate::webrtc::is_keyframe_or_param_set(false, payload_slice);
-
-                        // Dynamically cache STAP-A parameter sets if seen in stream
-                        if is_param_set && !payload_slice.is_empty() && (payload_slice[0] & 0x1F) == 24 {
-                            param_set_payload = Some(payload_slice.to_vec());
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
+                        if let Some(video_track) = video_track {
+                            info!(
+                                call_id = %call_id_video,
+                                stream = %stream_video.name,
+                                codec = %video_track.codec.name,
+                                source_pt = video_track.codec.payload_type,
+                                negotiated_pt = negotiated_video_pt,
+                                remote_video = %remote_video,
+                                "Attached camera video track (H.264) to SIP call - streaming RTP"
+                            );
 
-                        // Do not forward P-frames before we have sent the initial keyframe / SPS/PPS
-                        if !sent_first_keyframe {
-                            if !is_keyframe && !is_param_set {
-                                continue;
-                            }
-                            sent_first_keyframe = true;
-                        }
+                            let mut param_set_payload = video_track
+                                .codec
+                                .fmtp
+                                .as_ref()
+                                .and_then(|f| crate::webrtc::extract_h264_sps_pps(f))
+                                .map(|(sps, pps)| crate::webrtc::build_h264_stap_a(&sps, &pps));
 
-                        // Before keyframes, inject the parameter sets packet (STAP-A) if not immediately preceded by parameter sets
-                        if is_keyframe && !last_was_param_set {
-                            if let Some(ref ps_bytes) = param_set_payload {
-                                let mut stap_rtp = Vec::with_capacity(12 + ps_bytes.len());
-                                stap_rtp.push(0x80); // V=2
-                                stap_rtp.push(negotiated_video_pt & 0x7F); // M=0 (parameter sets packet)
-                                stap_rtp.extend_from_slice(&out_seq.to_be_bytes());
-                                out_seq = out_seq.wrapping_add(1);
-                                stap_rtp.extend_from_slice(&packet.timestamp.to_be_bytes());
-                                stap_rtp.extend_from_slice(&out_ssrc.to_be_bytes());
-                                stap_rtp.extend_from_slice(ps_bytes);
+                            let mut sub = video_track.subscribe();
+                            let mut pkt_count = 0u64;
+                            let out_ssrc = 0x52544302u32;
+                            let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
+                            let mut sent_first_keyframe = false;
+                            let mut last_was_param_set = false;
+
+                            loop {
+                                let packet = match sub.recv().await {
+                                    Ok(p) => p,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        debug!("Video forwarder lagged by {} packets - resuming", n);
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                        break;
+                                    }
+                                };
+
+                                let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
+                                    &packet.raw[packet.payload_offset..packet.payload_offset + packet.payload_len]
+                                } else {
+                                    continue;
+                                };
+
+                                let (is_keyframe, is_param_set) = crate::webrtc::is_keyframe_or_param_set(false, payload_slice);
+
+                                // Dynamically cache STAP-A parameter sets if seen in stream
+                                if is_param_set && !payload_slice.is_empty() && (payload_slice[0] & 0x1F) == 24 {
+                                    param_set_payload = Some(payload_slice.to_vec());
+                                }
+
+                                // Do not forward P-frames before we have sent the initial keyframe / SPS/PPS
+                                if !sent_first_keyframe {
+                                    if !is_keyframe && !is_param_set {
+                                        continue;
+                                    }
+                                    sent_first_keyframe = true;
+                                }
+
+                                // Before keyframes, inject the parameter sets packet (STAP-A) if not immediately preceded by parameter sets
+                                if is_keyframe && !last_was_param_set {
+                                    if let Some(ref ps_bytes) = param_set_payload {
+                                        let mut stap_rtp = Vec::with_capacity(12 + ps_bytes.len());
+                                        stap_rtp.push(0x80); // V=2
+                                        stap_rtp.push(negotiated_video_pt & 0x7F); // M=0 (parameter sets packet)
+                                        stap_rtp.extend_from_slice(&out_seq.to_be_bytes());
+                                        out_seq = out_seq.wrapping_add(1);
+                                        stap_rtp.extend_from_slice(&packet.timestamp.to_be_bytes());
+                                        stap_rtp.extend_from_slice(&out_ssrc.to_be_bytes());
+                                        stap_rtp.extend_from_slice(ps_bytes);
+
+                                        let (primary, alt) = *tx_v_targets.lock().await;
+                                        let _ = video_socket.send_to(&stap_rtp, primary).await;
+                                        if let Some(alt_addr) = alt {
+                                            if alt_addr != primary {
+                                                let _ = video_socket.send_to(&stap_rtp, alt_addr).await;
+                                            }
+                                        }
+                                        pkt_count += 1;
+                                        info!(call_id = %call_id_video, "Injected H.264 SPS/PPS STAP-A packet before keyframe into SIP video stream");
+                                    }
+                                }
+
+                                last_was_param_set = is_param_set;
+
+                                let mut raw = packet.raw.to_vec();
+                                if raw.len() >= 12 {
+                                    if negotiated_video_pt != 0 {
+                                        raw[1] = (raw[1] & 0x80) | (negotiated_video_pt & 0x7F);
+                                    }
+                                    // Strictly monotonic sequence numbers
+                                    raw[2..4].copy_from_slice(&out_seq.to_be_bytes());
+                                    out_seq = out_seq.wrapping_add(1);
+                                    // Strictly consistent SSRC matching STAP-A
+                                    raw[8..12].copy_from_slice(&out_ssrc.to_be_bytes());
+                                }
 
                                 let (primary, alt) = *tx_v_targets.lock().await;
-                                let _ = video_socket.send_to(&stap_rtp, primary).await;
+                                if let Err(e) = video_socket.send_to(&raw, primary).await {
+                                    debug!("Error forwarding video to SIP peer: {}", e);
+                                    break;
+                                }
                                 if let Some(alt_addr) = alt {
                                     if alt_addr != primary {
-                                        let _ = video_socket.send_to(&stap_rtp, alt_addr).await;
+                                        let _ = video_socket.send_to(&raw, alt_addr).await;
                                     }
                                 }
                                 pkt_count += 1;
-                                info!(call_id = %call_id_video, "Injected H.264 SPS/PPS STAP-A packet before keyframe into SIP video stream");
+                                if pkt_count == 1 || pkt_count % 300 == 0 {
+                                    info!(
+                                        call_id = %call_id_video,
+                                        packets_sent = pkt_count,
+                                        target = %primary,
+                                        "Actively streaming video RTP to SIP peer"
+                                    );
+                                }
                             }
-                        }
-
-                        last_was_param_set = is_param_set;
-
-                        let mut raw = packet.raw.to_vec();
-                        if raw.len() >= 12 {
-                            if negotiated_video_pt != 0 {
-                                raw[1] = (raw[1] & 0x80) | (negotiated_video_pt & 0x7F);
-                            }
-                            // Strictly monotonic sequence numbers
-                            raw[2..4].copy_from_slice(&out_seq.to_be_bytes());
-                            out_seq = out_seq.wrapping_add(1);
-                            // Strictly consistent SSRC matching STAP-A
-                            raw[8..12].copy_from_slice(&out_ssrc.to_be_bytes());
-                        }
-
-                        let (primary, alt) = *tx_v_targets.lock().await;
-                        if let Err(e) = video_socket.send_to(&raw, primary).await {
-                            debug!("Error forwarding video to SIP peer: {}", e);
-                            break;
-                        }
-                        if let Some(alt_addr) = alt {
-                            if alt_addr != primary {
-                                let _ = video_socket.send_to(&raw, alt_addr).await;
-                            }
-                        }
-                        pkt_count += 1;
-                        if pkt_count == 1 || pkt_count % 300 == 0 {
-                            info!(
+                        } else {
+                            warn!(
                                 call_id = %call_id_video,
-                                packets_sent = pkt_count,
-                                target = %primary,
-                                "Actively streaming video RTP to SIP peer"
+                                stream = %stream_video.name,
+                                "No video track found on stream after 8s for SIP call"
                             );
                         }
-                    }
-                } else {
-                    warn!(
-                        call_id = %call_id_video,
-                        stream = %stream_video.name,
-                        "No video track found on stream after 8s for SIP call"
-                    );
+                    }));
                 }
-            }));
+                VideoCodecKind::Jpeg => {
+                    let ffmpeg_video = Arc::clone(&ffmpeg);
+                    let transcode_child_clone = Arc::clone(&transcode_child);
+
+                    tasks.push(tokio::spawn(async move {
+                        // Wait for stream producer to be established
+                        let mut video_track = None;
+                        for _ in 0..80 {
+                            let tracks = stream_video.get_tracks().await;
+                            if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
+                                video_track = Some(Arc::clone(t));
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+
+                        if video_track.is_none() {
+                            warn!(
+                                call_id = %call_id_video,
+                                stream = %stream_video.name,
+                                "No video track found on stream after 8s for SIP JPEG transcode"
+                            );
+                            return;
+                        }
+
+                        info!(
+                            call_id = %call_id_video,
+                            stream = %stream_video.name,
+                            remote_video = %remote_video,
+                            "Spawning FFmpeg transcode to baseline MJPEG for RFC 2435 SIP video"
+                        );
+
+                        let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_video.name);
+                        let transcode_args = vec![
+                            "-hide_banner".to_string(),
+                            "-v".to_string(),
+                            "warning".to_string(),
+                            "-fflags".to_string(),
+                            "nobuffer".to_string(),
+                            "-flags".to_string(),
+                            "low_delay".to_string(),
+                            "-rtsp_transport".to_string(),
+                            "tcp".to_string(),
+                            "-i".to_string(),
+                            rtsp_url,
+                            "-an".to_string(),
+                            "-c:v".to_string(),
+                            "mjpeg".to_string(),
+                            "-q:v".to_string(),
+                            "4".to_string(),
+                            "-r".to_string(),
+                            "15".to_string(),
+                            "-vf".to_string(),
+                            "scale='min(800,iw)':-2".to_string(),
+                            "-pix_fmt".to_string(),
+                            "yuvj420p".to_string(),
+                            "-huffman".to_string(),
+                            "default".to_string(),
+                            "-f".to_string(),
+                            "mjpeg".to_string(),
+                            "pipe:1".to_string(),
+                        ];
+
+                        let mut child = match ffmpeg_video.spawn_stdout_process(&transcode_args) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(call_id = %call_id_video, "Failed to spawn FFmpeg MJPEG transcoder: {}", e);
+                                return;
+                            }
+                        };
+
+                        let mut stdout = match child.stdout.take() {
+                            Some(s) => s,
+                            None => {
+                                warn!(call_id = %call_id_video, "Failed to capture FFmpeg stdout");
+                                return;
+                            }
+                        };
+
+                        {
+                            let mut guard = transcode_child_clone.lock().await;
+                            *guard = Some(child);
+                        }
+
+                        let mut stream_buf = Vec::with_capacity(65536);
+                        let mut chunk = [0u8; 8192];
+                        let mut pkt_count = 0u64;
+                        let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
+                        let out_ssrc = 0x52544302u32;
+                        let mut timestamp: u32 = (uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32;
+
+                        loop {
+                            let n = match stdout.read(&mut chunk).await {
+                                Ok(0) => {
+                                    debug!(call_id = %call_id_video, "FFmpeg stdout reached EOF");
+                                    break;
+                                }
+                                Ok(n) => n,
+                                Err(e) => {
+                                    debug!(call_id = %call_id_video, "Error reading from FFmpeg stdout: {}", e);
+                                    break;
+                                }
+                            };
+
+                            stream_buf.extend_from_slice(&chunk[..n]);
+
+                            // Frame and packetize full JPEG images between SOI (0xFF, 0xD8) and EOI (0xFF, 0xD9)
+                            while let Some(soi_pos) = find_marker(&stream_buf, &[0xFF, 0xD8]) {
+                                if soi_pos > 0 {
+                                    stream_buf.drain(..soi_pos);
+                                }
+                                if stream_buf.len() < 4 {
+                                    break;
+                                }
+                                if let Some(eoi_rel) = find_marker(&stream_buf[2..], &[0xFF, 0xD9]) {
+                                    let eoi_pos = 2 + eoi_rel + 2;
+                                    let jpeg_frame = &stream_buf[..eoi_pos];
+
+                                    if let Some(packets) = crate::sip::rfc2435::packetize_jpeg_rtp(
+                                        jpeg_frame,
+                                        &mut out_seq,
+                                        timestamp,
+                                        out_ssrc,
+                                        1200,
+                                    ) {
+                                        let (primary, alt) = *tx_v_targets.lock().await;
+                                        for pkt in packets {
+                                            if let Err(e) = video_socket.send_to(&pkt, primary).await {
+                                                debug!("Error forwarding RFC 2435 JPEG RTP: {}", e);
+                                                break;
+                                            }
+                                            if let Some(alt_addr) = alt {
+                                                if alt_addr != primary {
+                                                    let _ = video_socket.send_to(&pkt, alt_addr).await;
+                                                }
+                                            }
+                                            pkt_count += 1;
+                                        }
+                                        timestamp = timestamp.wrapping_add(6000); // 15 fps clock advance
+                                        if pkt_count == 1 || pkt_count % 300 == 0 {
+                                            info!(
+                                                call_id = %call_id_video,
+                                                packets_sent = pkt_count,
+                                                target = %primary,
+                                                "Actively streaming RFC 2435 JPEG RTP to SIP peer"
+                                            );
+                                        }
+                                    }
+
+                                    stream_buf.drain(..eoi_pos);
+                                } else {
+                                    // Incomplete frame, wait for more data
+                                    break;
+                                }
+                            }
+
+                            if stream_buf.len() > 1_000_000 {
+                                stream_buf.clear();
+                            }
+                        }
+                    }));
+                }
+            }
         } else {
             info!(
                 call_id = %call_id,
@@ -419,6 +592,7 @@ impl SipCallSession {
             local_audio_port,
             local_video_port,
             tasks,
+            transcode_child,
             stream,
         })
     }
@@ -427,6 +601,10 @@ impl SipCallSession {
     pub async fn stop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        let mut child = self.transcode_child.lock().await;
+        if let Some(mut c) = child.take() {
+            let _ = c.kill().await;
         }
         self.stream.stop_backchannel().await;
         info!(call_id = %self.call_id, "SIP call media bridge stopped");
@@ -438,5 +616,14 @@ impl Drop for SipCallSession {
         for task in &self.tasks {
             task.abort();
         }
+        if let Ok(mut child) = self.transcode_child.try_lock() {
+            if let Some(mut c) = child.take() {
+                let _ = c.start_kill();
+            }
+        }
     }
+}
+
+fn find_marker(buf: &[u8], marker: &[u8; 2]) -> Option<usize> {
+    buf.windows(2).position(|w| w == marker)
 }

@@ -292,6 +292,12 @@ fn hex_md5(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodecKind {
+    H264,
+    Jpeg,
+}
+
 /// Helper to parse remote RTP port and host from SDP
 #[derive(Debug, Clone)]
 pub struct SdpMediaInfo {
@@ -300,6 +306,7 @@ pub struct SdpMediaInfo {
     pub video_port: Option<u16>,
     pub video_payload_types: Vec<u8>,
     pub h264_payload_type: Option<u8>,
+    pub jpeg_payload_type: Option<u8>,
     pub connection_ip: Option<String>,
 }
 
@@ -324,6 +331,39 @@ impl SdpMediaInfo {
         }
         96
     }
+
+    /// Pick the preferred video codec (H.264 or JPEG) and payload type based on SDP offer order
+    pub fn preferred_video_codec(&self) -> Option<(VideoCodecKind, u8)> {
+        if self.video_port.is_none() {
+            return None;
+        }
+
+        // Check peer's advertised preference order in m=video line
+        for &pt in &self.video_payload_types {
+            if Some(pt) == self.jpeg_payload_type || pt == 26 {
+                return Some((VideoCodecKind::Jpeg, pt));
+            }
+            if Some(pt) == self.h264_payload_type {
+                return Some((VideoCodecKind::H264, pt));
+            }
+        }
+
+        // Fallbacks
+        if let Some(pt) = self.jpeg_payload_type {
+            return Some((VideoCodecKind::Jpeg, pt));
+        }
+        if let Some(pt) = self.h264_payload_type {
+            return Some((VideoCodecKind::H264, pt));
+        }
+        if self.video_payload_types.contains(&26) {
+            return Some((VideoCodecKind::Jpeg, 26));
+        }
+        if let Some(&pt) = self.video_payload_types.first() {
+            return Some((VideoCodecKind::H264, pt));
+        }
+
+        None
+    }
 }
 
 pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
@@ -333,6 +373,7 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
         video_port: None,
         video_payload_types: Vec::new(),
         h264_payload_type: None,
+        jpeg_payload_type: None,
         connection_ip: None,
     };
 
@@ -376,18 +417,27 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
                 }
             }
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
-            // e.g. a=rtpmap:103 H264/90000
+            // e.g. a=rtpmap:103 H264/90000 or a=rtpmap:26 JPEG/90000
             let mut parts = rtpmap.split_whitespace();
             if let Some(pt_str) = parts.next() {
                 if let Ok(pt) = pt_str.parse::<u8>() {
                     if let Some(codec) = parts.next() {
-                        if codec.to_ascii_uppercase().starts_with("H264/") && info.h264_payload_type.is_none() {
+                        let codec_upper = codec.to_ascii_uppercase();
+                        if codec_upper.starts_with("H264/") && info.h264_payload_type.is_none() {
                             info.h264_payload_type = Some(pt);
+                        } else if (codec_upper.starts_with("JPEG/") || codec_upper.starts_with("MJPEG/"))
+                            && info.jpeg_payload_type.is_none()
+                        {
+                            info.jpeg_payload_type = Some(pt);
                         }
                     }
                 }
             }
         }
+    }
+
+    if info.jpeg_payload_type.is_none() && info.video_payload_types.contains(&26) {
+        info.jpeg_payload_type = Some(26);
     }
 
     info.connection_ip = global_c_ip;
@@ -400,7 +450,7 @@ pub fn build_sdp(
     audio_port: u16,
     audio_pt: u8,
     video_port: Option<u16>,
-    video_pt: u8,
+    video_codec: Option<(VideoCodecKind, u8)>,
     sprop_parameter_sets: Option<&str>,
 ) -> String {
     let audio_section = if audio_pt == 8 {
@@ -433,19 +483,31 @@ pub fn build_sdp(
         local_ip, local_ip, audio_section
     );
 
-    if let Some(v_port) = video_port {
-        let sprop_fmtp = if let Some(sprop) = sprop_parameter_sets {
-            format!(";sprop-parameter-sets={}", sprop)
-        } else {
-            String::new()
-        };
-        sdp.push_str(&format!(
-            "m=video {} RTP/AVP {}\r\n\
-            a=rtpmap:{} H264/90000\r\n\
-            a=fmtp:{} profile-level-id=42801f;packetization-mode=1{}\r\n\
-            a=sendrecv\r\n",
-            v_port, video_pt, video_pt, video_pt, sprop_fmtp
-        ));
+    if let (Some(v_port), Some((codec_kind, v_pt))) = (video_port, video_codec) {
+        match codec_kind {
+            VideoCodecKind::H264 => {
+                let sprop_fmtp = if let Some(sprop) = sprop_parameter_sets {
+                    format!(";sprop-parameter-sets={}", sprop)
+                } else {
+                    String::new()
+                };
+                sdp.push_str(&format!(
+                    "m=video {} RTP/AVP {}\r\n\
+                    a=rtpmap:{} H264/90000\r\n\
+                    a=fmtp:{} profile-level-id=42801f;packetization-mode=1{}\r\n\
+                    a=sendrecv\r\n",
+                    v_port, v_pt, v_pt, v_pt, sprop_fmtp
+                ));
+            }
+            VideoCodecKind::Jpeg => {
+                sdp.push_str(&format!(
+                    "m=video {} RTP/AVP {}\r\n\
+                    a=rtpmap:{} JPEG/90000\r\n\
+                    a=sendrecv\r\n",
+                    v_port, v_pt, v_pt
+                ));
+            }
+        }
     }
 
     sdp
@@ -509,6 +571,36 @@ a=rtpmap:96 H264/90000\r\n";
         assert_eq!(info.connection_ip, Some("198.51.100.200".to_string()));
         assert_eq!(info.audio_port, Some(16384));
         assert_eq!(info.video_port, Some(16386));
+        assert_eq!(info.preferred_video_codec(), Some((VideoCodecKind::H264, 96)));
+    }
+
+    #[test]
+    fn test_parse_sdp_media_jpeg() {
+        // Waveshare / ESPHome style SDP offer with PT 26 JPEG
+        let sdp = "\
+v=0\r\n\
+o=- 1 1 IN IP4 192.0.2.36\r\n\
+s=VoIP Intercom\r\n\
+c=IN IP4 192.0.2.36\r\n\
+t=0 0\r\n\
+m=audio 16384 RTP/AVP 0 8\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+m=video 16386 RTP/AVP 26\r\n\
+a=rtpmap:26 JPEG/90000\r\n\
+a=sendrecv\r\n";
+
+        let info = parse_sdp_media(sdp);
+        assert_eq!(info.connection_ip, Some("192.0.2.36".to_string()));
+        assert_eq!(info.audio_port, Some(16384));
+        assert_eq!(info.video_port, Some(16386));
+        assert_eq!(info.jpeg_payload_type, Some(26));
+        assert_eq!(info.preferred_video_codec(), Some((VideoCodecKind::Jpeg, 26)));
+
+        let answer = build_sdp("192.0.2.4", 20000, 8, Some(20002), Some((VideoCodecKind::Jpeg, 26)), None);
+        assert!(answer.contains("m=video 20002 RTP/AVP 26"));
+        assert!(answer.contains("a=rtpmap:26 JPEG/90000"));
+        assert!(!answer.contains("H264"));
+        assert!(!answer.contains("sprop-parameter-sets"));
     }
 
     #[test]

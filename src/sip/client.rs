@@ -3,7 +3,7 @@
 use super::ha::HaVoipClient;
 use super::message::{
     build_sdp, compute_digest_response, compute_digest_response_qop, extract_param,
-    parse_sdp_media, SipMessage, SipMethod,
+    parse_sdp_media, SipMessage, SipMethod, VideoCodecKind,
 };
 use super::session::SipCallSession;
 use crate::core::MediaKind;
@@ -525,7 +525,11 @@ impl SipCameraAccount {
             None
         };
 
-        let negotiated_video_pt = media_info.preferred_h264_pt();
+        let negotiated_video = media_info.preferred_video_codec();
+        let (negotiated_video_codec, negotiated_video_pt) = match negotiated_video {
+            Some((kind, pt)) => (kind, pt),
+            None => (VideoCodecKind::H264, 96),
+        };
         let remote_video_addr = media_info.video_port.and_then(|p| {
             let ip = if sdp_ip != "0.0.0.0" && !sdp_ip.is_empty() {
                 &sdp_ip
@@ -554,6 +558,7 @@ impl SipCameraAccount {
             negotiated_audio_pt,
             remote_video_addr,
             alt_video_addr,
+            negotiated_video_codec,
             negotiated_video_pt,
         )
         .await?;
@@ -565,16 +570,18 @@ impl SipCameraAccount {
         let mut active = self.active_call.lock().await;
         *active = Some(session);
 
-        // Extract sprop-parameter-sets from video track if available
+        // Extract sprop-parameter-sets from video track if available and using H.264
         let mut sprop = None;
-        let tracks = self.stream.get_tracks().await;
-        if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
-            if let Some(ref fmtp) = vt.codec.fmtp {
-                if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
-                    let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
-                    let val = after.split(';').next().unwrap_or("").trim();
-                    if !val.is_empty() {
-                        sprop = Some(val.to_string());
+        if negotiated_video_codec == VideoCodecKind::H264 {
+            let tracks = self.stream.get_tracks().await;
+            if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
+                if let Some(ref fmtp) = vt.codec.fmtp {
+                    if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
+                        let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
+                        let val = after.split(';').next().unwrap_or("").trim();
+                        if !val.is_empty() {
+                            sprop = Some(val.to_string());
+                        }
                     }
                 }
             }
@@ -586,7 +593,7 @@ impl SipCameraAccount {
             local_audio_port,
             negotiated_audio_pt,
             local_video_port,
-            negotiated_video_pt,
+            negotiated_video,
             sprop.as_deref(),
         );
         let local_port = self.socket.local_addr()?.port();
@@ -670,7 +677,7 @@ impl SipCameraAccount {
 
         // Temporary audio port for offer
         let dummy_audio_port = 20000;
-        let offer_sdp = build_sdp(&self.config.local_ip, dummy_audio_port, 0, None, 96, None);
+        let offer_sdp = build_sdp(&self.config.local_ip, dummy_audio_port, 0, None, None, None);
 
         let mut invite = SipMessage::new_request(SipMethod::Invite, &to_uri);
         invite.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch));

@@ -393,6 +393,7 @@ impl TrackDraft {
             (MediaKind::Audio, 8) => ("PCMA".to_string(), 8000, Some(1)),
             (MediaKind::Audio, 111) => ("OPUS".to_string(), 48000, Some(2)),
             (MediaKind::Audio, _) => ("PCMA".to_string(), 8000, Some(1)),
+            (MediaKind::Video, 26) => ("JPEG".to_string(), 90000, None),
             (MediaKind::Video, 96) => ("H264".to_string(), 90000, None),
             (MediaKind::Video, _) => ("H264".to_string(), 90000, None),
         };
