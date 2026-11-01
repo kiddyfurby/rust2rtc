@@ -3,7 +3,7 @@ use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
 use crate::webrtc::WebRtcManager;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -62,6 +62,16 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
+        .route("/api", get(api_info_handler))
+        .route("/api/", get(api_info_handler))
+        .route("/api/schemes", get(api_schemes_handler))
+        .route(
+            "/api/preload",
+            get(api_preload_get_handler)
+                .put(api_preload_action_handler)
+                .post(api_preload_action_handler)
+                .delete(api_preload_action_handler),
+        )
         .route(
             "/api/streams",
             get(api_streams_get_handler)
@@ -392,11 +402,88 @@ async fn index_handler() -> Html<&'static str> {
 </html>"#)
 }
 
+async fn api_info_handler(State(state): State<AppState>) -> Response {
+    let resp = serde_json::json!({
+        "version": "1.9.14",
+        "revision": "rust2rtc-0.2.0",
+        "host": "127.0.0.1:1984",
+        "rtsp": {
+            "listen": format!(":{}", state.rtsp_port),
+            "default_query": "video&audio"
+        }
+    });
+    (StatusCode::OK, Json(resp)).into_response()
+}
+
+async fn api_schemes_handler() -> Response {
+    let schemes = [
+        "alsa",
+        "bubble",
+        "doorbird",
+        "dvrip",
+        "echo",
+        "eseecloud",
+        "exec",
+        "expr",
+        "ffmpeg",
+        "flussonic",
+        "gopro",
+        "hass",
+        "homeassistant",
+        "homekit",
+        "http",
+        "https",
+        "httpx",
+        "isapi",
+        "ivideon",
+        "kasa",
+        "multitrans",
+        "nest",
+        "onvif",
+        "ring",
+        "roborock",
+        "rtmp",
+        "rtmps",
+        "rtmpx",
+        "rtsp",
+        "rtsps",
+        "rtspx",
+        "tapo",
+        "tcp",
+        "tuya",
+        "v4l2",
+        "vigi",
+        "webrtc",
+        "webtorrent",
+        "wyoming",
+        "wyze",
+        "xiaomi",
+        "yandex",
+    ];
+    (StatusCode::OK, Json(&schemes[..])).into_response()
+}
+
+async fn api_preload_get_handler() -> Response {
+    (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+}
+
+async fn api_preload_action_handler() -> Response {
+    (StatusCode::OK, Json(serde_json::json!({}))).into_response()
+}
+
 async fn api_streams_get_handler(
     State(state): State<AppState>,
-    Query(query): Query<StreamsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let target = query.src.or(query.name);
+    let mut target = None;
+    if let Some(query) = raw_query {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            if (k == "name" || k == "src") && target.is_none() {
+                target = Some(v.into_owned());
+            }
+        }
+    }
+
     if let Some(name) = target {
         if let Some(stream_info) = state.streams.get_go2rtc_stream(&name).await {
             (StatusCode::OK, Json(stream_info)).into_response()
@@ -411,36 +498,48 @@ async fn api_streams_get_handler(
 
 async fn api_streams_put_handler(
     State(state): State<AppState>,
-    Query(query): Query<StreamsQuery>,
+    RawQuery(raw_query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let payload: Option<StreamPayload> = if !body.is_empty() {
-        serde_json::from_slice(&body).ok()
-    } else {
-        None
-    };
+    let mut name = None;
+    let mut sources = Vec::new();
 
-    let (name, sources) = if let Some(p) = payload {
-        let name = p.name.or(p.src.clone()).or(query.name.clone()).or(query.src.clone());
-        let mut sources = p.sources.unwrap_or_default();
-        if sources.is_empty() {
-            if let Some(val) = p.val.or(p.src) {
+    if let Some(query) = raw_query {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            match k.as_ref() {
+                "name" => {
+                    if name.is_none() {
+                        name = Some(v.into_owned());
+                    }
+                }
+                "src" => {
+                    sources.push(v.into_owned());
+                }
+                "val" => {
+                    sources.push(v.into_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !body.is_empty() {
+        if let Ok(p) = serde_json::from_slice::<StreamPayload>(&body) {
+            if name.is_none() {
+                name = p.name.or(p.src);
+            }
+            if let Some(s) = p.sources {
+                sources.extend(s);
+            }
+            if let Some(val) = p.val {
                 sources.push(val);
             }
         }
-        (name, sources)
-    } else {
-        let name = query.name.clone().or(query.src.clone());
-        let mut sources = Vec::new();
-        if let Some(val) = query.val {
-            sources.push(val);
-        } else if let Some(src) = query.src {
-            if query.name.is_some() {
-                sources.push(src);
-            }
-        }
-        (name, sources)
-    };
+    }
+
+    if name.is_none() && !sources.is_empty() {
+        name = Some(sources[0].clone());
+    }
 
     if let Some(name) = name {
         if !sources.is_empty() {
@@ -459,9 +558,17 @@ async fn api_streams_put_handler(
 
 async fn api_streams_delete_handler(
     State(state): State<AppState>,
-    Query(query): Query<StreamsQuery>,
+    RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let target = query.src.or(query.name);
+    let mut target = None;
+    if let Some(query) = raw_query {
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            if (k == "name" || k == "src") && target.is_none() {
+                target = Some(v.into_owned());
+            }
+        }
+    }
+
     if let Some(name) = target {
         if state.streams.delete(&name).await {
             info!(stream = %name, "Deleted stream via /api/streams");
