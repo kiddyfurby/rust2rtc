@@ -23,15 +23,17 @@ use tracing::debug;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCIceGatheringState,
-    RTCPeerConnectionState,
+    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCIceGatheringState, RTCPeerConnectionState,
 };
 use webrtc::runtime::{channel, Sender};
 
 #[derive(Clone)]
 struct WebRtcHandler {
+    session_id: String,
     gather_complete_tx: Sender<()>,
     connected_tx: Sender<()>,
+    session_close_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 #[async_trait::async_trait]
@@ -43,9 +45,14 @@ impl PeerConnectionEventHandler for WebRtcHandler {
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        debug!(state = %state, "WebRTC peer connection state changed");
+        debug!(session = %self.session_id, state = %state, "WebRTC peer connection state changed");
         if state == RTCPeerConnectionState::Connected {
             let _ = self.connected_tx.try_send(());
+        } else if state == RTCPeerConnectionState::Failed
+            || state == RTCPeerConnectionState::Closed
+            || state == RTCPeerConnectionState::Disconnected
+        {
+            let _ = self.session_close_tx.send(());
         }
     }
 }
@@ -55,6 +62,7 @@ pub struct WebRtcManager {
     candidates: Vec<String>,
     pub rtsp_port: u16,
     pub ffmpeg_bin: String,
+    pub sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn PeerConnection>>>>,
 }
 
 impl WebRtcManager {
@@ -63,10 +71,15 @@ impl WebRtcManager {
             candidates,
             rtsp_port,
             ffmpeg_bin,
+            sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
 
-    pub async fn handle_whep(&self, stream: Arc<Stream>, offer_sdp: &str) -> Result<String> {
+    pub async fn handle_whep(
+        &self,
+        stream: Arc<Stream>,
+        offer_sdp: &str,
+    ) -> Result<(String, Arc<dyn PeerConnection>)> {
         let mut media_engine = MediaEngine::default();
 
         let video_feedback = vec![
@@ -230,12 +243,17 @@ impl WebRtcManager {
             .with_ice_servers(ice_servers)
             .build();
 
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let (session_close_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
         let (connected_tx, mut _connected_rx) = channel::<()>(1);
 
         let handler = Arc::new(WebRtcHandler {
+            session_id: session_id.clone(),
             gather_complete_tx,
             connected_tx,
+            session_close_tx: session_close_tx.clone(),
         });
 
         let peer_connection = PeerConnectionBuilder::new()
@@ -376,17 +394,45 @@ impl WebRtcManager {
             .await
             .ok_or_else(|| anyhow::anyhow!("Failed to generate local SDP answer"))?;
 
+        let pc_arc: Arc<dyn PeerConnection> = Arc::new(peer_connection);
+        {
+            let mut guard = self.sessions.write().await;
+            guard.insert(session_id.clone(), Arc::clone(&pc_arc));
+        }
+
+        let mut keeper_rx = session_close_tx.subscribe();
+        let sessions_clone = Arc::clone(&self.sessions);
+        let sid = session_id.clone();
+        let pc_holder = Arc::clone(&pc_arc);
+        tokio::spawn(async move {
+            let _ = keeper_rx.recv().await;
+            debug!(session = %sid, "WebRTC session closed, removing from active sessions");
+            {
+                let mut guard = sessions_clone.write().await;
+                guard.remove(&sid);
+            }
+            let _ = pc_holder.close().await;
+        });
+
         // Spawn video RTP forwarder after the track is bound
         if let Some((vtrack, mut rx, video_ssrc, is_hevc, is_high, mut param_set_payload, default_pt)) = video_track_info {
             let actual_pt = find_negotiated_video_pt(&local_desc.sdp, is_hevc, is_high, default_pt);
             tracing::info!(stream = %stream.name, pt = actual_pt, is_hevc = is_hevc, "Starting WebRTC video forwarder");
 
+            let mut close_rx = session_close_tx.subscribe();
             tokio::spawn(async move {
                 let mut seq: u16 = 0;
                 let mut sent_first_keyframe = false;
                 let mut last_was_param_set = false;
 
-                while let Ok(packet) = rx.recv().await {
+                loop {
+                    let packet = tokio::select! {
+                        _ = close_rx.recv() => break,
+                        res = rx.recv() => match res {
+                            Ok(pkt) => pkt,
+                            Err(_) => break,
+                        }
+                    };
                     let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
                         &packet.raw[packet.payload_offset..packet.payload_offset + packet.payload_len]
                     } else {
@@ -454,6 +500,7 @@ impl WebRtcManager {
                 if is_aac {
                     let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", self.rtsp_port, stream.name);
                     let ffmpeg_bin = self.ffmpeg_bin.clone();
+                    let mut close_rx = session_close_tx.subscribe();
 
                     tokio::spawn(async move {
                         let udp_sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
@@ -503,7 +550,15 @@ impl WebRtcManager {
                         };
 
                         let mut buf = [0u8; 2048];
-                        while let Ok((n, _)) = udp_sock.recv_from(&mut buf).await {
+                        loop {
+                            let n = tokio::select! {
+                                _ = close_rx.recv() => break,
+                                res = udp_sock.recv_from(&mut buf) => match res {
+                                    Ok((n, _)) => n,
+                                    Err(_) => break,
+                                }
+                            };
+
                             let mut bytes = BytesMut::from(&buf[..n]);
                             if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
                                 rtp_pkt.header.ssrc = audio_ssrc;
@@ -518,9 +573,18 @@ impl WebRtcManager {
                         let _ = child.kill().await;
                     });
                 } else {
+                    let mut close_rx = session_close_tx.subscribe();
                     tokio::spawn(async move {
                         let mut seq: u16 = 0;
-                        while let Ok(packet) = rx.recv().await {
+                        loop {
+                            let packet = tokio::select! {
+                                _ = close_rx.recv() => break,
+                                res = rx.recv() => match res {
+                                    Ok(pkt) => pkt,
+                                    Err(_) => break,
+                                }
+                            };
+
                             let mut bytes = BytesMut::from(&packet.raw[..]);
                             if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
                                 rtp_pkt.header.ssrc = audio_ssrc;
@@ -538,7 +602,7 @@ impl WebRtcManager {
             }
         }
 
-        Ok(local_desc.sdp)
+        Ok((local_desc.sdp, pc_arc))
     }
 }
 

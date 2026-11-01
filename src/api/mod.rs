@@ -543,7 +543,7 @@ async fn api_webrtc_handler(
         }
 
         match state.webrtc.handle_whep(stream, &body).await {
-            Ok(answer_sdp) => (
+            Ok((answer_sdp, _pc)) => (
                 StatusCode::CREATED,
                 [
                     (header::CONTENT_TYPE, "application/sdp"),
@@ -588,6 +588,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
     });
 
     let mut mse_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut active_pc: Option<Arc<dyn webrtc::peer_connection::PeerConnection>> = None;
 
     while let Some(msg_result) = ws_stream.next().await {
         let msg = match msg_result {
@@ -644,7 +645,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     }
 
                     match state.webrtc.handle_whep(stream, &offer_sdp).await {
-                        Ok(answer_sdp) => {
+                        Ok((answer_sdp, pc)) => {
+                            active_pc = Some(pc);
                             let answer_msg = WsMessage {
                                 msg_type: "webrtc/answer".to_string(),
                                 value: Some(serde_json::Value::String(answer_sdp)),
@@ -684,6 +686,21 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
             }
             "webrtc/candidate" => {
                 debug!("Received ICE candidate via WebSocket: {:?}", ws_msg.value);
+                if let Some(ref pc) = active_pc {
+                    let cand_str = match ws_msg.value {
+                        Some(serde_json::Value::String(s)) => s,
+                        _ => String::new(),
+                    };
+                    if !cand_str.is_empty() {
+                        let init = webrtc::peer_connection::RTCIceCandidateInit {
+                            candidate: cand_str,
+                            ..Default::default()
+                        };
+                        if let Err(e) = pc.add_ice_candidate(init).await {
+                            debug!("Failed to add ICE candidate: {}", e);
+                        }
+                    }
+                }
             }
             "mse" => {
                 let src_name = default_src.as_deref().unwrap_or("").to_string();
@@ -841,6 +858,9 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
         }
     }
 
+    if let Some(pc) = active_pc {
+        let _ = pc.close().await;
+    }
     if let Some(h) = mse_handle {
         h.abort();
     }
