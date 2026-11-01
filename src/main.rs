@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let args = Args::parse_from(normalized);
 
     // Collect all config paths
-    let config_paths: Vec<PathBuf> = if !args.config.is_empty() {
+    let mut config_paths: Vec<PathBuf> = if !args.config.is_empty() {
         args.config
     } else if std::path::Path::new("rust2rtc.yaml").exists() {
         vec![PathBuf::from("rust2rtc.yaml")]
@@ -69,6 +69,19 @@ async fn main() -> Result<()> {
     } else {
         vec![PathBuf::from("rust2rtc.yaml")]
     };
+
+    // Auto-detect companion rust2rtc.yaml configs (e.g. in /config/rust2rtc.yaml inside Docker,
+    // or alongside any explicit config path, or in current dir)
+    let supplemental = [
+        PathBuf::from("/config/rust2rtc.yaml"),
+        PathBuf::from("rust2rtc.yaml"),
+    ];
+    for supp in supplemental {
+        if supp.exists() && !config_paths.contains(&supp) {
+            info!("Found supplemental config file: {:?}", supp);
+            config_paths.push(supp);
+        }
+    }
 
     let mut config = Config::default();
     let mut loaded_any = false;
