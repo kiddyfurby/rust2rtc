@@ -14,6 +14,11 @@ It serves as a **drop-in binary replacement for `go2rtc`** across the smart home
 ## 🌟 Key Features
 
 - **⚡ Zero-Cost Asynchronous Architecture**: Built on Tokio with multi-producer, multi-consumer lock-free broadcast pipelines.
+- **📹 Native In-Process RTSP Client (Zero-FFmpeg Camera Ingestion)**:
+  - Connects directly to IP cameras and NVRs over TCP in pure Rust.
+  - Full support for standard RTSP handshakes (`OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, `TEARDOWN`, `GET_PARAMETER` keepalive).
+  - Handles Digest and Basic authentication natively with zero external dependencies.
+  - Ingests and depacketizes interleaved binary RTP frames directly into stream tracks in-process, completely eliminating the need for `ffmpeg -c copy` ingestion subprocesses.
 - **🔊 Pure-Rust In-Process Audio Transcoder (Zero-FFmpeg WebRTC Audio)**:
   - **In-process decoding**: Native decoding of AAC-hbr (RFC 3640 via `symphonia`) and G.711 $\mu$-law/A-law without spawning FFmpeg child subprocesses.
   - **In-process Opus encoding**: High-fidelity 48kHz stereo encoding via `opus-pure`.
