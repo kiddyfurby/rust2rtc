@@ -105,7 +105,8 @@ impl Stream {
         let source = self
             .sources
             .iter()
-            .find(|s| !s.starts_with("multitrans://") && !s.contains("#video=mjpeg"))
+            .find(|s| !s.starts_with("multitrans://") && !s.contains("#video=mjpeg") && !s.starts_with("ffmpeg:"))
+            .or_else(|| self.sources.iter().find(|s| !s.starts_with("multitrans://")))
             .unwrap_or(&self.sources[0]);
         info!(stream = %self.name, source = %source, "Starting on-demand producer");
 
@@ -158,9 +159,13 @@ impl Stream {
                     "m={} 0 RTP/AVP {}\r\n",
                     kind_str, track.codec.payload_type
                 ));
+                let rtpmap_suffix = match track.codec.channels {
+                    Some(ch) if track.kind == MediaKind::Audio => format!("/{}", ch),
+                    _ => String::new(),
+                };
                 sdp.push_str(&format!(
-                    "a=rtpmap:{} {}/{}\r\n",
-                    track.codec.payload_type, track.codec.name, track.codec.clock_rate
+                    "a=rtpmap:{} {}/{}{}\r\n",
+                    track.codec.payload_type, track.codec.name, track.codec.clock_rate, rtpmap_suffix
                 ));
 
                 if let Some(ref fmtp) = track.codec.fmtp {

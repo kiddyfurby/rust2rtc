@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::core::{Codec, MediaKind, RtpPacket, Track};
+use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
@@ -9,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug, Clone)]
@@ -26,16 +28,30 @@ impl RtspRequest {
     }
 }
 
+enum RtspOutgoing {
+    Rtp(u8, Bytes),
+    Msg(Vec<u8>),
+}
+
 pub struct RtspServer {
     listen_addr: String,
+    rtsp_port: u16,
     streams: Arc<StreamManager>,
+    ffmpeg: Arc<FfmpegManager>,
 }
 
 impl RtspServer {
-    pub fn new(listen_addr: String, streams: Arc<StreamManager>) -> Self {
+    pub fn new(
+        listen_addr: String,
+        rtsp_port: u16,
+        streams: Arc<StreamManager>,
+        ffmpeg: Arc<FfmpegManager>,
+    ) -> Self {
         Self {
             listen_addr,
+            rtsp_port,
             streams,
+            ffmpeg,
         }
     }
 
@@ -152,8 +168,19 @@ impl RtspServer {
                             "RTSP/1.0 200 OK\r\n\
                             CSeq: {}\r\n\
                             Server: rust2rtc\r\n\
-                            Public: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, TEARDOWN\r\n\r\n",
+                            Public: OPTIONS, DESCRIBE, ANNOUNCE, SETUP, PLAY, RECORD, TEARDOWN, GET_PARAMETER\r\n\r\n",
                             req.cseq()
+                        );
+                        stream.write_all(response.as_bytes()).await?;
+                    }
+                    "GET_PARAMETER" => {
+                        let response = format!(
+                            "RTSP/1.0 200 OK\r\n\
+                            CSeq: {}\r\n\
+                            Server: rust2rtc\r\n\
+                            Session: {}\r\n\r\n",
+                            req.cseq(),
+                            session_id
                         );
                         stream.write_all(response.as_bytes()).await?;
                     }
@@ -186,6 +213,20 @@ impl RtspServer {
                     "DESCRIBE" => {
                         // RTSP Consumer asking for stream SDP
                         let stream_obj = self.streams.get_or_create(&stream_id).await;
+
+                        // Ensure on-demand producer is started
+                        if let Err(e) = stream_obj.ensure_started(self.rtsp_port, &self.ffmpeg).await {
+                            warn!(stream = %stream_id, error = %e, "Failed to start producer on DESCRIBE");
+                        }
+
+                        // Wait for tracks to be announced if stream is starting up
+                        let start = tokio::time::Instant::now();
+                        while stream_obj.get_tracks().await.is_empty()
+                            && start.elapsed() < tokio::time::Duration::from_secs(6)
+                        {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+
                         let sdp = stream_obj.generate_sdp(&self.listen_addr).await;
 
                         let response = format!(
@@ -208,16 +249,29 @@ impl RtspServer {
                             .cloned()
                             .unwrap_or_else(|| "RTP/AVP/TCP;unicast;interleaved=0-1".to_string());
 
+                        let stream_obj = self.streams.get_or_create(&stream_id).await;
+                        let tracks = stream_obj.get_tracks().await;
+
+                        let track_idx = req
+                            .path
+                            .rsplit('/')
+                            .next()
+                            .and_then(|seg| seg.strip_prefix("track"))
+                            .and_then(|idx_str| idx_str.parse::<usize>().ok());
+
                         // Map requested interleaved channels to track
                         if let Some(pos) = transport.find("interleaved=") {
                             let after = &transport[pos + 12..];
                             let chan_str = after.split(['-', ';', ',']).next().unwrap_or("0");
                             if let Ok(ch) = chan_str.parse::<u8>() {
-                                let stream_obj = self.streams.get_or_create(&stream_id).await;
-                                let tracks = stream_obj.get_tracks().await;
-                                let track_idx = (ch / 2) as usize;
-                                if let Some(track) = tracks.get(track_idx) {
-                                    track_channels.insert(ch, Arc::clone(track));
+                                let selected_track = if let Some(idx) = track_idx {
+                                    tracks.get(idx).cloned()
+                                } else {
+                                    tracks.get((ch / 2) as usize).cloned()
+                                };
+
+                                if let Some(track) = selected_track {
+                                    track_channels.insert(ch, track);
                                 }
                             }
                         }
@@ -258,36 +312,100 @@ impl RtspServer {
                         );
                         stream.write_all(response.as_bytes()).await?;
 
-                        // Spawn task to stream RTP to this consumer
-                        let stream_obj = self.streams.get_or_create(&stream_id).await;
-                        let tracks = stream_obj.get_tracks().await;
-
-                        if let Some(video_track) = tracks.first() {
-                            let mut rx = video_track.subscribe();
+                        if !track_channels.is_empty() {
+                            let (tx, mut rx) = mpsc::channel::<RtspOutgoing>(1024);
                             let (mut reader, mut writer) = stream.into_split();
 
-                            tokio::spawn(async move {
-                                while let Ok(packet) = rx.recv().await {
-                                    let mut header = [0u8; 4];
-                                    header[0] = b'$';
-                                    header[1] = 0; // channel 0
-                                    let len = packet.raw.len() as u16;
-                                    header[2..4].copy_from_slice(&len.to_be_bytes());
-
-                                    if writer.write_all(&header).await.is_err() {
-                                        break;
+                            // Spawn subscriber per mapped channel
+                            for (&ch, track) in &track_channels {
+                                let mut track_rx = track.subscribe();
+                                let tx_clone = tx.clone();
+                                tokio::spawn(async move {
+                                    while let Ok(packet) = track_rx.recv().await {
+                                        if tx_clone.send(RtspOutgoing::Rtp(ch, packet.raw)).await.is_err() {
+                                            break;
+                                        }
                                     }
-                                    if writer.write_all(&packet.raw).await.is_err() {
-                                        break;
+                                });
+                            }
+
+                            // Writer task
+                            tokio::spawn(async move {
+                                while let Some(msg) = rx.recv().await {
+                                    match msg {
+                                        RtspOutgoing::Rtp(ch, raw) => {
+                                            let mut header = [0u8; 4];
+                                            header[0] = b'$';
+                                            header[1] = ch;
+                                            let len = raw.len() as u16;
+                                            header[2..4].copy_from_slice(&len.to_be_bytes());
+
+                                            if writer.write_all(&header).await.is_err() {
+                                                break;
+                                            }
+                                            if writer.write_all(&raw).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        RtspOutgoing::Msg(data) => {
+                                            if writer.write_all(&data).await.is_err() {
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             });
 
-                            // Keep reading to handle TEARDOWN
-                            let mut dummy = [0u8; 1024];
-                            while let Ok(n) = reader.read(&mut dummy).await {
-                                if n == 0 {
-                                    break;
+                            // Reader loop for keepalive & teardown
+                            let tx_resp = tx.clone();
+                            let mut read_buf = BytesMut::with_capacity(4096);
+                            loop {
+                                if let Some(pos) = find_crlf_crlf(&read_buf) {
+                                    let header_bytes = read_buf.split_to(pos + 4);
+                                    if let Ok((cmd, _, _, hdrs)) = parse_rtsp_headers(&header_bytes) {
+                                        let cseq = hdrs.get("cseq").cloned().unwrap_or_else(|| "0".to_string());
+                                        let content_len = hdrs
+                                            .get("content-length")
+                                            .and_then(|v| v.parse::<usize>().ok())
+                                            .unwrap_or(0);
+                                        while read_buf.len() < content_len {
+                                            if reader.read_buf(&mut read_buf).await.unwrap_or(0) == 0 {
+                                                return Ok(());
+                                            }
+                                        }
+                                        let _ = read_buf.split_to(content_len);
+
+                                        match cmd.as_str() {
+                                            "GET_PARAMETER" => {
+                                                let resp = format!(
+                                                    "RTSP/1.0 200 OK\r\nCSeq: {}\r\nSession: {}\r\n\r\n",
+                                                    cseq, session_id
+                                                );
+                                                let _ = tx_resp.send(RtspOutgoing::Msg(resp.into_bytes())).await;
+                                            }
+                                            "OPTIONS" => {
+                                                let resp = format!(
+                                                    "RTSP/1.0 200 OK\r\nCSeq: {}\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
+                                                    cseq
+                                                );
+                                                let _ = tx_resp.send(RtspOutgoing::Msg(resp.into_bytes())).await;
+                                            }
+                                            "TEARDOWN" => {
+                                                let resp = format!(
+                                                    "RTSP/1.0 200 OK\r\nCSeq: {}\r\n\r\n",
+                                                    cseq
+                                                );
+                                                let _ = tx_resp.send(RtspOutgoing::Msg(resp.into_bytes())).await;
+                                                return Ok(());
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                } else {
+                                    let n = reader.read_buf(&mut read_buf).await?;
+                                    if n == 0 {
+                                        break;
+                                    }
                                 }
                             }
                             return Ok(());

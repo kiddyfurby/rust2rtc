@@ -126,7 +126,9 @@ async fn main() -> Result<()> {
     // Start RTSP Server
     let rtsp_server = Arc::new(RtspServer::new(
         rtsp_listen.clone(),
+        rtsp_port,
         Arc::clone(&stream_manager),
+        Arc::clone(&ffmpeg_manager),
     ));
 
     tokio::spawn(async move {
