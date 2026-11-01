@@ -1,8 +1,10 @@
 mod api;
+mod audio;
 mod backchannel;
 mod config;
 mod core;
 mod ffmpeg;
+mod mp4;
 mod rtsp;
 mod sip;
 mod streams;
