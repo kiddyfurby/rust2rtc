@@ -262,6 +262,65 @@ Works out-of-the-box with:
 
 ---
 
+## 🧪 Tested Devices & Hardware Compatibility
+
+`rust2rtc` is actively validated in real-world 24/7 smart home and surveillance deployments across a wide variety of host hardware, operating systems, and camera vendors:
+
+### 🖥️ Host Systems & Architectures
+| Hardware / Platform | Architecture | Operating System | Role & Notes |
+| :--- | :---: | :---: | :--- |
+| **Apple Silicon MacBook** | `aarch64` / `arm64` | macOS Sonoma / Sequoia | Primary development, unit testing, Safari WebRTC (HEVC/H.264) & MSE evaluation |
+| **Rockchip RK3588 (Orange Pi 5 Plus)** | `aarch64-unknown-linux-musl` | Debian / Armbian Linux | 24/7 production node running Frigate NVR, Home Assistant, and multi-camera RTSP/WebRTC ingest |
+| **x86_64 Server / PC** | `x86_64-unknown-linux-musl` | Linux / Docker | Containerized NVR workloads and CI automated verification |
+
+### 📹 Cameras, Doorbells & Encoders
+| Device / Model | Firmware / Platform | Protocols & Features Tested |
+| :--- | :--- | :--- |
+| **Reolink Video Doorbell** (PoE & WiFi) | Official v3.0.0+ | • 5MP H.264 High Profile Level 5.1 (`profile-level-id=640033`, 2560×1920 @ 20fps)<br>• Native pure-Rust in-process AAC-to-Opus audio transcoding<br>• Full-duplex two-way audio (backchannel) over WebRTC & SIP |
+| **TP-Link AIPC / Chinese PTZ**<br>(e.g. `TL-AIPC657-ZOOM-DUAL`) | Chinese Regional Firmware | • Dual-lens main & sub RTSP TCP streams<br>• In-process interleaved stream recovery & `OPTIONS` keepalive<br>• ONVIF port 2020 integration for Frigate detection |
+| **TP-Link Tapo Series**<br>(Tapo C200, C210, C310, C110) | Official Tapo Firmware | • Standard RTSP over TCP with Digest MD5 authentication<br>• Low-latency H.264 video with PCMA audio |
+| **Yi / Kami Cameras** | `yi-hack-allwinner-v2` / `yi-hack-v4/v5` | • Allwinner v2 platform RTSP stream ingestion<br>• In-process H.264 depacketization & sub-second JPEG snapshot capture |
+| **SIP Panels & Intercom Screens**<br>(Grandstream, Akuvox, ESP32-P4 Touch) | FreePBX / Asterisk / SIP2.0 | • Bi-directional SIP audio (PCMA/PCMU 20ms)<br>• Video over SIP via RFC 2435 JPEG RTP (15 fps paced) and H.264 |
+
+---
+
+## 📝 Changelog & Release History
+
+### v0.4.0 (Current)
+- **RTSP Interleaved Stream Resynchronization**:
+  - Implemented automatic binary packet delimiter (`$`) scanner to recover instantly from corrupted or desynchronized interleaved TCP streams.
+  - Added full response body draining based on `Content-Length` to prevent parser lockups from RTSP responses that include trailing payload bytes.
+  - Replaced periodic keepalive with universal bodyless `OPTIONS`, eliminating keepalive rejection on cameras with strict parameter requirements.
+- **Dynamic H.264 Profile & Level Negotiation for 5MP/4K Cameras**:
+  - Dynamically extracts exact `profile-level-id` (e.g. `640033` for 5MP Reolink Doorbell vs `640029` for 1080p) from SDP `fmtp` and SPS NAL units.
+  - Prevents Chromium and Safari `SourceBuffer` decode rejections caused by Level 4.1 frame macroblock limits.
+  - Supports both JSON string and array formats (`["avc1", "hvc1"]`) in client codec negotiation messages.
+- **WebRTC Codec Registration & WAN Connectivity**:
+  - Added H.264 High Profile Level 5.1 (`profile-level-id=640033`) SDP codec registration.
+  - Extended STUN ICE candidate gathering window to 500 ms to reliably obtain server-reflexive candidates for external WAN and cellular IPv6 clients.
+
+### v0.3.0
+- **Pure-Rust In-Process RTSP Client**:
+  - High-performance TCP interleaved RTSP ingest engine completely eliminating `ffmpeg -c copy` background processes.
+  - Native Digest MD5 and Basic authentication without external tools.
+  - Dynamic parameter set (SPS/PPS/VPS) extraction from SDP and inline bitstreams.
+- **Home Assistant go2rtc API Compatibility**:
+  - Implemented `/api` returning compatible `1.9.14` version and dynamic `rust2rtc` revision string.
+  - Added `/api/schemes` and `/api/preload` endpoints to allow Home Assistant to validate `rust2rtc` as an external go2rtc instance without spawning its bundled binaries.
+
+### v0.2.0
+- **Pure-Rust In-Process Audio Transcoding**:
+  - Native decoding of AAC-hbr (RFC 3640) and G.711 to 48kHz Opus via `symphonia` and `opus-pure`.
+  - Camera-clock lip-sync and deduplicated shared broadcast tracks across concurrent viewers.
+- **SIP Intercom & Backchannel**:
+  - Full-duplex backchannel for Reolink and ONVIF smart doorbells.
+  - High-fidelity G.711a/u 20ms audio repacking and RFC 2435 JPEG RTP video streaming for hardware intercom screens.
+
+### v0.1.0
+- Initial release: Tokio/Axum asynchronous core, WebRTC WHEP gateway, RTSP TCP server (`:8554`), and fast JPEG snapshots.
+
+---
+
 ## 🤝 Contributing
 
 Contributions are very welcome! Whether you are interested in:
