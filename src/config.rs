@@ -111,12 +111,15 @@ impl StreamConfig {
 pub struct ApiConfig {
     #[serde(default = "default_api_listen")]
     pub listen: String,
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen: default_api_listen(),
+            origin: None,
         }
     }
 }
@@ -171,7 +174,35 @@ fn default_ffmpeg_global() -> String {
 impl Config {
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(Self::default());
+        }
         let config: Config = serde_yaml::from_str(&content)?;
         Ok(config)
+    }
+
+    pub fn merge(&mut self, other: Config) {
+        for (name, stream) in other.streams {
+            self.streams.insert(name, stream);
+        }
+        if other.api.listen != default_api_listen() {
+            self.api = other.api;
+        }
+        if other.rtsp.listen != default_rtsp_listen() {
+            self.rtsp = other.rtsp;
+        }
+        if other.ffmpeg.bin != default_ffmpeg_bin() || other.ffmpeg.global != default_ffmpeg_global() {
+            self.ffmpeg = other.ffmpeg;
+        }
+        if let Some(webrtc) = other.webrtc {
+            if let Some(ref mut our_webrtc) = self.webrtc {
+                our_webrtc.candidates.extend(webrtc.candidates);
+            } else {
+                self.webrtc = Some(webrtc);
+            }
+        }
+        if let Some(sip) = other.sip {
+            self.sip = Some(sip);
+        }
     }
 }
