@@ -252,6 +252,22 @@ impl RtspServer {
                             .cloned()
                             .unwrap_or_else(|| "RTP/AVP/TCP;unicast;interleaved=0-1".to_string());
 
+                        // If client requested UDP transport without TCP / interleaved, reject with 461 Unsupported Transport
+                        // so clients like ffmpeg/ffprobe immediately switch to TCP interleaved transport without timing out
+                        let is_tcp = transport.to_uppercase().contains("TCP") || transport.contains("interleaved");
+                        if !is_tcp {
+                            let response = format!(
+                                "RTSP/1.0 461 Unsupported Transport\r\n\
+                                CSeq: {}\r\n\
+                                Server: rust2rtc\r\n\
+                                Session: {}\r\n\r\n",
+                                req.cseq(),
+                                session_id
+                            );
+                            stream.write_all(response.as_bytes()).await?;
+                            continue;
+                        }
+
                         let stream_obj = self.streams.get_or_create(&stream_id).await;
                         let tracks = stream_obj.get_tracks().await;
 
@@ -262,20 +278,32 @@ impl RtspServer {
                             .and_then(|seg| seg.strip_prefix("track"))
                             .and_then(|idx_str| idx_str.parse::<usize>().ok());
 
+                        let mut resp_transport = transport.clone();
+                        let mut assigned_ch = None;
+
                         // Map requested interleaved channels to track
                         if let Some(pos) = transport.find("interleaved=") {
                             let after = &transport[pos + 12..];
                             let chan_str = after.split(['-', ';', ',']).next().unwrap_or("0");
                             if let Ok(ch) = chan_str.parse::<u8>() {
-                                let selected_track = if let Some(idx) = track_idx {
-                                    tracks.get(idx).cloned()
-                                } else {
-                                    tracks.get((ch / 2) as usize).cloned()
-                                };
+                                assigned_ch = Some(ch);
+                            }
+                        } else {
+                            // Assign interleaved channel if client asked for TCP without explicit channel numbers
+                            let next_ch = (track_channels.len() * 2) as u8;
+                            resp_transport.push_str(&format!(";interleaved={}-{}", next_ch, next_ch + 1));
+                            assigned_ch = Some(next_ch);
+                        }
 
-                                if let Some(track) = selected_track {
-                                    track_channels.insert(ch, track);
-                                }
+                        if let Some(ch) = assigned_ch {
+                            let selected_track = if let Some(idx) = track_idx {
+                                tracks.get(idx).cloned()
+                            } else {
+                                tracks.get((ch / 2) as usize).cloned()
+                            };
+
+                            if let Some(track) = selected_track {
+                                track_channels.insert(ch, track);
                             }
                         }
 
@@ -287,7 +315,7 @@ impl RtspServer {
                             Transport: {}\r\n\r\n",
                             req.cseq(),
                             session_id,
-                            transport
+                            resp_transport
                         );
                         stream.write_all(response.as_bytes()).await?;
                     }

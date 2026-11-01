@@ -440,6 +440,18 @@ impl WebRtcManager {
                 let mut last_keyframe_ts: Option<u32> = None;
                 let mut connected_fired = false;
 
+                let mut cached_h264_sps: Option<Vec<u8>> = None;
+                let mut cached_h264_pps: Option<Vec<u8>> = None;
+                let mut cached_h265_vps: Option<Vec<u8>> = None;
+                let mut cached_h265_sps: Option<Vec<u8>> = None;
+                let mut cached_h265_pps: Option<Vec<u8>> = None;
+
+                if is_hevc && param_set_packets.len() >= 3 {
+                    cached_h265_vps = Some(param_set_packets[0].clone());
+                    cached_h265_sps = Some(param_set_packets[1].clone());
+                    cached_h265_pps = Some(param_set_packets[2].clone());
+                }
+
                 loop {
                     let packet = tokio::select! {
                         _ = close_rx.recv() => break,
@@ -469,26 +481,51 @@ impl WebRtcManager {
 
                     let (is_keyframe, is_param_set) = is_keyframe_or_param_set(is_hevc, payload_slice);
 
-                    // Dynamically cache parameter sets if seen in stream (even before first keyframe)
+                    // Dynamically cache parameter sets seen in stream
                     if is_param_set {
-                        if !is_hevc && (payload_slice[0] & 0x1F) == 24 {
-                            param_set_packets = vec![payload_slice.to_vec()];
-                        } else if is_hevc {
+                        if !is_hevc {
+                            let nalu_type = payload_slice[0] & 0x1F;
+                            if nalu_type == 7 {
+                                cached_h264_sps = Some(payload_slice.to_vec());
+                            } else if nalu_type == 8 {
+                                cached_h264_pps = Some(payload_slice.to_vec());
+                            } else if nalu_type == 24 {
+                                param_set_packets = vec![payload_slice.to_vec()];
+                            }
+                            if let (Some(sps), Some(pps)) = (&cached_h264_sps, &cached_h264_pps) {
+                                param_set_packets = vec![build_h264_stap_a(sps, pps)];
+                            }
+                        } else {
                             let nalu_type = (payload_slice[0] >> 1) & 0x3F;
-                            if nalu_type == 48 {
+                            if nalu_type == 32 {
+                                cached_h265_vps = Some(payload_slice.to_vec());
+                            } else if nalu_type == 33 {
+                                cached_h265_sps = Some(payload_slice.to_vec());
+                            } else if nalu_type == 34 {
+                                cached_h265_pps = Some(payload_slice.to_vec());
+                            } else if nalu_type == 48 {
                                 let unpacked = unpack_h265_ap(payload_slice);
-                                if !unpacked.is_empty() {
-                                    param_set_packets = unpacked;
+                                for nalu in unpacked {
+                                    if !nalu.is_empty() {
+                                        let sub_type = (nalu[0] >> 1) & 0x3F;
+                                        if sub_type == 32 { cached_h265_vps = Some(nalu); }
+                                        else if sub_type == 33 { cached_h265_sps = Some(nalu); }
+                                        else if sub_type == 34 { cached_h265_pps = Some(nalu); }
+                                    }
                                 }
+                            }
+                            let mut ps = Vec::new();
+                            if let Some(ref v) = cached_h265_vps { ps.push(v.clone()); }
+                            if let Some(ref s) = cached_h265_sps { ps.push(s.clone()); }
+                            if let Some(ref p) = cached_h265_pps { ps.push(p.clone()); }
+                            if !ps.is_empty() {
+                                param_set_packets = ps;
                             }
                         }
                     }
 
                     if !sent_first_keyframe {
                         // Wait until an actual IDR keyframe arrives before forwarding frames
-                        if is_param_set {
-                            continue;
-                        }
                         if !is_keyframe {
                             continue;
                         }
