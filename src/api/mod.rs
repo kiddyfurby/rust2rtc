@@ -1,3 +1,4 @@
+use crate::core::MediaKind;
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
 use crate::webrtc::WebRtcManager;
@@ -9,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info};
 
@@ -669,6 +671,145 @@ async fn handle_ws(mut socket: WebSocket, query: StreamsQuery, state: AppState) 
             }
             "webrtc/candidate" => {
                 debug!("Received ICE candidate via WebSocket: {:?}", ws_msg.value);
+            }
+            "mse" => {
+                let src_name = default_src.as_deref().unwrap_or("");
+                if let Some(stream) = state.streams.get(src_name).await {
+                    let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
+                    for _ in 0..50 {
+                        if !stream.get_tracks().await.is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+
+                    let tracks = stream.get_tracks().await;
+                    let mut has_h265 = false;
+                    let mut has_aac = false;
+                    for t in &tracks {
+                        if t.kind == MediaKind::Video {
+                            if t.codec.name.contains("H265") || t.codec.name.contains("HEVC") {
+                                has_h265 = true;
+                            }
+                        } else if t.kind == MediaKind::Audio {
+                            if t.codec.name.contains("AAC") || t.codec.name.contains("MP4A") {
+                                has_aac = true;
+                            }
+                        }
+                    }
+
+                    let client_codecs = ws_msg
+                        .value
+                        .as_ref()
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let (mime, copy_video, copy_audio) = if has_h265 {
+                        if client_codecs.contains("hvc1") {
+                            if has_aac && client_codecs.contains("mp4a") {
+                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\"", true, true)
+                            } else {
+                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0\"", true, false)
+                            }
+                        } else {
+                            if has_aac && client_codecs.contains("mp4a") {
+                                ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", false, true)
+                            } else {
+                                ("video/mp4; codecs=\"avc1.640029\"", false, false)
+                            }
+                        }
+                    } else {
+                        if has_aac && client_codecs.contains("mp4a") {
+                            ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", true, true)
+                        } else {
+                            ("video/mp4; codecs=\"avc1.640029\"", true, false)
+                        }
+                    };
+
+                    info!(stream = %src_name, mime = %mime, copy_video = copy_video, copy_audio = copy_audio, "Starting MSE fMP4 stream");
+
+                    let reply = WsMessage {
+                        msg_type: "mse".to_string(),
+                        value: Some(serde_json::Value::String(mime.to_string())),
+                    };
+                    if let Ok(json_str) = serde_json::to_string(&reply) {
+                        let _ = socket.send(Message::Text(json_str.into())).await;
+                    }
+
+                    let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src_name);
+                    let mut cmd = tokio::process::Command::new(state.ffmpeg.bin());
+                    cmd.args([
+                        "-hide_banner",
+                        "-loglevel", "warning",
+                        "-rtsp_transport", "tcp",
+                        "-i", &rtsp_url,
+                    ]);
+
+                    if copy_video {
+                        cmd.args(["-c:v", "copy"]);
+                    } else {
+                        cmd.args(["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]);
+                    }
+
+                    if copy_audio {
+                        cmd.args(["-c:a", "copy"]);
+                    } else {
+                        cmd.arg("-an");
+                    }
+
+                    cmd.args([
+                        "-f", "mp4",
+                        "-movflags", "empty_moov+default_base_moof+frag_keyframe",
+                        "-flush_packets", "1",
+                        "-reset_timestamps", "1",
+                        "pipe:1",
+                    ]);
+                    cmd.stdout(std::process::Stdio::piped());
+                    cmd.stderr(std::process::Stdio::null());
+
+                    let mut child = match cmd.spawn() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("Failed to spawn FFmpeg for MSE stream {}: {}", src_name, e);
+                            continue;
+                        }
+                    };
+
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let mut buf = vec![0u8; 8192];
+                        loop {
+                            tokio::select! {
+                                read_res = stdout.read(&mut buf) => {
+                                    match read_res {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            if socket.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                ws_msg = socket.recv() => {
+                                    match ws_msg {
+                                        Some(Ok(Message::Close(_))) | None => break,
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = child.kill().await;
+                    return;
+                } else {
+                    let err_msg = WsMessage {
+                        msg_type: "error".to_string(),
+                        value: Some(serde_json::Value::String(format!("Stream '{}' not found", src_name))),
+                    };
+                    if let Ok(json_str) = serde_json::to_string(&err_msg) {
+                        let _ = socket.send(Message::Text(json_str.into())).await;
+                    }
+                }
             }
             other => {
                 debug!("Received unhandled WebSocket message type: {}", other);
