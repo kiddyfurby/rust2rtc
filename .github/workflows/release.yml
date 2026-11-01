@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_zig: true
+            artifact_name: rust2rtc-linux-arm64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_zig: true
+            artifact_name: rust2rtc-linux-amd64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            use_zig: false
+            artifact_name: rust2rtc-darwin-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        if: matrix.use_zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zig
+        run: pipx install cargo-zigbuild
+
+      - name: Build binary
+        run: |
+          if [ "${{ matrix.use_zig }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+            cp target/${{ matrix.target }}/release/rust2rtc ${{ matrix.artifact_name }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+            cp target/release/rust2rtc ${{ matrix.artifact_name }}
+          fi
+          chmod +x ${{ matrix.artifact_name }}
+          tar -czvf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+          shasum -a 256 ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
+          shasum -a 256 ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.sha256
+            ${{ matrix.artifact_name }}.tar.gz.sha256
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

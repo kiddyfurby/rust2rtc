@@ -122,7 +122,45 @@ The following features have been implemented and verified in live testing:
 
 ---
 
-## 🚀 Getting Started
+## 📥 Downloads & Pre-Compiled Binaries
+
+Pre-compiled, standalone, statically linked binaries are provided for all 3 supported production platforms on the [**GitHub Releases**](https://github.com/kiddyfurby/rust2rtc/releases/latest) page:
+
+| Platform / Architecture | Recommended Hardware | Binary | Archive |
+| :--- | :--- | :---: | :---: |
+| **Linux ARM64** (`aarch64`) | Rockchip RK3588 (Orange Pi 5 Plus), Raspberry Pi 4 / 5, Home Assistant OS | [**`rust2rtc-linux-arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-linux-arm64) | [`.tar.gz`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-linux-arm64.tar.gz) |
+| **Linux x86_64** (`amd64`) | Intel & AMD 64-bit servers, mini PCs, Frigate Docker containers | [**`rust2rtc-linux-amd64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-linux-amd64) | [`.tar.gz`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-linux-amd64.tar.gz) |
+| **macOS Apple Silicon** (`arm64`) | Apple M1 / M2 / M3 / M4 MacBook, Mac mini, Mac Studio (macOS 12+) | [**`rust2rtc-darwin-arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-darwin-arm64) | [`.tar.gz`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-darwin-arm64.tar.gz) |
+
+> [!TIP]
+> **Zero Dependencies**: Linux binaries are fully statically linked against `musl` (`*-unknown-linux-musl`), requiring zero system dependencies or shared C libraries.
+
+### Quick One-Liner Download
+
+#### Linux ARM64 (RK3588 / Orange Pi 5 Plus / Raspberry Pi)
+```bash
+curl -L -o rust2rtc https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-linux-arm64
+chmod +x rust2rtc
+./rust2rtc
+```
+
+#### Linux x86_64 (Intel / AMD Server)
+```bash
+curl -L -o rust2rtc https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-linux-amd64
+chmod +x rust2rtc
+./rust2rtc
+```
+
+#### macOS Apple Silicon (MacBook / Mac mini)
+```bash
+curl -L -o rust2rtc https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc-darwin-arm64
+chmod +x rust2rtc
+./rust2rtc
+```
+
+---
+
+## 🚀 Building from Source
 
 ### Prerequisites
 
