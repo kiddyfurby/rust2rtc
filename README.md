@@ -117,11 +117,16 @@ The following features have been implemented and verified in live testing:
 git clone https://github.com/kiddyfurby/rust2rtc.git
 cd rust2rtc
 
-# Build optimized release binary
-cargo build --release
-```
+# Build macOS release binary
+just mac          # or: cargo build --release
 
-The compiled binary will be placed at `./target/release/rust2rtc`.
+# Cross-compile for Linux (statically-linked musl ELF binaries):
+just linux-amd64  # for x86_64 Linux servers / NVRs
+just linux-arm64  # for Raspberry Pi / ARM64 Home Assistant OS
+
+# Build and package all targets into ./dist/:
+just dist
+```
 
 ---
 
