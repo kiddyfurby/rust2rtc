@@ -19,6 +19,7 @@ use rtc::rtp_transceiver::rtp_sender::{
 };
 use rtc::shared::marshal::Unmarshal;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tracing::debug;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -53,11 +54,17 @@ impl PeerConnectionEventHandler for WebRtcHandler {
 #[derive(Clone)]
 pub struct WebRtcManager {
     candidates: Vec<String>,
+    pub rtsp_port: u16,
+    pub ffmpeg_bin: String,
 }
 
 impl WebRtcManager {
-    pub fn new(candidates: Vec<String>) -> Self {
-        Self { candidates }
+    pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String) -> Self {
+        Self {
+            candidates,
+            rtsp_port,
+            ffmpeg_bin,
+        }
     }
 
     pub async fn handle_whep(&self, stream: Arc<Stream>, offer_sdp: &str) -> Result<String> {
@@ -259,7 +266,7 @@ impl WebRtcManager {
         }
 
         let mut video_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, bool, bool, Option<Vec<u8>>, u8)> = None;
-        let mut audio_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, u8)> = None;
+        let mut audio_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, u8, bool)> = None;
 
         for track in &tracks {
             if track.kind == MediaKind::Video && video_track_info.is_none() {
@@ -315,6 +322,7 @@ impl WebRtcManager {
                 video_track_info = Some((video_track, rx, video_ssrc, is_hevc, is_high, param_set_packet_payload, default_pt));
             } else if track.kind == MediaKind::Audio && audio_track_info.is_none() {
                 let name = track.codec.name.to_uppercase();
+                let is_aac = name.contains("AAC") || name.contains("MP4A") || name.contains("MPEG4-GENERIC");
                 let (audio_codec, default_pt) = if name.contains("OPUS") {
                     (opus_codec.clone(), 111)
                 } else if name.contains("PCMU") {
@@ -346,7 +354,7 @@ impl WebRtcManager {
                     tracing::warn!("Failed to add audio track: {}", e);
                 } else {
                     let rx = track.subscribe();
-                    audio_track_info = Some((audio_track, rx, audio_ssrc, default_pt));
+                    audio_track_info = Some((audio_track, rx, audio_ssrc, default_pt, is_aac));
                 }
             }
         }
@@ -439,24 +447,95 @@ impl WebRtcManager {
         }
 
         // Spawn audio RTP forwarder if audio track was negotiated
-        if let Some((atrack, mut rx, audio_ssrc, default_pt)) = audio_track_info {
-            let actual_audio_pt = find_negotiated_audio_pt(&local_desc.sdp, default_pt);
-            tracing::info!(stream = %stream.name, pt = actual_audio_pt, "Starting WebRTC audio forwarder");
+        if let Some((atrack, mut rx, audio_ssrc, default_pt, is_aac)) = audio_track_info {
+            if is_audio_active(&local_desc.sdp) {
+                let actual_audio_pt = find_negotiated_audio_pt(&local_desc.sdp, default_pt);
+                tracing::info!(stream = %stream.name, pt = actual_audio_pt, is_aac = is_aac, "Starting WebRTC audio forwarder");
 
-            tokio::spawn(async move {
-                let mut seq: u16 = 0;
-                while let Ok(packet) = rx.recv().await {
-                    let mut bytes = BytesMut::from(&packet.raw[..]);
-                    if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
-                        rtp_pkt.header.ssrc = audio_ssrc;
-                        rtp_pkt.header.payload_type = actual_audio_pt;
-                        rtp_pkt.header.sequence_number = seq;
-                        seq = seq.wrapping_add(1);
+                if is_aac {
+                    let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", self.rtsp_port, stream.name);
+                    let ffmpeg_bin = self.ffmpeg_bin.clone();
 
-                        let _ = atrack.write_rtp(rtp_pkt).await;
-                    }
+                    tokio::spawn(async move {
+                        let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+                        cmd.kill_on_drop(true);
+                        cmd.args([
+                            "-hide_banner",
+                            "-loglevel", "warning",
+                            "-fflags", "nobuffer",
+                            "-flags", "low_delay",
+                            "-rtsp_transport", "tcp",
+                            "-i", &rtsp_url,
+                            "-vn",
+                            "-c:a", "pcm_alaw",
+                            "-ar", "8000",
+                            "-ac", "1",
+                            "-f", "alaw",
+                            "pipe:1",
+                        ]);
+                        cmd.stdout(std::process::Stdio::piped());
+                        cmd.stderr(std::process::Stdio::null());
+
+                        let mut child = match cmd.spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!("Failed to spawn FFmpeg audio transcoder for WebRTC {}: {}", rtsp_url, e);
+                                return;
+                            }
+                        };
+
+                        if let Some(mut stdout) = child.stdout.take() {
+                            let mut buf = [0u8; 160];
+                            let mut seq: u16 = 0;
+                            let mut ts: u32 = 0;
+
+                            loop {
+                                match stdout.read_exact(&mut buf).await {
+                                    Ok(_) => {
+                                        let rtp_pkt = rtp::packet::Packet {
+                                            header: rtp::header::Header {
+                                                version: 2,
+                                                payload_type: actual_audio_pt,
+                                                sequence_number: seq,
+                                                timestamp: ts,
+                                                ssrc: audio_ssrc,
+                                                marker: false,
+                                                ..Default::default()
+                                            },
+                                            payload: Bytes::copy_from_slice(&buf),
+                                        };
+                                        seq = seq.wrapping_add(1);
+                                        ts = ts.wrapping_add(160);
+
+                                        if atrack.write_rtp(rtp_pkt).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        let _ = child.kill().await;
+                    });
+                } else {
+                    tokio::spawn(async move {
+                        let mut seq: u16 = 0;
+                        while let Ok(packet) = rx.recv().await {
+                            let mut bytes = BytesMut::from(&packet.raw[..]);
+                            if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
+                                rtp_pkt.header.ssrc = audio_ssrc;
+                                rtp_pkt.header.payload_type = actual_audio_pt;
+                                rtp_pkt.header.sequence_number = seq;
+                                seq = seq.wrapping_add(1);
+
+                                let _ = atrack.write_rtp(rtp_pkt).await;
+                            }
+                        }
+                    });
                 }
-            });
+            } else {
+                tracing::debug!(stream = %stream.name, "Audio was rejected by client in SDP answer");
+            }
         }
 
         Ok(local_desc.sdp)
@@ -535,6 +614,20 @@ fn find_negotiated_audio_pt(sdp: &str, default_pt: u8) -> u8 {
         }
     }
     default_pt
+}
+
+fn is_audio_active(sdp: &str) -> bool {
+    for line in sdp.lines() {
+        let line = line.trim();
+        if let Some(r) = line.strip_prefix("m=audio ") {
+            if let Some((port_str, _)) = r.split_once(' ') {
+                if port_str != "0" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {

@@ -699,13 +699,17 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     let tracks = stream.get_tracks().await;
                     let mut has_h265 = false;
                     let mut has_aac = false;
+                    let mut has_audio = false;
                     for t in &tracks {
                         if t.kind == MediaKind::Video {
-                            if t.codec.name.contains("H265") || t.codec.name.contains("HEVC") {
+                            let name = t.codec.name.to_uppercase();
+                            if name.contains("265") || name.contains("HEVC") {
                                 has_h265 = true;
                             }
                         } else if t.kind == MediaKind::Audio {
-                            if t.codec.name.contains("AAC") || t.codec.name.contains("MP4A") {
+                            has_audio = true;
+                            let name = t.codec.name.to_uppercase();
+                            if name.contains("AAC") || name.contains("MP4A") || name.contains("MPEG4-GENERIC") {
                                 has_aac = true;
                             }
                         }
@@ -717,29 +721,33 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    let (mime, copy_video, copy_audio) = if has_h265 {
+                    let allow_audio = has_audio && client_codecs.contains("mp4a");
+                    let copy_audio = has_aac && allow_audio;
+                    let transcode_audio = !has_aac && allow_audio;
+
+                    let (mime, copy_video) = if has_h265 {
                         if client_codecs.contains("hvc1") {
-                            if has_aac && client_codecs.contains("mp4a") {
-                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\"", true, true)
+                            if allow_audio {
+                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\"", true)
                             } else {
-                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0\"", true, false)
+                                ("video/mp4; codecs=\"hvc1.1.6.L153.B0\"", true)
                             }
                         } else {
-                            if has_aac && client_codecs.contains("mp4a") {
-                                ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", false, true)
+                            if allow_audio {
+                                ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", false)
                             } else {
-                                ("video/mp4; codecs=\"avc1.640029\"", false, false)
+                                ("video/mp4; codecs=\"avc1.640029\"", false)
                             }
                         }
                     } else {
-                        if has_aac && client_codecs.contains("mp4a") {
-                            ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", true, true)
+                        if allow_audio {
+                            ("video/mp4; codecs=\"avc1.640029,mp4a.40.2\"", true)
                         } else {
-                            ("video/mp4; codecs=\"avc1.640029\"", true, false)
+                            ("video/mp4; codecs=\"avc1.640029\"", true)
                         }
                     };
 
-                    info!(stream = %src_name, mime = %mime, copy_video = copy_video, copy_audio = copy_audio, "Starting MSE fMP4 stream");
+                    info!(stream = %src_name, mime = %mime, copy_video = copy_video, copy_audio = copy_audio, transcode_audio = transcode_audio, "Starting MSE fMP4 stream");
 
                     let reply = WsMessage {
                         msg_type: "mse".to_string(),
@@ -777,6 +785,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
 
                         if copy_audio {
                             cmd.args(["-c:a", "copy"]);
+                        } else if transcode_audio {
+                            cmd.args(["-c:a", "aac", "-b:a", "64k", "-ar", "16000", "-ac", "1"]);
                         } else {
                             cmd.arg("-an");
                         }
