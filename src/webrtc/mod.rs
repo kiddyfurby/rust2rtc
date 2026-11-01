@@ -19,7 +19,6 @@ use rtc::rtp_transceiver::rtp_sender::{
 };
 use rtc::shared::marshal::Unmarshal;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 use tracing::debug;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
@@ -323,7 +322,7 @@ impl WebRtcManager {
             } else if track.kind == MediaKind::Audio && audio_track_info.is_none() {
                 let name = track.codec.name.to_uppercase();
                 let is_aac = name.contains("AAC") || name.contains("MP4A") || name.contains("MPEG4-GENERIC");
-                let (audio_codec, default_pt) = if name.contains("OPUS") {
+                let (audio_codec, default_pt) = if is_aac || name.contains("OPUS") {
                     (opus_codec.clone(), 111)
                 } else if name.contains("PCMU") {
                     (pcmu_codec.clone(), 0)
@@ -457,6 +456,21 @@ impl WebRtcManager {
                     let ffmpeg_bin = self.ffmpeg_bin.clone();
 
                     tokio::spawn(async move {
+                        let udp_sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to bind UDP socket for Opus transcode: {}", e);
+                                return;
+                            }
+                        };
+                        let local_port = match udp_sock.local_addr() {
+                            Ok(addr) => addr.port(),
+                            Err(e) => {
+                                tracing::error!("Failed to get local port: {}", e);
+                                return;
+                            }
+                        };
+
                         let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
                         cmd.kill_on_drop(true);
                         cmd.args([
@@ -467,54 +481,40 @@ impl WebRtcManager {
                             "-rtsp_transport", "tcp",
                             "-i", &rtsp_url,
                             "-vn",
-                            "-c:a", "pcm_alaw",
-                            "-ar", "8000",
-                            "-ac", "1",
-                            "-f", "alaw",
-                            "pipe:1",
+                            "-af", "aresample=async=1000:first_pts=0",
+                            "-c:a", "libopus",
+                            "-application", "lowdelay",
+                            "-ar", "48000",
+                            "-ac", "2",
+                            "-b:a", "48k",
+                            "-payload_type", "111",
+                            "-f", "rtp",
+                            &format!("rtp://127.0.0.1:{}", local_port),
                         ]);
-                        cmd.stdout(std::process::Stdio::piped());
+                        cmd.stdout(std::process::Stdio::null());
                         cmd.stderr(std::process::Stdio::null());
 
                         let mut child = match cmd.spawn() {
                             Ok(c) => c,
                             Err(e) => {
-                                tracing::error!("Failed to spawn FFmpeg audio transcoder for WebRTC {}: {}", rtsp_url, e);
+                                tracing::error!("Failed to spawn FFmpeg Opus transcoder for WebRTC {}: {}", rtsp_url, e);
                                 return;
                             }
                         };
 
-                        if let Some(mut stdout) = child.stdout.take() {
-                            let mut buf = [0u8; 160];
-                            let mut seq: u16 = 0;
-                            let mut ts: u32 = 0;
+                        let mut buf = [0u8; 2048];
+                        while let Ok((n, _)) = udp_sock.recv_from(&mut buf).await {
+                            let mut bytes = BytesMut::from(&buf[..n]);
+                            if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
+                                rtp_pkt.header.ssrc = audio_ssrc;
+                                rtp_pkt.header.payload_type = actual_audio_pt;
 
-                            loop {
-                                match stdout.read_exact(&mut buf).await {
-                                    Ok(_) => {
-                                        let rtp_pkt = rtp::packet::Packet {
-                                            header: rtp::header::Header {
-                                                version: 2,
-                                                payload_type: actual_audio_pt,
-                                                sequence_number: seq,
-                                                timestamp: ts,
-                                                ssrc: audio_ssrc,
-                                                marker: false,
-                                                ..Default::default()
-                                            },
-                                            payload: Bytes::copy_from_slice(&buf),
-                                        };
-                                        seq = seq.wrapping_add(1);
-                                        ts = ts.wrapping_add(160);
-
-                                        if atrack.write_rtp(rtp_pkt).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
+                                if atrack.write_rtp(rtp_pkt).await.is_err() {
+                                    break;
                                 }
                             }
                         }
+
                         let _ = child.kill().await;
                     });
                 } else {
