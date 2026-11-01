@@ -3,6 +3,7 @@
 pub mod client;
 pub mod ha;
 pub mod message;
+pub mod rfc2435;
 pub mod session;
 
 use anyhow::Result;

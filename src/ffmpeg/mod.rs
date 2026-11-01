@@ -247,6 +247,30 @@ impl FfmpegManager {
         Ok(child)
     }
 
+    /// Spawns an external FFmpeg child process with piped stdout for streaming transcoded media
+    pub fn spawn_stdout_process(&self, args: &[String]) -> Result<Child> {
+        info!(bin = %self.bin, args = ?args, "Spawning FFmpeg stdout transcode process");
+        let mut child = Command::new(&self.bin)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("Failed to spawn {}", self.bin))?;
+
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    debug!(target: "ffmpeg_stdout", "{}", line);
+                }
+            });
+        }
+
+        Ok(child)
+    }
+
     /// Generate a snapshot JPEG image for a given input source
     pub async fn take_snapshot(&self, source: &str, rtsp_port: u16, is_hevc: bool) -> Result<Bytes> {
         let resolved = resolve_source(source, rtsp_port);
