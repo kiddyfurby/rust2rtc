@@ -424,13 +424,18 @@ impl WebRtcManager {
                 let mut seq: u16 = 0;
                 let mut sent_first_keyframe = false;
                 let mut last_was_param_set = false;
+                let mut last_keyframe_ts: Option<u32> = None;
 
                 loop {
                     let packet = tokio::select! {
                         _ = close_rx.recv() => break,
                         res = rx.recv() => match res {
                             Ok(pkt) => pkt,
-                            Err(_) => break,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("WebRTC video receiver lagged by {} packets", n);
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     };
                     let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
@@ -447,30 +452,36 @@ impl WebRtcManager {
                     }
 
                     if !sent_first_keyframe {
-                        // Do not drop parameter sets or keyframes
-                        if !is_keyframe && !is_param_set {
+                        // Wait until an actual IDR keyframe arrives before forwarding frames
+                        if is_param_set {
+                            continue;
+                        }
+                        if !is_keyframe {
                             continue;
                         }
                         sent_first_keyframe = true;
                     }
 
                     // Before keyframes, inject the parameter sets packet (STAP-A / AP) if not immediately preceded by parameter sets
-                    if is_keyframe && !last_was_param_set {
-                        if let Some(ref ps_bytes) = param_set_payload {
-                            let ps_rtp = rtp::packet::Packet {
-                                header: rtp::header::Header {
-                                    version: 2,
-                                    payload_type: actual_pt,
-                                    sequence_number: seq,
-                                    timestamp: packet.timestamp,
-                                    ssrc: video_ssrc,
-                                    marker: false,
-                                    ..Default::default()
-                                },
-                                payload: Bytes::copy_from_slice(ps_bytes),
-                            };
-                            seq = seq.wrapping_add(1);
-                            let _ = vtrack.write_rtp(ps_rtp).await;
+                    if is_keyframe && last_keyframe_ts != Some(packet.timestamp) {
+                        last_keyframe_ts = Some(packet.timestamp);
+                        if !last_was_param_set {
+                            if let Some(ref ps_bytes) = param_set_payload {
+                                let ps_rtp = rtp::packet::Packet {
+                                    header: rtp::header::Header {
+                                        version: 2,
+                                        payload_type: actual_pt,
+                                        sequence_number: seq,
+                                        timestamp: packet.timestamp,
+                                        ssrc: video_ssrc,
+                                        marker: false,
+                                        ..Default::default()
+                                    },
+                                    payload: Bytes::copy_from_slice(ps_bytes),
+                                };
+                                seq = seq.wrapping_add(1);
+                                let _ = vtrack.write_rtp(ps_rtp).await;
+                            }
                         }
                     }
 
@@ -528,7 +539,6 @@ impl WebRtcManager {
                             "-rtsp_transport", "tcp",
                             "-i", &rtsp_url,
                             "-vn",
-                            "-af", "aresample=async=1000:first_pts=0",
                             "-c:a", "libopus",
                             "-application", "lowdelay",
                             "-ar", "48000",
@@ -581,7 +591,11 @@ impl WebRtcManager {
                                 _ = close_rx.recv() => break,
                                 res = rx.recv() => match res {
                                     Ok(pkt) => pkt,
-                                    Err(_) => break,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!("WebRTC audio receiver lagged by {} packets", n);
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
                             };
 
