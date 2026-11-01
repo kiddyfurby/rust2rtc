@@ -22,6 +22,7 @@ pub struct AudioTranscoder {
     out_seq: u16,
     out_ts: u32,
     out_ssrc: u32,
+    last_source_ts: Option<u32>,
 }
 
 impl AudioTranscoder {
@@ -84,6 +85,7 @@ impl AudioTranscoder {
             out_seq: 0,
             out_ts: 0,
             out_ssrc,
+            last_source_ts: None,
         })
     }
 
@@ -92,6 +94,24 @@ impl AudioTranscoder {
         let payload = packet.payload();
         if payload.is_empty() {
             return Vec::new();
+        }
+
+        // Synchronize Opus RTP timestamp with camera's audio clock
+        let packet_ts_48k = if self.source_rate > 0 {
+            (packet.timestamp as u64 * 48000 / self.source_rate as u64) as u32
+        } else {
+            self.out_ts
+        };
+
+        if self.last_source_ts.is_none() {
+            self.out_ts = packet_ts_48k;
+            self.last_source_ts = Some(packet.timestamp);
+        } else {
+            // Re-sync if camera clock drifts or jumps significantly (> 1 second = 48000 ticks)
+            let diff = packet_ts_48k.wrapping_sub(self.out_ts);
+            if diff > 48000 && diff < (u32::MAX - 48000) {
+                self.out_ts = packet_ts_48k;
+            }
         }
 
         let pcm_floats = if let Some(decoder) = &mut self.aac_decoder {
