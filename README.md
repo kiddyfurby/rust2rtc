@@ -26,6 +26,17 @@
 - **📸 High-Speed Snapshots**:
   - Instant JPEG frame capture via `/api/frame.jpeg?src=<stream>` for both H.264 and H.265 (HEVC) streams.
   - Optimized pipeline with low-delay decoding and track readiness polling.
+- **📞 SIP Gateway & Intercom Integration**:
+  - Asynchronous SIP protocol engine supporting standard Digest MD5 authentication, auto-registration, Keep-Alive `OPTIONS` pings, and graceful unregistration (`REGISTER Expires: 0`) on shutdown.
+  - Inbound call handling with symmetric RTP and Call-ID response routing.
+  - Auto-configuration of Home Assistant SIP integration via REST API with dynamic account provisioning.
+- **🔊 Two-Way Audio (Backchannel)**:
+  - Full-duplex backchannel for Reolink and ONVIF-compatible smart doorbells and intercom cameras (`backchannel=1`).
+  - High-fidelity PCM / G.711a (PCMA) / G.711u (PCMU) transcoding and repacking into standard 20ms audio frames (160 samples @ 8kHz).
+- **📺 Video over SIP (H.264 & RFC 2435 JPEG RTP)**:
+  - **H.264 Video Relay**: SSRC normalization, dynamic payload type rewriting, and SPS/PPS parameter set injection for SIP video phones.
+  - **RFC 2435 JPEG RTP Streaming**: Hardware-friendly MJPEG RTP streaming for low-power smart panels and intercom screens (e.g. Waveshare ESP32-P4 Touch panels, Grandstream, Akuvox).
+  - Real-time 15 fps frame pacing and backlog-dropping pipeline to ensure zero lag and prevent socket buffer bloat.
 - **🖥️ Built-in Web Dashboard**:
   - Web UI on port `:1984` featuring auto-refreshing snapshot tiles, stream statistics (packets, bytes, active consumers), and instant WebRTC live preview.
 
@@ -60,6 +71,10 @@ The following features have been implemented and verified in live testing:
 | **RTSP TCP Relay** | RTSP Interleaved TCP (`:8554`) | macOS (Darwin) | FFmpeg / RTSP Clients | ✅ **Verified** – Interleaved channel demuxing & broadcast |
 | **Multi-Source (`multitrans`)**| `multitrans://` & fallback lists | macOS (Darwin) | Internal Engine | ✅ **Verified** – Source fallback and candidate selection |
 | **FFmpeg On-Demand** | `ffmpeg:stream#params` | macOS (Darwin) | External FFmpeg | ✅ **Verified** – Audio transcoding to Opus, video filtering, scaling |
+| **SIP Audio & Backchannel** | SIP / G.711a / G.711u | macOS (Darwin) | Home Assistant / FreePBX | ✅ **Verified** – Symmetric RTP, 20ms audio repacking & Reolink backchannel |
+| **SIP Video (H.264)** | SIP / RFC 6184 H.264 RTP | macOS (Darwin) | SIP Video Phone / Softphone | ✅ **Verified** – Live video forwarder with dynamic PT & SSRC normalization |
+| **SIP Video (RFC 2435 JPEG)**| SIP / RFC 2435 JPEG RTP | macOS (Darwin) | Waveshare ESP32-P4 Touch Panel | ✅ **Verified** – Hardware-decoded MJPEG with 15fps pacing & backlog drop |
+| **SIP Registration & Exit** | SIP Digest MD5 | macOS (Darwin) | Asterisk / FreePBX | ✅ **Verified** – Auto-registration, keep-alive OPTIONS, graceful unregister |
 | **Web Dashboard** | HTTP / HTML5 / JS (`:1984`) | macOS (Darwin) | Google Chrome (macOS) | ✅ **Verified** – Live stream cards, bitrates, snapshot previews |
 
 ---
@@ -72,11 +87,12 @@ The following features have been implemented and verified in live testing:
 | **WebRTC Gateway (WHEP)** | ✅ | ✅ | Working (H.264 & H.265) |
 | **External FFmpeg Remux / Transcode** | ✅ | ✅ | Working |
 | **JPEG Snapshots API** | ✅ | ✅ | Working (H.264 & H.265) |
+| **SIP Gateway & Intercom** | ⚠️ | ✅ | Working (Audio, H.264 & RFC 2435 JPEG) |
+| **Two-Way Audio (Backchannel)** | ✅ | ✅ | Working (Reolink & SIP G.711) |
 | **Web UI Dashboard** | ✅ | ✅ | Working |
 | **RTSP UDP / Multicast** | ✅ | 🚧 | Planned |
 | **HLS / fMP4 Streaming** | ✅ | 🚧 | In progress |
 | **HomeKit Integration** | ✅ | ⏳ | Planned |
-| **Two-Way Audio (Backchannel)** | ✅ | ⏳ | Planned |
 | **Native ONVIF Discovery** | ✅ | ⏳ | Planned |
 
 ---
@@ -137,6 +153,23 @@ rtsp:
 
 ffmpeg:
   bin: "ffmpeg"
+
+sip:
+  server: "198.51.100.1:5060"
+  domain: "198.51.100.1"
+  # Optional Home Assistant auto-provisioning
+  ha_url: "http://198.51.100.1:8123"
+  ha_token: "YOUR_HA_LONG_LIVED_ACCESS_TOKEN"
+  auto_register_streams: true
+  base_extension: 101
+  auto_password: "YourSecurePasswordHere"
+  accounts:
+    doorbell:
+      extension: "101"
+      auth_user: "camera_doorbell"
+      password: "YourSecurePasswordHere"
+      display_name: "Front Doorbell"
+      auto_answer: true
 ```
 
 ---
