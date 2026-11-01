@@ -537,7 +537,7 @@ fn find_negotiated_audio_pt(sdp: &str, default_pt: u8) -> u8 {
     default_pt
 }
 
-fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
+pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
     if payload.is_empty() {
         return (false, false);
     }
