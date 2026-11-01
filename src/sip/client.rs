@@ -6,6 +6,7 @@ use super::message::{
     parse_sdp_media, SipMessage, SipMethod,
 };
 use super::session::SipCallSession;
+use crate::core::MediaKind;
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::Stream;
 use anyhow::{bail, Context, Result};
@@ -464,6 +465,9 @@ impl SipCameraAccount {
             Some(SipMethod::Bye) => self.handle_bye(msg, peer_addr).await,
             Some(SipMethod::Cancel) => self.handle_cancel(msg, peer_addr).await,
             Some(SipMethod::Options) => self.handle_options(msg, peer_addr).await,
+            Some(SipMethod::Other(ref m)) if m.eq_ignore_ascii_case("INFO") => {
+                self.handle_info(msg, peer_addr).await
+            }
             _ => {
                 debug!("Unhandled SIP method: {:?}", msg.method);
                 Ok(())
@@ -498,6 +502,16 @@ impl SipCameraAccount {
             .clone()
             .unwrap_or_else(|| peer_ip.clone());
 
+        info!(
+            call_id = %call_id,
+            peer = %peer_addr,
+            sdp_ip = %sdp_ip,
+            audio_port = ?media_info.audio_port,
+            video_port = ?media_info.video_port,
+            "Parsed caller SDP media"
+        );
+        debug!(call_id = %call_id, raw_sdp = %req.body, "Full incoming SDP");
+
         let audio_port = match media_info.audio_port {
             Some(port) => port,
             None => bail!("Caller SDP did not specify audio port"),
@@ -511,9 +525,22 @@ impl SipCameraAccount {
             None
         };
 
-        let remote_video_addr = media_info
-            .video_port
-            .and_then(|p| format!("{}:{}", peer_ip, p).parse::<SocketAddr>().ok());
+        let negotiated_video_pt = media_info.preferred_h264_pt();
+        let remote_video_addr = media_info.video_port.and_then(|p| {
+            let ip = if sdp_ip != "0.0.0.0" && !sdp_ip.is_empty() {
+                &sdp_ip
+            } else {
+                &peer_ip
+            };
+            format!("{}:{}", ip, p).parse::<SocketAddr>().ok()
+        });
+        let alt_video_addr = media_info.video_port.and_then(|p| {
+            if sdp_ip != peer_ip && !peer_ip.is_empty() {
+                format!("{}:{}", peer_ip, p).parse::<SocketAddr>().ok()
+            } else {
+                None
+            }
+        });
 
         // 4. Start media bridge session
         let session = SipCallSession::start(
@@ -526,6 +553,8 @@ impl SipCameraAccount {
             alt_audio_addr,
             negotiated_audio_pt,
             remote_video_addr,
+            alt_video_addr,
+            negotiated_video_pt,
         )
         .await?;
 
@@ -536,12 +565,29 @@ impl SipCameraAccount {
         let mut active = self.active_call.lock().await;
         *active = Some(session);
 
+        // Extract sprop-parameter-sets from video track if available
+        let mut sprop = None;
+        let tracks = self.stream.get_tracks().await;
+        if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
+            if let Some(ref fmtp) = vt.codec.fmtp {
+                if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
+                    let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
+                    let val = after.split(';').next().unwrap_or("").trim();
+                    if !val.is_empty() {
+                        sprop = Some(val.to_string());
+                    }
+                }
+            }
+        }
+
         // 5. Send 200 OK with Answer SDP
         let answer_sdp = build_sdp(
             &self.config.local_ip,
             local_audio_port,
             negotiated_audio_pt,
             local_video_port,
+            negotiated_video_pt,
+            sprop.as_deref(),
         );
         let local_port = self.socket.local_addr()?.port();
         let contact_user = if !self.config.auth_user.is_empty() {
@@ -597,6 +643,15 @@ impl SipCameraAccount {
         Ok(())
     }
 
+    /// Handle INFO (e.g. Picture Fast Update / keyframe request)
+    async fn handle_info(&self, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+        let call_id = req.get_header("call-id").unwrap_or("unknown");
+        info!(call_id = %call_id, body = %req.body, "Received SIP INFO request - replying 200 OK");
+        let ok_resp = self.create_reply(&req, 200, "OK");
+        self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
+        Ok(())
+    }
+
     /// Trigger an outbound call to an extension or ring group (e.g. Doorbell button pressed)
     pub async fn trigger_outbound_call(&self, target_extension: &str) -> Result<()> {
         let server_addr: SocketAddr = tokio::net::lookup_host(&self.config.server)
@@ -615,7 +670,7 @@ impl SipCameraAccount {
 
         // Temporary audio port for offer
         let dummy_audio_port = 20000;
-        let offer_sdp = build_sdp(&self.config.local_ip, dummy_audio_port, 0, None);
+        let offer_sdp = build_sdp(&self.config.local_ip, dummy_audio_port, 0, None, 96, None);
 
         let mut invite = SipMessage::new_request(SipMethod::Invite, &to_uri);
         invite.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch));

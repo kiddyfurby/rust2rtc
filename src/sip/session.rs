@@ -39,6 +39,8 @@ impl SipCallSession {
         alt_audio_addr: Option<SocketAddr>,
         negotiated_audio_pt: u8,
         remote_video_addr: Option<SocketAddr>,
+        alt_video_addr: Option<SocketAddr>,
+        negotiated_video_pt: u8,
     ) -> Result<Self> {
         // Bind local UDP socket on 0.0.0.0 so kernel routes across any interface/VLAN
         let audio_socket = UdpSocket::bind("0.0.0.0:0")
@@ -54,6 +56,9 @@ impl SipCallSession {
             remote_audio = %remote_audio_addr,
             alt_audio = ?alt_audio_addr,
             audio_pt = negotiated_audio_pt,
+            remote_video = ?remote_video_addr,
+            alt_video = ?alt_video_addr,
+            video_pt = negotiated_video_pt,
             "Starting SIP call media bridge"
         );
 
@@ -224,7 +229,49 @@ impl SipCallSession {
             local_video_port = Some(v_port);
             let video_socket = Arc::new(video_socket);
 
+            info!(
+                call_id = %call_id,
+                stream = %stream.name,
+                local_video_port = v_port,
+                remote_video = %remote_video,
+                alt_video = ?alt_video_addr,
+                video_pt = negotiated_video_pt,
+                "Initializing SIP video forwarder"
+            );
+
             let stream_video = Arc::clone(&stream);
+            let call_id_video = call_id.clone();
+            let video_targets = Arc::new(Mutex::new((remote_video, alt_video_addr)));
+            let tx_v_targets = Arc::clone(&video_targets);
+            let rx_v_targets = Arc::clone(&video_targets);
+
+            // Listen for peer RTCP / video packets on video_socket to lock symmetric RTP
+            let rx_video_sock = Arc::clone(&video_socket);
+            let call_id_vrx = call_id.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let mut locked_symmetric = false;
+                loop {
+                    match rx_video_sock.recv_from(&mut buf).await {
+                        Ok((_, src_addr)) => {
+                            if !locked_symmetric {
+                                let mut t = rx_v_targets.lock().await;
+                                if t.0 != src_addr || t.1.is_some() {
+                                    info!(
+                                        call_id = %call_id_vrx,
+                                        peer_video_rtp = %src_addr,
+                                        "Symmetric RTP locked onto peer video address"
+                                    );
+                                    *t = (src_addr, None);
+                                }
+                                locked_symmetric = true;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }));
+
             tasks.push(tokio::spawn(async move {
                 let mut video_track = None;
                 for _ in 0..80 {
@@ -236,15 +283,135 @@ impl SipCallSession {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 if let Some(video_track) = video_track {
+                    info!(
+                        call_id = %call_id_video,
+                        stream = %stream_video.name,
+                        codec = %video_track.codec.name,
+                        source_pt = video_track.codec.payload_type,
+                        negotiated_pt = negotiated_video_pt,
+                        remote_video = %remote_video,
+                        "Attached camera video track (H.264) to SIP call - streaming RTP"
+                    );
+
+                    let mut param_set_payload = video_track
+                        .codec
+                        .fmtp
+                        .as_ref()
+                        .and_then(|f| crate::webrtc::extract_h264_sps_pps(f))
+                        .map(|(sps, pps)| crate::webrtc::build_h264_stap_a(&sps, &pps));
+
                     let mut sub = video_track.subscribe();
-                    while let Ok(packet) = sub.recv().await {
-                        if let Err(e) = video_socket.send_to(&packet.raw, remote_video).await {
+                    let mut pkt_count = 0u64;
+                    let out_ssrc = 0x52544302u32;
+                    let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
+                    let mut sent_first_keyframe = false;
+                    let mut last_was_param_set = false;
+
+                    loop {
+                        let packet = match sub.recv().await {
+                            Ok(p) => p,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                debug!("Video forwarder lagged by {} packets - resuming", n);
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
+                        };
+
+                        let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
+                            &packet.raw[packet.payload_offset..packet.payload_offset + packet.payload_len]
+                        } else {
+                            continue;
+                        };
+
+                        let (is_keyframe, is_param_set) = crate::webrtc::is_keyframe_or_param_set(false, payload_slice);
+
+                        // Dynamically cache STAP-A parameter sets if seen in stream
+                        if is_param_set && !payload_slice.is_empty() && (payload_slice[0] & 0x1F) == 24 {
+                            param_set_payload = Some(payload_slice.to_vec());
+                        }
+
+                        // Do not forward P-frames before we have sent the initial keyframe / SPS/PPS
+                        if !sent_first_keyframe {
+                            if !is_keyframe && !is_param_set {
+                                continue;
+                            }
+                            sent_first_keyframe = true;
+                        }
+
+                        // Before keyframes, inject the parameter sets packet (STAP-A) if not immediately preceded by parameter sets
+                        if is_keyframe && !last_was_param_set {
+                            if let Some(ref ps_bytes) = param_set_payload {
+                                let mut stap_rtp = Vec::with_capacity(12 + ps_bytes.len());
+                                stap_rtp.push(0x80); // V=2
+                                stap_rtp.push(negotiated_video_pt & 0x7F); // M=0 (parameter sets packet)
+                                stap_rtp.extend_from_slice(&out_seq.to_be_bytes());
+                                out_seq = out_seq.wrapping_add(1);
+                                stap_rtp.extend_from_slice(&packet.timestamp.to_be_bytes());
+                                stap_rtp.extend_from_slice(&out_ssrc.to_be_bytes());
+                                stap_rtp.extend_from_slice(ps_bytes);
+
+                                let (primary, alt) = *tx_v_targets.lock().await;
+                                let _ = video_socket.send_to(&stap_rtp, primary).await;
+                                if let Some(alt_addr) = alt {
+                                    if alt_addr != primary {
+                                        let _ = video_socket.send_to(&stap_rtp, alt_addr).await;
+                                    }
+                                }
+                                pkt_count += 1;
+                                info!(call_id = %call_id_video, "Injected H.264 SPS/PPS STAP-A packet before keyframe into SIP video stream");
+                            }
+                        }
+
+                        last_was_param_set = is_param_set;
+
+                        let mut raw = packet.raw.to_vec();
+                        if raw.len() >= 12 {
+                            if negotiated_video_pt != 0 {
+                                raw[1] = (raw[1] & 0x80) | (negotiated_video_pt & 0x7F);
+                            }
+                            // Strictly monotonic sequence numbers
+                            raw[2..4].copy_from_slice(&out_seq.to_be_bytes());
+                            out_seq = out_seq.wrapping_add(1);
+                            // Strictly consistent SSRC matching STAP-A
+                            raw[8..12].copy_from_slice(&out_ssrc.to_be_bytes());
+                        }
+
+                        let (primary, alt) = *tx_v_targets.lock().await;
+                        if let Err(e) = video_socket.send_to(&raw, primary).await {
                             debug!("Error forwarding video to SIP peer: {}", e);
                             break;
                         }
+                        if let Some(alt_addr) = alt {
+                            if alt_addr != primary {
+                                let _ = video_socket.send_to(&raw, alt_addr).await;
+                            }
+                        }
+                        pkt_count += 1;
+                        if pkt_count == 1 || pkt_count % 300 == 0 {
+                            info!(
+                                call_id = %call_id_video,
+                                packets_sent = pkt_count,
+                                target = %primary,
+                                "Actively streaming video RTP to SIP peer"
+                            );
+                        }
                     }
+                } else {
+                    warn!(
+                        call_id = %call_id_video,
+                        stream = %stream_video.name,
+                        "No video track found on stream after 8s for SIP call"
+                    );
                 }
             }));
+        } else {
+            info!(
+                call_id = %call_id,
+                stream = %stream.name,
+                "No remote video port negotiated - audio-only SIP call"
+            );
         }
 
         Ok(Self {
