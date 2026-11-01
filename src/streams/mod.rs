@@ -25,7 +25,7 @@ pub struct Stream {
     pub bytes_recv: AtomicU64,
     pub packets_recv: AtomicU64,
     pub backchannel: Mutex<Option<Arc<crate::backchannel::BackchannelSession>>>,
-    pub opus_track: Mutex<Option<Arc<Track>>>,
+    pub opus_track: Arc<Mutex<Option<Arc<Track>>>>,
 }
 
 impl Stream {
@@ -38,7 +38,7 @@ impl Stream {
             bytes_recv: AtomicU64::new(0),
             packets_recv: AtomicU64::new(0),
             backchannel: Mutex::new(None),
-            opus_track: Mutex::new(None),
+            opus_track: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -122,12 +122,15 @@ impl Stream {
         // 5. Spawn background in-process audio transcode worker
         let stream_name = self.name.clone();
         let track_for_worker = Arc::clone(&opus_track);
+        let opus_track_slot = Arc::clone(&self.opus_track);
         tokio::spawn(async move {
             info!(stream = %stream_name, codec = %source_audio_track.codec.name, "Starting shared in-process Opus audio transcode worker");
             let mut transcoder = match crate::audio::AudioTranscoder::new(&source_audio_track.codec) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(stream = %stream_name, "Failed to initialize AudioTranscoder: {}", e);
+                    let mut guard = opus_track_slot.lock().await;
+                    *guard = None;
                     return;
                 }
             };
@@ -136,11 +139,11 @@ impl Stream {
             let mut idle_ticks = 0;
 
             loop {
-                // If no viewers are listening to this Opus track for ~10 seconds, shut down worker to save resources
+                // If no viewers are listening to this Opus track for ~60 seconds, shut down worker to save resources
                 if track_for_worker.consumer_count() == 0 {
                     idle_ticks += 1;
-                    if idle_ticks > 500 { // ~10 seconds with 20ms audio packets
-                        info!(stream = %stream_name, "No active consumers on shared Opus track, terminating transcode worker");
+                    if idle_ticks > 3000 { // ~60 seconds with 20ms audio packets
+                        info!(stream = %stream_name, "No active consumers on shared Opus track after 60s, terminating transcode worker");
                         break;
                     }
                 } else {
@@ -163,6 +166,11 @@ impl Stream {
                     }
                 }
             }
+
+            // Always reset the slot so subsequent connections restart a fresh worker
+            let mut guard = opus_track_slot.lock().await;
+            *guard = None;
+            info!(stream = %stream_name, "Shared Opus audio transcode worker terminated and slot cleared");
         });
 
         Some(opus_track)
