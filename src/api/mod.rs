@@ -749,10 +749,14 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     };
 
                     let video_track = stream.get_tracks().await.into_iter().find(|t| t.kind == crate::core::MediaKind::Video);
-                    let use_native_fmp4 = copy_video && !has_h265 && video_track.is_some();
+                    let use_native_fmp4 = copy_video && video_track.is_some();
 
                     let mime = if use_native_fmp4 {
-                        "video/mp4; codecs=\"avc1.640029\""
+                        if has_h265 {
+                            "video/mp4; codecs=\"hvc1.1.6.L153.B0\""
+                        } else {
+                            "video/mp4; codecs=\"avc1.640029\""
+                        }
                     } else if has_h265 {
                         if client_codecs.contains("hvc1") {
                             if allow_audio {
@@ -795,66 +799,121 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     if use_native_fmp4 {
                         // Pure-Rust in-process fMP4 multiplexer (Zero FFmpeg subprocess)
                         let vtrack = video_track.unwrap();
-                        info!(stream = %stream_name, "Starting pure-Rust in-process MSE fMP4 stream (no FFmpeg)");
+                        info!(stream = %stream_name, is_hevc = has_h265, "Starting pure-Rust in-process MSE fMP4 stream (no FFmpeg)");
 
                         mse_handle = Some(tokio::spawn(async move {
                             let mut rx = vtrack.subscribe();
-                            let mut depacketizer = crate::mp4::H264RtpDepacketizer::new();
                             let mut sent_init = false;
                             let mut seq = 1u32;
                             let mut base_pts = 0u64;
                             let mut last_rtp_ts: Option<u32> = None;
 
-                            // Pre-load SPS / PPS from track SDP fmtp if available
-                            if let Some(ref fmtp) = vtrack.codec.fmtp {
-                                if let Some((sps, pps)) = crate::webrtc::extract_h264_sps_pps(fmtp) {
-                                    depacketizer.sps = Some(sps);
-                                    depacketizer.pps = Some(pps);
+                            if has_h265 {
+                                let mut depacketizer = crate::mp4::H265RtpDepacketizer::new();
+                                if let Some(ref fmtp) = vtrack.codec.fmtp {
+                                    if let Some((vps, sps, pps)) = crate::webrtc::extract_h265_vps_sps_pps(fmtp) {
+                                        depacketizer.vps = Some(vps);
+                                        depacketizer.sps = Some(sps);
+                                        depacketizer.pps = Some(pps);
+                                    }
                                 }
-                            }
 
-                            loop {
-                                let packet = match rx.recv().await {
-                                    Ok(p) => p,
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged");
-                                        continue;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                };
-
-                                if let Some((is_keyframe, rtp_ts, nalus)) = depacketizer.feed_packet(&packet) {
-                                    if !sent_init {
-                                        // Gate initial playback on a keyframe
-                                        if !is_keyframe {
+                                loop {
+                                    let packet = match rx.recv().await {
+                                        Ok(p) => p,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE H.265 receiver lagged");
                                             continue;
                                         }
-
-                                        if let (Some(sps), Some(pps)) = (&depacketizer.sps, &depacketizer.pps) {
-                                            let (w, h) = crate::mp4::parse_h264_sps_dimensions(sps);
-                                            let init_seg = crate::mp4::make_h264_init_segment(sps, pps, w, h);
-                                            if tx_mse.send(Message::Binary(init_seg.into())).await.is_err() {
-                                                break;
-                                            }
-                                            sent_init = true;
-                                        } else {
-                                            continue;
-                                        }
-                                    }
-
-                                    let duration = if let Some(last) = last_rtp_ts {
-                                        rtp_ts.wrapping_sub(last).max(1000).min(90000)
-                                    } else {
-                                        3000
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     };
-                                    last_rtp_ts = Some(rtp_ts);
 
-                                    let media_seg = crate::mp4::make_h264_media_segment(seq, base_pts, duration, is_keyframe, &nalus);
-                                    seq = seq.wrapping_add(1);
-                                    base_pts += duration as u64;
+                                    if let Some((is_keyframe, rtp_ts, nalus)) = depacketizer.feed_packet(&packet) {
+                                        if !sent_init {
+                                            if !is_keyframe {
+                                                continue;
+                                            }
+                                            if let (Some(vps), Some(sps), Some(pps)) = (&depacketizer.vps, &depacketizer.sps, &depacketizer.pps) {
+                                                let init_seg = crate::mp4::make_h265_init_segment(vps, sps, pps, 2560, 1440);
+                                                if tx_mse.send(Message::Binary(init_seg.into())).await.is_err() {
+                                                    break;
+                                                }
+                                                sent_init = true;
+                                            } else {
+                                                continue;
+                                            }
+                                        }
 
-                                    if tx_mse.send(Message::Binary(media_seg.into())).await.is_err() {
-                                        break;
+                                        let duration = if let Some(last) = last_rtp_ts {
+                                            rtp_ts.wrapping_sub(last).max(1000).min(90000)
+                                        } else {
+                                            3000
+                                        };
+                                        last_rtp_ts = Some(rtp_ts);
+
+                                        let media_seg = crate::mp4::make_h264_media_segment(seq, base_pts, duration, is_keyframe, &nalus);
+                                        seq = seq.wrapping_add(1);
+                                        base_pts += duration as u64;
+
+                                        if tx_mse.send(Message::Binary(media_seg.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let mut depacketizer = crate::mp4::H264RtpDepacketizer::new();
+
+                                // Pre-load SPS / PPS from track SDP fmtp if available
+                                if let Some(ref fmtp) = vtrack.codec.fmtp {
+                                    if let Some((sps, pps)) = crate::webrtc::extract_h264_sps_pps(fmtp) {
+                                        depacketizer.sps = Some(sps);
+                                        depacketizer.pps = Some(pps);
+                                    }
+                                }
+
+                                loop {
+                                    let packet = match rx.recv().await {
+                                        Ok(p) => p,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged");
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                    };
+
+                                    if let Some((is_keyframe, rtp_ts, nalus)) = depacketizer.feed_packet(&packet) {
+                                        if !sent_init {
+                                            // Gate initial playback on a keyframe
+                                            if !is_keyframe {
+                                                continue;
+                                            }
+
+                                            if let (Some(sps), Some(pps)) = (&depacketizer.sps, &depacketizer.pps) {
+                                                let (w, h) = crate::mp4::parse_h264_sps_dimensions(sps);
+                                                let init_seg = crate::mp4::make_h264_init_segment(sps, pps, w, h);
+                                                if tx_mse.send(Message::Binary(init_seg.into())).await.is_err() {
+                                                    break;
+                                                }
+                                                sent_init = true;
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+
+                                        let duration = if let Some(last) = last_rtp_ts {
+                                            rtp_ts.wrapping_sub(last).max(1000).min(90000)
+                                        } else {
+                                            3000
+                                        };
+                                        last_rtp_ts = Some(rtp_ts);
+
+                                        let media_seg = crate::mp4::make_h264_media_segment(seq, base_pts, duration, is_keyframe, &nalus);
+                                        seq = seq.wrapping_add(1);
+                                        base_pts += duration as u64;
+
+                                        if tx_mse.send(Message::Binary(media_seg.into())).await.is_err() {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -940,9 +999,11 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
         }
     }
 
-    if let Some(pc) = active_pc {
-        let _ = pc.close().await;
-    }
+    // Note: Do NOT close `active_pc` when the WebSocket closes!
+    // In go2rtc's `video-rtc.js` (`onpcvideo`), once WebRTC connects and decodes its first
+    // video frame, the client switches playback to WebRTC and intentionally calls `this.ws.close()`
+    // to stop the redundant MSE stream while keeping the WebRTC PeerConnection alive over UDP.
+    let _ = active_pc;
     if let Some(h) = mse_handle {
         h.abort();
     }

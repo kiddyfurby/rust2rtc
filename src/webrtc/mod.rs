@@ -82,6 +82,23 @@ impl WebRtcManager {
         stream: Arc<Stream>,
         offer_sdp: &str,
     ) -> Result<(String, Arc<dyn PeerConnection>)> {
+        let tracks = stream.get_tracks().await;
+        let is_stream_hevc = tracks.iter().any(|t| {
+            t.kind == MediaKind::Video
+                && (t.codec.name.to_uppercase().contains("265")
+                    || t.codec.name.to_uppercase().contains("HEVC"))
+        });
+
+        let offer_upper = offer_sdp.to_uppercase();
+        let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
+
+        if is_stream_hevc && !offer_has_hevc {
+            anyhow::bail!(
+                "Camera stream is H.265 (HEVC), but this browser does not support WebRTC H.265. Please view the H.264 sub-stream ({}_sub) or use a browser with HEVC WebRTC enabled (e.g. Safari).",
+                stream.name
+            );
+        }
+
         let mut media_engine = MediaEngine::default();
 
         let video_feedback = vec![
@@ -112,15 +129,6 @@ impl WebRtcManager {
             rtcp_feedback: video_feedback.clone(),
         };
 
-        media_engine.register_codec(
-            rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
-                rtp_codec: h264_high.clone(),
-                payload_type: 98,
-                ..Default::default()
-            },
-            RtpCodecKind::Video,
-        )?;
-
         let h264_cb = RTCRtpCodec {
             mime_type: MIME_TYPE_H264.to_owned(),
             clock_rate: 90000,
@@ -129,15 +137,6 @@ impl WebRtcManager {
                 "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_owned(),
             rtcp_feedback: video_feedback.clone(),
         };
-
-        media_engine.register_codec(
-            rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
-                rtp_codec: h264_cb.clone(),
-                payload_type: 96,
-                ..Default::default()
-            },
-            RtpCodecKind::Video,
-        )?;
 
         let h264_b = RTCRtpCodec {
             mime_type: MIME_TYPE_H264.to_owned(),
@@ -148,31 +147,65 @@ impl WebRtcManager {
             rtcp_feedback: video_feedback.clone(),
         };
 
-        media_engine.register_codec(
-            rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
-                rtp_codec: h264_b.clone(),
-                payload_type: 97,
-                ..Default::default()
-            },
-            RtpCodecKind::Video,
-        )?;
-
         let h265_codec = RTCRtpCodec {
             mime_type: MIME_TYPE_HEVC.to_owned(),
             clock_rate: 90000,
             channels: 0,
-            sdp_fmtp_line: "".to_owned(),
+            sdp_fmtp_line: "level-id=180;profile-id=1;tier-flag=0;tx-mode=SRST".to_owned(),
             rtcp_feedback: video_feedback.clone(),
         };
 
-        media_engine.register_codec(
-            rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
-                rtp_codec: h265_codec.clone(),
-                payload_type: 100,
-                ..Default::default()
-            },
-            RtpCodecKind::Video,
-        )?;
+        if is_stream_hevc {
+            media_engine.register_codec(
+                rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                    rtp_codec: h265_codec.clone(),
+                    payload_type: 100,
+                    ..Default::default()
+                },
+                RtpCodecKind::Video,
+            )?;
+            // Also register generic H.265 without fmtp restriction for Safari/browsers without profile-id fmtp
+            let h265_generic = RTCRtpCodec {
+                mime_type: MIME_TYPE_HEVC.to_owned(),
+                clock_rate: 90000,
+                channels: 0,
+                sdp_fmtp_line: "".to_owned(),
+                rtcp_feedback: video_feedback.clone(),
+            };
+            media_engine.register_codec(
+                rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                    rtp_codec: h265_generic,
+                    payload_type: 101,
+                    ..Default::default()
+                },
+                RtpCodecKind::Video,
+            )?;
+        } else {
+            media_engine.register_codec(
+                rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                    rtp_codec: h264_high.clone(),
+                    payload_type: 98,
+                    ..Default::default()
+                },
+                RtpCodecKind::Video,
+            )?;
+            media_engine.register_codec(
+                rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                    rtp_codec: h264_cb.clone(),
+                    payload_type: 96,
+                    ..Default::default()
+                },
+                RtpCodecKind::Video,
+            )?;
+            media_engine.register_codec(
+                rtc::rtp_transceiver::rtp_sender::RTCRtpCodecParameters {
+                    rtp_codec: h264_b.clone(),
+                    payload_type: 97,
+                    ..Default::default()
+                },
+                RtpCodecKind::Video,
+            )?;
+        }
 
         let opus_codec = RTCRtpCodec {
             mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -249,7 +282,7 @@ impl WebRtcManager {
         let (session_close_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
         let (gather_complete_tx, mut gather_complete_rx) = channel::<()>(1);
-        let (connected_tx, mut _connected_rx) = channel::<()>(1);
+        let (connected_tx, mut connected_rx) = channel::<()>(1);
 
         let handler = Arc::new(WebRtcHandler {
             session_id: session_id.clone(),
@@ -267,24 +300,7 @@ impl WebRtcManager {
             .build()
             .await?;
 
-        let tracks = stream.get_tracks().await;
-        let is_stream_hevc = tracks.iter().any(|t| {
-            t.kind == MediaKind::Video
-                && (t.codec.name.to_uppercase().contains("265")
-                    || t.codec.name.to_uppercase().contains("HEVC"))
-        });
-
-        let offer_upper = offer_sdp.to_uppercase();
-        let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
-
-        if is_stream_hevc && !offer_has_hevc {
-            anyhow::bail!(
-                "Camera stream is H.265 (HEVC), but this browser does not support WebRTC H.265. Please view the H.264 sub-stream ({}_sub) or use a browser with HEVC WebRTC enabled (e.g. Safari).",
-                stream.name
-            );
-        }
-
-        let mut video_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, bool, bool, Option<Vec<u8>>, u8)> = None;
+        let mut video_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, bool, bool, Vec<Vec<u8>>, u8)> = None;
         let mut audio_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, u8)> = None;
 
         for track in &tracks {
@@ -325,20 +341,22 @@ impl WebRtcManager {
 
                 let rx = track.subscribe();
 
-                // Pre-generate parameter sets packet payload (STAP-A for H264, AP for H265) if available
-                let param_set_packet_payload = if let Some(ref fmtp) = track.codec.fmtp {
+                // Pre-generate parameter sets packets (STAP-A for H264, individual VPS/SPS/PPS for H265) if available
+                let param_set_packets = if let Some(ref fmtp) = track.codec.fmtp {
                     if is_hevc {
                         extract_h265_vps_sps_pps(fmtp)
-                            .map(|(vps, sps, pps)| build_h265_ap(&vps, &sps, &pps))
+                            .map(|(vps, sps, pps)| vec![vps, sps, pps])
+                            .unwrap_or_default()
                     } else {
                         extract_h264_sps_pps(fmtp)
-                            .map(|(sps, pps)| build_h264_stap_a(&sps, &pps))
+                            .map(|(sps, pps)| vec![build_h264_stap_a(&sps, &pps)])
+                            .unwrap_or_default()
                     }
                 } else {
-                    None
+                    Vec::new()
                 };
 
-                video_track_info = Some((video_track, rx, video_ssrc, is_hevc, is_high, param_set_packet_payload, default_pt));
+                video_track_info = Some((video_track, rx, video_ssrc, is_hevc, is_high, param_set_packets, default_pt));
             }
         }
 
@@ -381,8 +399,8 @@ impl WebRtcManager {
         let answer = peer_connection.create_answer(None).await?;
         peer_connection.set_local_description(answer).await?;
 
-        // Wait for ICE candidate gathering (timeout 1 second)
-        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(1000), gather_complete_rx.recv()).await;
+        // Wait briefly for host/LAN ICE candidate gathering (150ms avoids blocking on unreachable VLAN STUN interfaces)
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(150), gather_complete_rx.recv()).await;
 
         let local_desc = peer_connection
             .local_description()
@@ -410,7 +428,7 @@ impl WebRtcManager {
         });
 
         // Spawn video RTP forwarder after the track is bound
-        if let Some((vtrack, mut rx, video_ssrc, is_hevc, is_high, mut param_set_payload, default_pt)) = video_track_info {
+        if let Some((vtrack, mut rx, video_ssrc, is_hevc, is_high, mut param_set_packets, default_pt)) = video_track_info {
             let actual_pt = find_negotiated_video_pt(&local_desc.sdp, is_hevc, is_high, default_pt);
             tracing::info!(stream = %stream.name, pt = actual_pt, is_hevc = is_hevc, "Starting WebRTC video forwarder");
 
@@ -420,10 +438,20 @@ impl WebRtcManager {
                 let mut sent_first_keyframe = false;
                 let mut last_was_param_set = false;
                 let mut last_keyframe_ts: Option<u32> = None;
+                let mut connected_fired = false;
 
                 loop {
                     let packet = tokio::select! {
                         _ = close_rx.recv() => break,
+                        Some(()) = connected_rx.recv(), if !connected_fired => {
+                            connected_fired = true;
+                            // Reset keyframe gate when DTLS/ICE transitions to Connected so the first
+                            // keyframe after DTLS handshake is guaranteed to be preceded by parameter sets.
+                            sent_first_keyframe = false;
+                            last_was_param_set = false;
+                            last_keyframe_ts = None;
+                            continue;
+                        }
                         res = rx.recv() => match res {
                             Ok(pkt) => pkt,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -441,9 +469,19 @@ impl WebRtcManager {
 
                     let (is_keyframe, is_param_set) = is_keyframe_or_param_set(is_hevc, payload_slice);
 
-                    // Dynamically cache STAP-A parameter sets if seen in stream
-                    if is_param_set && !is_hevc && payload_slice[0] & 0x1F == 24 {
-                        param_set_payload = Some(payload_slice.to_vec());
+                    // Dynamically cache parameter sets if seen in stream (even before first keyframe)
+                    if is_param_set {
+                        if !is_hevc && (payload_slice[0] & 0x1F) == 24 {
+                            param_set_packets = vec![payload_slice.to_vec()];
+                        } else if is_hevc {
+                            let nalu_type = (payload_slice[0] >> 1) & 0x3F;
+                            if nalu_type == 48 {
+                                let unpacked = unpack_h265_ap(payload_slice);
+                                if !unpacked.is_empty() {
+                                    param_set_packets = unpacked;
+                                }
+                            }
+                        }
                     }
 
                     if !sent_first_keyframe {
@@ -457,11 +495,11 @@ impl WebRtcManager {
                         sent_first_keyframe = true;
                     }
 
-                    // Before keyframes, inject the parameter sets packet (STAP-A / AP) if not immediately preceded by parameter sets
+                    // Before keyframes, inject the parameter sets packets if not immediately preceded by parameter sets
                     if is_keyframe && last_keyframe_ts != Some(packet.timestamp) {
                         last_keyframe_ts = Some(packet.timestamp);
                         if !last_was_param_set {
-                            if let Some(ref ps_bytes) = param_set_payload {
+                            for ps_bytes in &param_set_packets {
                                 let ps_rtp = rtp::packet::Packet {
                                     header: rtp::header::Header {
                                         version: 2,
@@ -549,52 +587,64 @@ impl WebRtcManager {
 }
 
 fn find_negotiated_video_pt(sdp: &str, is_hevc: bool, is_high: bool, default_pt: u8) -> u8 {
-    let mut rtpmap = std::collections::HashMap::new();
-    let mut fmtp = std::collections::HashMap::new();
+    let mut rtpmap: Vec<(u8, String)> = Vec::new();
+    let mut fmtp: Vec<(u8, String)> = Vec::new();
 
     for line in sdp.lines() {
         let line = line.trim();
         if let Some(r) = line.strip_prefix("a=rtpmap:") {
             if let Some((pt_str, rest)) = r.split_once(' ') {
                 if let Ok(pt) = pt_str.parse::<u8>() {
-                    rtpmap.insert(pt, rest.to_uppercase());
+                    rtpmap.push((pt, rest.to_uppercase()));
                 }
             }
         } else if let Some(f) = line.strip_prefix("a=fmtp:") {
             if let Some((pt_str, rest)) = f.split_once(' ') {
                 if let Ok(pt) = pt_str.parse::<u8>() {
-                    fmtp.insert(pt, rest.to_string());
+                    fmtp.push((pt, rest.to_string()));
                 }
             }
         }
     }
 
     if is_hevc {
-        for (&pt, name) in &rtpmap {
+        // Prefer Main Profile (profile-id=1) when multiple H.265 payload types are offered
+        for (pt, name) in &rtpmap {
             if name.contains("H265") || name.contains("HEVC") {
-                return pt;
+                let is_profile_1 = fmtp
+                    .iter()
+                    .find(|(fpt, _)| fpt == pt)
+                    .map_or(true, |(_, params)| params.contains("profile-id=1") || !params.contains("profile-id="));
+                if is_profile_1 {
+                    return *pt;
+                }
+            }
+        }
+        for (pt, name) in &rtpmap {
+            if name.contains("H265") || name.contains("HEVC") {
+                return *pt;
             }
         }
         return default_pt;
     }
 
     if is_high {
-        for (&pt, params) in &fmtp {
+        for (pt, params) in &fmtp {
             if params.contains("6400") {
-                return pt;
+                return *pt;
             }
         }
     } else {
-        for (&pt, params) in &fmtp {
+        for (pt, params) in &fmtp {
             if params.contains("42") {
-                return pt;
+                return *pt;
             }
         }
     }
 
-    for (&pt, name) in &rtpmap {
+    for (pt, name) in &rtpmap {
         if name.contains("H264") {
-            return pt;
+            return *pt;
         }
     }
 
@@ -737,6 +787,7 @@ pub fn build_h264_stap_a(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     payload
 }
 
+#[allow(dead_code)]
 pub fn build_h265_ap(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(2 + 2 + vps.len() + 2 + sps.len() + 2 + pps.len());
     payload.push(0x60); // AP header byte 1: Type=48 << 1
@@ -750,6 +801,26 @@ pub fn build_h265_ap(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
     payload
 }
 
+/// Unpack an H.265 Aggregation Packet (NAL type 48) into individual Single NAL Unit payloads.
+pub fn unpack_h265_ap(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut nals = Vec::new();
+    if payload.len() < 4 || ((payload[0] >> 1) & 0x3F) != 48 {
+        return nals;
+    }
+    let mut idx = 2;
+    while idx + 2 <= payload.len() {
+        let nlen = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+        idx += 2;
+        if nlen > 0 && idx + nlen <= payload.len() {
+            nals.push(payload[idx..idx + nlen].to_vec());
+            idx += nlen;
+        } else {
+            break;
+        }
+    }
+    nals
+}
+
 /// Re-fragment oversized video payloads into safe MTU slices (<= 1180 bytes)
 /// to prevent IP fragmentation and UDP packet loss across WebRTC paths.
 pub fn fragment_payload_for_webrtc(
@@ -758,6 +829,33 @@ pub fn fragment_payload_for_webrtc(
     marker: bool,
 ) -> Vec<(Bytes, bool)> {
     const MAX_CHUNK: usize = 1170; // Guaranteed safe under 1280 MTU with IP/UDP/SRTP headers
+
+    if payload.is_empty() {
+        return Vec::new();
+    }
+
+    // For H.265, unpack Aggregation Packets (NAL 48) into individual Single NAL Unit packets
+    // so SRST WebRTC receivers (Chromium/Safari) decode VPS/SPS/PPS reliably, and ensure marker=false on parameter sets.
+    if is_hevc {
+        let nalu_type = (payload[0] >> 1) & 0x3F;
+        if nalu_type == 48 {
+            let sub_nals = unpack_h265_ap(payload);
+            let mut out = Vec::with_capacity(sub_nals.len());
+            for (i, nalu) in sub_nals.into_iter().enumerate() {
+                if nalu.is_empty() {
+                    continue;
+                }
+                let sub_type = (nalu[0] >> 1) & 0x3F;
+                // Parameter sets (32, 33, 34) and SEI (39, 40) must have marker=false
+                let is_ps_or_sei = matches!(sub_type, 32 | 33 | 34 | 39 | 40);
+                let sub_marker = if is_ps_or_sei { false } else { marker && i == 0 };
+                out.extend(fragment_payload_for_webrtc(true, &nalu, sub_marker));
+            }
+            return out;
+        } else if matches!(nalu_type, 32 | 33 | 34 | 39 | 40) && payload.len() <= MAX_CHUNK {
+            return vec![(Bytes::copy_from_slice(payload), false)];
+        }
+    }
 
     if payload.len() <= MAX_CHUNK {
         return vec![(Bytes::copy_from_slice(payload), marker)];
@@ -936,5 +1034,37 @@ mod tests {
         assert_eq!(chunks[1].0[0] & 0x1F, 28);
         assert_eq!(chunks[1].0[1], 0x41); // E=1, type=1
         assert!(chunks[1].1); // marker true on final chunk
+    }
+
+    #[test]
+    fn test_unpack_h265_ap_and_fragment() {
+        let vps = vec![0x40, 0x01, 0x0c, 0x01]; // type 32
+        let sps = vec![0x42, 0x01, 0x01, 0x01]; // type 33
+        let pps = vec![0x44, 0x01, 0xc0, 0x73]; // type 34
+        let ap = build_h265_ap(&vps, &sps, &pps);
+
+        let unpacked = unpack_h265_ap(&ap);
+        assert_eq!(unpacked, vec![vps.clone(), sps.clone(), pps.clone()]);
+
+        let chunks = fragment_payload_for_webrtc(true, &ap, true);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(&chunks[0].0[..], &vps[..]);
+        assert!(!chunks[0].1); // marker must be false on VPS
+        assert_eq!(&chunks[1].0[..], &sps[..]);
+        assert!(!chunks[1].1); // marker must be false on SPS
+        assert_eq!(&chunks[2].0[..], &pps[..]);
+        assert!(!chunks[2].1); // marker must be false on PPS
+    }
+
+    #[test]
+    fn test_find_negotiated_video_pt_hevc_profile1() {
+        let sdp = "m=video 9 UDP/TLS/RTP/SAVPF 49 51\r\n\
+                   a=rtpmap:51 H265/90000\r\n\
+                   a=fmtp:51 level-id=180;profile-id=2;tier-flag=0;tx-mode=SRST\r\n\
+                   a=rtpmap:49 H265/90000\r\n\
+                   a=fmtp:49 level-id=180;profile-id=1;tier-flag=0;tx-mode=SRST\r\n";
+        for _ in 0..20 {
+            assert_eq!(find_negotiated_video_pt(sdp, true, true, 100), 49);
+        }
     }
 }
