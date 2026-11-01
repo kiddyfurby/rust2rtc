@@ -286,11 +286,34 @@ impl RtspClient {
                 }
             }
 
-            // Check if buffer starts with plain text (e.g. RTSP response to keepalive)
+            // Check if buffer starts with plain text (e.g. RTSP response to keepalive) or desynchronized data
             if !buffer.is_empty() && buffer[0] != b'$' {
-                if let Some(pos) = find_crlf_crlf(&buffer) {
-                    let _ = buffer.split_to(pos + 4);
+                if buffer.starts_with(b"RTSP/") {
+                    if let Some(pos) = find_crlf_crlf(&buffer) {
+                        let header_bytes = &buffer[..pos + 4];
+                        let mut body_len = 0usize;
+                        let header_str = String::from_utf8_lossy(header_bytes);
+                        for line in header_str.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    body_len = v.trim().parse::<usize>().unwrap_or(0);
+                                }
+                            }
+                        }
+                        if buffer.len() >= pos + 4 + body_len {
+                            let _ = buffer.split_to(pos + 4 + body_len);
+                            continue;
+                        }
+                    }
+                } else if let Some(dollar_pos) = buffer.iter().position(|&b| b == b'$') {
+                    // Resynchronize to next interleaved RTP packet!
+                    warn!(stream = %stream.name, discarded = dollar_pos, "Resynchronizing interleaved RTSP stream to next '$'");
+                    let _ = buffer.split_to(dollar_pos);
                     continue;
+                } else {
+                    // Buffer contains unparseable garbage with no '$' delimiter - clear it to unblock
+                    warn!(stream = %stream.name, discarded = buffer.len(), "Discarding unparseable RTSP buffer garbage");
+                    buffer.clear();
                 }
             }
 
@@ -314,18 +337,18 @@ impl RtspClient {
                     return Ok(true);
                 }
                 _ = keepalive_timer.tick() => {
-                    // Send RTSP keepalive (GET_PARAMETER or OPTIONS)
+                    // Send RTSP keepalive (OPTIONS is universally supported without a response body)
                     trace!(stream = %stream.name, "Sending RTSP keepalive");
                     let _ = tokio::time::timeout(
-                        Duration::from_millis(2000),
+                        Duration::from_millis(5000),
                         Self::send_raw_request(
                             &mut tcp,
                             &mut buffer,
-                            "GET_PARAMETER",
+                            "OPTIONS",
                             &clean_url,
                             &mut cseq,
                             session_id.as_deref(),
-                            auth_info.as_ref().and_then(|a| a.generate_header("GET_PARAMETER", &clean_url, &username, &password)).as_deref(),
+                            auth_info.as_ref().and_then(|a| a.generate_header("OPTIONS", &clean_url, &username, &password)).as_deref(),
                             None,
                             Some(&channel_map),
                             Some(&stream),
@@ -470,8 +493,8 @@ impl RtspClient {
                 }
             }
 
-            // 2. Discard leading newlines/whitespace
-            while !buffer.is_empty() && (buffer[0] == b'\r' || buffer[0] == b'\n' || buffer[0] == b' ') {
+            // 2. Discard leading non-RTSP, non-$ bytes (whitespace, newlines, or dangling body bytes)
+            while !buffer.is_empty() && buffer[0] != b'$' && !buffer.starts_with(b"RTSP/") {
                 let _ = buffer.get_u8();
             }
 
