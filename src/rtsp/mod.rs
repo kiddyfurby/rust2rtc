@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+pub mod client;
+pub use client::RtspClient;
+
 use crate::core::{Codec, MediaKind, RtpPacket, Track};
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
