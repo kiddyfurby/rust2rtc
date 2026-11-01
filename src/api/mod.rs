@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -31,11 +31,32 @@ pub struct SipCallQuery {
     pub dest: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StreamsQuery {
+    pub src: Option<String>,
+    pub name: Option<String>,
+    pub val: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamPayload {
+    pub src: Option<String>,
+    pub name: Option<String>,
+    pub val: Option<String>,
+    pub sources: Option<Vec<String>>,
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
-        .route("/api/streams", get(api_streams_handler))
+        .route(
+            "/api/streams",
+            get(api_streams_get_handler)
+                .put(api_streams_put_handler)
+                .post(api_streams_put_handler)
+                .delete(api_streams_delete_handler),
+        )
         .route("/api/ffmpeg", get(api_ffmpeg_handler))
         .route("/api/frame.jpeg", get(api_frame_handler))
         .route("/api/webrtc", post(api_webrtc_handler))
@@ -279,8 +300,29 @@ async fn index_handler() -> Html<&'static str> {
         async function loadStreams() {
             try {
                 const res = await fetch('/api/streams');
-                const streams = await res.json();
+                const data = await res.json();
                 const container = document.getElementById('streams');
+
+                const streams = Array.isArray(data) ? data : Object.entries(data).map(([name, s]) => {
+                    const isLive = s.producers && s.producers.some(p => p.recv > 0 || (p.medias && p.medias.length > 0));
+                    const totalConsumers = s.consumers ? s.consumers.length : 0;
+                    const recvBytes = s.producers ? s.producers.reduce((acc, p) => acc + (p.recv || 0), 0) : 0;
+                    const recvPackets = s.producers ? s.producers.reduce((acc, p) => acc + (p.recv_packets || 0), 0) : 0;
+                    const medias = (s.producers && s.producers[0] && s.producers[0].medias) || [];
+                    const tracks = medias.map(m => {
+                        const parts = m.split(',').map(p => p.trim());
+                        return { kind: parts[0] || 'video', codec: parts[2] || parts[1] || '' };
+                    });
+                    return {
+                        name,
+                        active: isLive,
+                        consumers: totalConsumers,
+                        bytes_recv: recvBytes,
+                        packets_recv: recvPackets,
+                        tracks
+                    };
+                });
+
                 if (streams.length === 0) {
                     container.innerHTML = '<div style="color: #8b949e">No streams configured.</div>';
                     return;
@@ -337,9 +379,90 @@ async fn index_handler() -> Html<&'static str> {
 </html>"#)
 }
 
-async fn api_streams_handler(State(state): State<AppState>) -> Json<Vec<crate::streams::StreamInfo>> {
-    let infos = state.streams.get_all_infos().await;
-    Json(infos)
+async fn api_streams_get_handler(
+    State(state): State<AppState>,
+    Query(query): Query<StreamsQuery>,
+) -> Response {
+    let target = query.src.or(query.name);
+    if let Some(name) = target {
+        if let Some(stream_info) = state.streams.get_go2rtc_stream(&name).await {
+            (StatusCode::OK, Json(stream_info)).into_response()
+        } else {
+            (StatusCode::NOT_FOUND, "Stream not found").into_response()
+        }
+    } else {
+        let all_streams = state.streams.get_go2rtc_streams().await;
+        (StatusCode::OK, Json(all_streams)).into_response()
+    }
+}
+
+async fn api_streams_put_handler(
+    State(state): State<AppState>,
+    Query(query): Query<StreamsQuery>,
+    body: axum::body::Bytes,
+) -> Response {
+    let payload: Option<StreamPayload> = if !body.is_empty() {
+        serde_json::from_slice(&body).ok()
+    } else {
+        None
+    };
+
+    let (name, sources) = if let Some(p) = payload {
+        let name = p.name.or(p.src.clone()).or(query.name.clone()).or(query.src.clone());
+        let mut sources = p.sources.unwrap_or_default();
+        if sources.is_empty() {
+            if let Some(val) = p.val.or(p.src) {
+                sources.push(val);
+            }
+        }
+        (name, sources)
+    } else {
+        let name = query.name.clone().or(query.src.clone());
+        let mut sources = Vec::new();
+        if let Some(val) = query.val {
+            sources.push(val);
+        } else if let Some(src) = query.src {
+            if query.name.is_some() {
+                sources.push(src);
+            }
+        }
+        (name, sources)
+    };
+
+    if let Some(name) = name {
+        if !sources.is_empty() {
+            state.streams.add_configured_stream(name.clone(), sources).await;
+            info!(stream = %name, "Dynamically configured stream via /api/streams");
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "ok", "stream": name })),
+            )
+                .into_response();
+        }
+    }
+
+    (StatusCode::BAD_REQUEST, "Missing stream name or source URL").into_response()
+}
+
+async fn api_streams_delete_handler(
+    State(state): State<AppState>,
+    Query(query): Query<StreamsQuery>,
+) -> Response {
+    let target = query.src.or(query.name);
+    if let Some(name) = target {
+        if state.streams.delete(&name).await {
+            info!(stream = %name, "Deleted stream via /api/streams");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "ok" })),
+            )
+                .into_response()
+        } else {
+            (StatusCode::NOT_FOUND, "Stream not found").into_response()
+        }
+    } else {
+        (StatusCode::BAD_REQUEST, "Missing stream name").into_response()
+    }
 }
 
 async fn api_ffmpeg_handler(State(state): State<AppState>) -> Response {
