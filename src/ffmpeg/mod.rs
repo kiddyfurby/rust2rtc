@@ -19,6 +19,10 @@ impl FfmpegManager {
         Self { bin, global_args }
     }
 
+    pub fn bin(&self) -> &str {
+        &self.bin
+    }
+
     /// Check if FFmpeg is available and return version info
     pub async fn check_version(&self) -> Result<String> {
         let output = Command::new(&self.bin)
