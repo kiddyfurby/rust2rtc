@@ -257,6 +257,8 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    sip_manager.unregister_all().await;
+
     info!("rust2rtc stopped cleanly");
     Ok(())
 }
