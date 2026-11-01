@@ -55,6 +55,7 @@ pub struct SipCameraAccount {
     used_extensions: Arc<Mutex<HashSet<String>>>,
     current_extension: Mutex<String>,
     registered: AtomicBool,
+    is_stopping: AtomicBool,
     cseq: AtomicU32,
     local_tag: String,
 }
@@ -93,6 +94,7 @@ impl SipCameraAccount {
             used_extensions,
             current_extension: Mutex::new(initial_ext),
             registered: AtomicBool::new(false),
+            is_stopping: AtomicBool::new(false),
             cseq: AtomicU32::new(1),
             local_tag,
         })
@@ -116,10 +118,18 @@ impl SipCameraAccount {
         // 1. Spawn Registration Loop
         tokio::spawn(async move {
             loop {
+                if account.is_stopping.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Err(e) = account.register().await {
                     warn!(stream = %account.config.stream_name, "SIP registration error: {}", e);
                 }
-                tokio::time::sleep(Duration::from_secs(120)).await;
+                for _ in 0..120 {
+                    if account.is_stopping.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         });
 
@@ -156,7 +166,10 @@ impl SipCameraAccount {
     /// Perform SIP registration with digest authentication challenge
     /// and automatic Home Assistant `voip_stack.create_account` provisioning on 401/403
     pub async fn register(&self) -> Result<()> {
-        match self.register_once().await {
+        if self.is_stopping.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match self.register_request(300).await {
             Ok(()) => {
                 self.registered.store(true, Ordering::Relaxed);
                 Ok(())
@@ -189,7 +202,7 @@ impl SipCameraAccount {
                         };
                         *self.current_extension.lock().await = provisioned_ext;
 
-                        match self.register_once().await {
+                        match self.register_request(300).await {
                             Ok(()) => {
                                 self.registered.store(true, Ordering::Relaxed);
                                 return Ok(());
@@ -207,7 +220,28 @@ impl SipCameraAccount {
         }
     }
 
-    async fn register_once(&self) -> Result<()> {
+    /// Unregister from the SIP registrar by sending a REGISTER with expires=0
+    pub async fn unregister(&self) -> Result<()> {
+        self.is_stopping.store(true, Ordering::SeqCst);
+        if !self.registered.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Terminate any active media session first
+        {
+            let mut active = self.active_call.lock().await;
+            if let Some(mut session) = active.take() {
+                session.stop().await;
+            }
+        }
+
+        info!(stream = %self.config.stream_name, "Unregistering SIP account (expires=0)");
+        let res = self.register_request(0).await;
+        self.registered.store(false, Ordering::SeqCst);
+        res
+    }
+
+    async fn register_request(&self, expires: u32) -> Result<()> {
         let server_addr: SocketAddr = tokio::net::lookup_host(&self.config.server)
             .await?
             .next()
@@ -239,7 +273,8 @@ impl SipCameraAccount {
         reg_msg.set_header("To", &format!("<{}>", to_uri));
         reg_msg.set_header("Call-ID", &call_id);
         reg_msg.set_header("CSeq", &format!("{} REGISTER", seq));
-        reg_msg.set_header("Contact", &format!("<{}>;expires=300", contact));
+        reg_msg.set_header("Contact", &format!("<{}>;expires={}", contact, expires));
+        reg_msg.set_header("Expires", &expires.to_string());
         reg_msg.set_header("Max-Forwards", "70");
         reg_msg.set_header("User-Agent", "rust2rtc");
 
@@ -247,7 +282,7 @@ impl SipCameraAccount {
 
         // Wait for response routed by listener (skip provisional 1xx)
         let resp = loop {
-            let msg = match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            let msg = match tokio::time::timeout(Duration::from_secs(4), rx.recv()).await {
                 Ok(Some(m)) => m,
                 Ok(None) => {
                     self.pending_responses.lock().await.remove(&call_id);
@@ -267,7 +302,11 @@ impl SipCameraAccount {
 
         if resp.status_code == Some(200) {
             self.pending_responses.lock().await.remove(&call_id);
-            info!(stream = %self.config.stream_name, ext = %current_ext, "SIP registered successfully");
+            if expires == 0 {
+                info!(stream = %self.config.stream_name, ext = %current_ext, "SIP unregistered successfully");
+            } else {
+                info!(stream = %self.config.stream_name, ext = %current_ext, "SIP registered successfully");
+            }
             return Ok(());
         }
 
@@ -279,6 +318,7 @@ impl SipCameraAccount {
                     &from_uri,
                     &to_uri,
                     &contact,
+                    expires,
                     local_port,
                     server_addr,
                     &mut rx,
@@ -288,12 +328,21 @@ impl SipCameraAccount {
             self.pending_responses.lock().await.remove(&call_id);
 
             if resp2.status_code == Some(200) {
-                info!(
-                    stream = %self.config.stream_name,
-                    ext = %current_ext,
-                    auth_user = %reg_user,
-                    "SIP registered successfully with auth"
-                );
+                if expires == 0 {
+                    info!(
+                        stream = %self.config.stream_name,
+                        ext = %current_ext,
+                        auth_user = %reg_user,
+                        "SIP unregistered successfully with auth"
+                    );
+                } else {
+                    info!(
+                        stream = %self.config.stream_name,
+                        ext = %current_ext,
+                        auth_user = %reg_user,
+                        "SIP registered successfully with auth"
+                    );
+                }
                 return Ok(());
             } else if resp2.status_code == Some(401) || resp2.status_code == Some(403) {
                 bail!(
@@ -318,6 +367,7 @@ impl SipCameraAccount {
         from_uri: &str,
         to_uri: &str,
         contact: &str,
+        expires: u32,
         local_port: u16,
         server_addr: SocketAddr,
         rx: &mut mpsc::Receiver<SipMessage>,
@@ -406,7 +456,8 @@ impl SipCameraAccount {
         auth_reg.set_header("To", &format!("<{}>", to_uri));
         auth_reg.set_header("Call-ID", call_id);
         auth_reg.set_header("CSeq", &format!("{} REGISTER", seq2));
-        auth_reg.set_header("Contact", &format!("<{}>;expires=300", contact));
+        auth_reg.set_header("Contact", &format!("<{}>;expires={}", contact, expires));
+        auth_reg.set_header("Expires", &expires.to_string());
         let auth_hdr_name = if challenge_resp.status_code == Some(407) {
             "Proxy-Authorization"
         } else {

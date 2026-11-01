@@ -12,8 +12,9 @@ use crate::ffmpeg::FfmpegManager;
 use crate::streams::StreamManager;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct SipManager {
     accounts: RwLock<HashMap<String, Arc<SipCameraAccount>>>,
@@ -100,5 +101,28 @@ impl SipManager {
         }
         statuses.sort_by(|a, b| a.extension.cmp(&b.extension));
         statuses
+    }
+
+    /// Gracefully unregister all SIP accounts with the registrar on shutdown
+    pub async fn unregister_all(&self) {
+        let accounts = self.accounts.read().await;
+        if accounts.is_empty() {
+            return;
+        }
+        info!(count = accounts.len(), "Unregistering all SIP accounts...");
+        let mut set = tokio::task::JoinSet::new();
+        for acc in accounts.values() {
+            let acc_clone = Arc::clone(acc);
+            set.spawn(async move {
+                if let Err(e) = acc_clone.unregister().await {
+                    debug!(stream = %acc_clone.config.stream_name, "Error during SIP unregister: {}", e);
+                }
+            });
+        }
+        let wait_all = async {
+            while set.join_next().await.is_some() {}
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(3), wait_all).await;
+        info!("All SIP accounts unregistered");
     }
 }

@@ -625,4 +625,25 @@ a=sendrecv\r\n";
         );
         assert_eq!(resp.len(), 32);
     }
+
+    #[test]
+    fn test_unregister_sip_message() {
+        let mut reg_msg = SipMessage::new_request(SipMethod::Register, "sip:homeassistant.local");
+        reg_msg.set_header("Via", "SIP/2.0/UDP 198.51.100.10:5060;branch=z9hG4bK-123;rport");
+        reg_msg.set_header("From", "<sip:doorbell@homeassistant.local>;tag=tag1");
+        reg_msg.set_header("To", "<sip:doorbell@homeassistant.local>");
+        reg_msg.set_header("Call-ID", "call-reg-1");
+        reg_msg.set_header("CSeq", "2 REGISTER");
+        reg_msg.set_header("Contact", "<sip:doorbell@198.51.100.10:5060>;expires=0");
+        reg_msg.set_header("Expires", "0");
+
+        let serialized = reg_msg.serialize();
+        assert!(serialized.contains("Contact: <sip:doorbell@198.51.100.10:5060>;expires=0"));
+        assert!(serialized.contains("Expires: 0"));
+
+        let parsed = SipMessage::parse(&serialized).unwrap();
+        assert_eq!(parsed.method, Some(SipMethod::Register));
+        assert_eq!(parsed.get_header("Expires"), Some("0"));
+        assert!(parsed.get_header("Contact").unwrap().contains("expires=0"));
+    }
 }
