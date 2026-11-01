@@ -59,7 +59,7 @@ impl FfmpegManager {
 
         let resolved = resolve_source(source, rtsp_port);
 
-        // Default RTSP or file remux: copy video and normalize audio to 8kHz mono G.711 PCMA for WebRTC/SIP compatibility
+        // Default RTSP or file remux: stream copy video and audio without re-encoding
         let output_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_id);
         let args = vec![
             "-hide_banner".to_string(),
@@ -73,14 +73,8 @@ impl FfmpegManager {
             "tcp".to_string(),
             "-i".to_string(),
             resolved,
-            "-c:v".to_string(),
+            "-c".to_string(),
             "copy".to_string(),
-            "-c:a".to_string(),
-            "pcm_alaw".to_string(),
-            "-ar".to_string(),
-            "8000".to_string(),
-            "-ac".to_string(),
-            "1".to_string(),
             "-f".to_string(),
             "rtsp".to_string(),
             "-rtsp_transport".to_string(),
