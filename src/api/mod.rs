@@ -778,69 +778,142 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         h.abort();
                     }
 
-                    let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src_name);
-                    let ffmpeg_bin = state.ffmpeg.bin().to_string();
+                    let video_track = stream.get_tracks().await.into_iter().find(|t| t.kind == crate::core::MediaKind::Video);
                     let tx_mse = tx.clone();
+                    let stream_name = src_name.clone();
 
-                    mse_handle = Some(tokio::spawn(async move {
-                        let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
-                        cmd.kill_on_drop(true);
-                        cmd.args([
-                            "-hide_banner",
-                            "-loglevel", "warning",
-                            "-fflags", "nobuffer",
-                            "-flags", "low_delay",
-                            "-rtsp_transport", "tcp",
-                            "-i", &rtsp_url,
-                        ]);
+                    if copy_video && !has_h265 && video_track.is_some() {
+                        // Pure-Rust in-process fMP4 multiplexer (Zero FFmpeg subprocess)
+                        let vtrack = video_track.unwrap();
+                        info!(stream = %stream_name, "Starting pure-Rust in-process MSE fMP4 stream (no FFmpeg)");
 
-                        if copy_video {
-                            cmd.args(["-c:v", "copy"]);
-                        } else {
-                            cmd.args(["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]);
-                        }
+                        mse_handle = Some(tokio::spawn(async move {
+                            let mut rx = vtrack.subscribe();
+                            let mut depacketizer = crate::mp4::H264RtpDepacketizer::new();
+                            let mut sent_init = false;
+                            let mut seq = 1u32;
+                            let mut base_pts = 0u64;
+                            let mut last_rtp_ts: Option<u32> = None;
 
-                        if copy_audio {
-                            cmd.args(["-c:a", "copy"]);
-                        } else if transcode_audio {
-                            cmd.args(["-c:a", "aac", "-b:a", "64k", "-ar", "16000", "-ac", "1"]);
-                        } else {
-                            cmd.arg("-an");
-                        }
-
-                        cmd.args([
-                            "-f", "mp4",
-                            "-movflags", "empty_moov+default_base_moof+frag_keyframe",
-                            "-flush_packets", "1",
-                            "pipe:1",
-                        ]);
-                        cmd.stdout(std::process::Stdio::piped());
-                        cmd.stderr(std::process::Stdio::null());
-
-                        let mut child = match cmd.spawn() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!("Failed to spawn FFmpeg for MSE stream {}: {}", src_name, e);
-                                return;
-                            }
-                        };
-
-                        if let Some(mut stdout) = child.stdout.take() {
-                            let mut buf = vec![0u8; 8192];
-                            loop {
-                                match stdout.read(&mut buf).await {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if tx_mse.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
+                            // Pre-load SPS / PPS from track SDP fmtp if available
+                            if let Some(ref fmtp) = vtrack.codec.fmtp {
+                                if let Some((sps, pps)) = crate::webrtc::extract_h264_sps_pps(fmtp) {
+                                    depacketizer.sps = Some(sps);
+                                    depacketizer.pps = Some(pps);
                                 }
                             }
-                        }
-                        let _ = child.kill().await;
-                    }));
+
+                            loop {
+                                let packet = match rx.recv().await {
+                                    Ok(p) => p,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged");
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                };
+
+                                if let Some((is_keyframe, rtp_ts, nalus)) = depacketizer.feed_packet(&packet) {
+                                    if !sent_init {
+                                        // Gate initial playback on a keyframe
+                                        if !is_keyframe {
+                                            continue;
+                                        }
+
+                                        if let (Some(sps), Some(pps)) = (&depacketizer.sps, &depacketizer.pps) {
+                                            let (w, h) = crate::mp4::parse_h264_sps_dimensions(sps);
+                                            let init_seg = crate::mp4::make_h264_init_segment(sps, pps, w, h);
+                                            if tx_mse.send(Message::Binary(init_seg.into())).await.is_err() {
+                                                break;
+                                            }
+                                            sent_init = true;
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+
+                                    let duration = if let Some(last) = last_rtp_ts {
+                                        rtp_ts.wrapping_sub(last).max(1000).min(90000)
+                                    } else {
+                                        3000
+                                    };
+                                    last_rtp_ts = Some(rtp_ts);
+
+                                    let media_seg = crate::mp4::make_h264_media_segment(seq, base_pts, duration, is_keyframe, &nalus);
+                                    seq = seq.wrapping_add(1);
+                                    base_pts += duration as u64;
+
+                                    if tx_mse.send(Message::Binary(media_seg.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }));
+                    } else {
+                        // Fallback to FFmpeg transcoding process if video re-encoding is required
+                        let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src_name);
+                        let ffmpeg_bin = state.ffmpeg.bin().to_string();
+
+                        mse_handle = Some(tokio::spawn(async move {
+                            let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
+                            cmd.kill_on_drop(true);
+                            cmd.args([
+                                "-hide_banner",
+                                "-loglevel", "warning",
+                                "-fflags", "nobuffer",
+                                "-flags", "low_delay",
+                                "-rtsp_transport", "tcp",
+                                "-i", &rtsp_url,
+                            ]);
+
+                            if copy_video {
+                                cmd.args(["-c:v", "copy"]);
+                            } else {
+                                cmd.args(["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]);
+                            }
+
+                            if copy_audio {
+                                cmd.args(["-c:a", "copy"]);
+                            } else if transcode_audio {
+                                cmd.args(["-c:a", "aac", "-b:a", "64k", "-ar", "16000", "-ac", "1"]);
+                            } else {
+                                cmd.arg("-an");
+                            }
+
+                            cmd.args([
+                                "-f", "mp4",
+                                "-movflags", "empty_moov+default_base_moof+frag_keyframe",
+                                "-flush_packets", "1",
+                                "pipe:1",
+                            ]);
+                            cmd.stdout(std::process::Stdio::piped());
+                            cmd.stderr(std::process::Stdio::null());
+
+                            let mut child = match cmd.spawn() {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!("Failed to spawn FFmpeg for MSE stream {}: {}", src_name, e);
+                                    return;
+                                }
+                            };
+
+                            if let Some(mut stdout) = child.stdout.take() {
+                                let mut buf = vec![0u8; 8192];
+                                loop {
+                                    match stdout.read(&mut buf).await {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            if tx_mse.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            }
+                            let _ = child.kill().await;
+                        }));
+                    }
                 } else {
                     let err_msg = WsMessage {
                         msg_type: "error".to_string(),
