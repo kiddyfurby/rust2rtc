@@ -1,4 +1,5 @@
 /target
+/dist
 /reference
 *.log
 .DS_Store
