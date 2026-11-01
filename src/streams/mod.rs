@@ -9,12 +9,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::process::Child;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tracing::info;
 
 pub struct ActiveProducer {
     pub source: String,
     pub child: Option<Child>,
+    pub cancel_tx: Option<oneshot::Sender<()>>,
 }
 
 pub struct Stream {
@@ -177,7 +178,7 @@ impl Stream {
     }
 
     /// Ensure that a producer is actively running for this stream
-    pub async fn ensure_started(&self, rtsp_port: u16, ffmpeg: &FfmpegManager) -> Result<()> {
+    pub async fn ensure_started(self: &Arc<Self>, rtsp_port: u16, ffmpeg: &FfmpegManager) -> Result<()> {
         let mut producer_guard = self.producer.lock().await;
         if producer_guard.is_some() {
             return Ok(());
@@ -193,14 +194,37 @@ impl Stream {
             .find(|s| !s.starts_with("multitrans://") && !s.contains("#video=mjpeg") && !s.starts_with("ffmpeg:"))
             .or_else(|| self.sources.iter().find(|s| !s.starts_with("multitrans://")))
             .unwrap_or(&self.sources[0]);
-        info!(stream = %self.name, source = %source, "Starting on-demand producer");
 
+        let resolved = crate::ffmpeg::resolve_source(source, rtsp_port);
+
+        // If source resolves to standard RTSP, ingest natively in-process (zero FFmpeg subprocess)
+        if resolved.starts_with("rtsp://") {
+            info!(stream = %self.name, source = %resolved, "Starting native in-process RTSP producer");
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let self_clone = Arc::clone(self);
+            let resolved_clone = resolved.clone();
+
+            tokio::spawn(async move {
+                crate::rtsp::RtspClient::run(resolved_clone, self_clone, cancel_rx).await;
+            });
+
+            *producer_guard = Some(ActiveProducer {
+                source: source.clone(),
+                child: None,
+                cancel_tx: Some(cancel_tx),
+            });
+
+            return Ok(());
+        }
+
+        info!(stream = %self.name, source = %source, "Starting on-demand FFmpeg fallback producer");
         let (bin, args) = ffmpeg.build_command(source, rtsp_port, &self.name);
         let child = ffmpeg.spawn_process(&bin, &args)?;
 
         *producer_guard = Some(ActiveProducer {
             source: source.clone(),
             child: Some(child),
+            cancel_tx: None,
         });
 
         Ok(())
@@ -210,8 +234,12 @@ impl Stream {
     pub async fn stop(&self) {
         let mut producer_guard = self.producer.lock().await;
         if let Some(mut prod) = producer_guard.take() {
+            if let Some(cancel_tx) = prod.cancel_tx {
+                info!(stream = %self.name, "Stopping native in-process RTSP stream");
+                let _ = cancel_tx.send(());
+            }
             if let Some(mut child) = prod.child.take() {
-                info!(stream = %self.name, "Stopping stream producer");
+                info!(stream = %self.name, "Stopping FFmpeg stream producer");
                 let _ = child.kill().await;
             }
         }
