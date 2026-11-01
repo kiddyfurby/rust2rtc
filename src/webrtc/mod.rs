@@ -60,7 +60,9 @@ impl PeerConnectionEventHandler for WebRtcHandler {
 #[derive(Clone)]
 pub struct WebRtcManager {
     candidates: Vec<String>,
+    #[allow(dead_code)]
     pub rtsp_port: u16,
+    #[allow(dead_code)]
     pub ffmpeg_bin: String,
     pub sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn PeerConnection>>>>,
 }
@@ -283,7 +285,7 @@ impl WebRtcManager {
         }
 
         let mut video_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, bool, bool, Option<Vec<u8>>, u8)> = None;
-        let mut audio_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, u8, bool)> = None;
+        let mut audio_track_info: Option<(Arc<TrackLocalStaticRTP>, tokio::sync::broadcast::Receiver<crate::core::RtpPacket>, u32, u8)> = None;
 
         for track in &tracks {
             if track.kind == MediaKind::Video && video_track_info.is_none() {
@@ -337,42 +339,35 @@ impl WebRtcManager {
                 };
 
                 video_track_info = Some((video_track, rx, video_ssrc, is_hevc, is_high, param_set_packet_payload, default_pt));
-            } else if track.kind == MediaKind::Audio && audio_track_info.is_none() {
-                let name = track.codec.name.to_uppercase();
-                let is_aac = name.contains("AAC") || name.contains("MP4A") || name.contains("MPEG4-GENERIC");
-                let (audio_codec, default_pt) = if is_aac || name.contains("OPUS") {
-                    (opus_codec.clone(), 111)
-                } else if name.contains("PCMU") {
-                    (pcmu_codec.clone(), 0)
-                } else {
-                    (pcma_codec.clone(), 8)
-                };
+            }
+        }
 
-                let audio_ssrc = crate::core::generate_id();
-                let audio_track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
-                    format!("stream-{}", stream.name),
-                    format!("audio-track-{}", stream.name),
-                    "audio".to_string(),
-                    RtpCodecKind::Audio,
-                    vec![RTCRtpEncodingParameters {
-                        rtp_coding_parameters: RTCRtpCodingParameters {
-                            ssrc: Some(audio_ssrc),
-                            ..Default::default()
-                        },
-                        codec: audio_codec,
+        // Add shared Opus audio track if audio is available (native or in-process transcoded)
+        if let Some(opus_track) = stream.get_or_create_opus_track().await {
+            let audio_ssrc = crate::core::generate_id();
+            let audio_track = Arc::new(TrackLocalStaticRTP::new(MediaStreamTrack::new(
+                format!("stream-{}", stream.name),
+                format!("audio-track-{}", stream.name),
+                "audio".to_string(),
+                RtpCodecKind::Audio,
+                vec![RTCRtpEncodingParameters {
+                    rtp_coding_parameters: RTCRtpCodingParameters {
+                        ssrc: Some(audio_ssrc),
                         ..Default::default()
-                    }],
-                )));
+                    },
+                    codec: opus_codec.clone(),
+                    ..Default::default()
+                }],
+            )));
 
-                if let Err(e) = peer_connection
-                    .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
-                    .await
-                {
-                    tracing::warn!("Failed to add audio track: {}", e);
-                } else {
-                    let rx = track.subscribe();
-                    audio_track_info = Some((audio_track, rx, audio_ssrc, default_pt, is_aac));
-                }
+            if let Err(e) = peer_connection
+                .add_track(Arc::clone(&audio_track) as Arc<dyn TrackLocal>)
+                .await
+            {
+                tracing::warn!("Failed to add audio track: {}", e);
+            } else {
+                let rx = opus_track.subscribe();
+                audio_track_info = Some((audio_track, rx, audio_ssrc, 111));
             }
         }
 
@@ -502,115 +497,39 @@ impl WebRtcManager {
             });
         }
 
-        // Spawn audio RTP forwarder if audio track was negotiated
-        if let Some((atrack, mut rx, audio_ssrc, default_pt, is_aac)) = audio_track_info {
+        // Spawn native in-process audio RTP forwarder if audio track was negotiated
+        if let Some((atrack, mut rx, audio_ssrc, default_pt)) = audio_track_info {
             if is_audio_active(&local_desc.sdp) {
                 let actual_audio_pt = find_negotiated_audio_pt(&local_desc.sdp, default_pt);
-                tracing::info!(stream = %stream.name, pt = actual_audio_pt, is_aac = is_aac, "Starting WebRTC audio forwarder");
+                tracing::info!(stream = %stream.name, pt = actual_audio_pt, "Starting native in-process WebRTC audio forwarder");
 
-                if is_aac {
-                    let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", self.rtsp_port, stream.name);
-                    let ffmpeg_bin = self.ffmpeg_bin.clone();
-                    let mut close_rx = session_close_tx.subscribe();
-
-                    tokio::spawn(async move {
-                        let udp_sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!("Failed to bind UDP socket for Opus transcode: {}", e);
-                                return;
-                            }
-                        };
-                        let local_port = match udp_sock.local_addr() {
-                            Ok(addr) => addr.port(),
-                            Err(e) => {
-                                tracing::error!("Failed to get local port: {}", e);
-                                return;
-                            }
-                        };
-
-                        let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
-                        cmd.kill_on_drop(true);
-                        cmd.args([
-                            "-hide_banner",
-                            "-loglevel", "warning",
-                            "-fflags", "nobuffer",
-                            "-flags", "low_delay",
-                            "-rtsp_transport", "tcp",
-                            "-i", &rtsp_url,
-                            "-vn",
-                            "-c:a", "libopus",
-                            "-application", "lowdelay",
-                            "-ar", "48000",
-                            "-ac", "2",
-                            "-b:a", "48k",
-                            "-payload_type", "111",
-                            "-f", "rtp",
-                            &format!("rtp://127.0.0.1:{}", local_port),
-                        ]);
-                        cmd.stdout(std::process::Stdio::null());
-                        cmd.stderr(std::process::Stdio::null());
-
-                        let mut child = match cmd.spawn() {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::error!("Failed to spawn FFmpeg Opus transcoder for WebRTC {}: {}", rtsp_url, e);
-                                return;
-                            }
-                        };
-
-                        let mut buf = [0u8; 2048];
-                        loop {
-                            let n = tokio::select! {
-                                _ = close_rx.recv() => break,
-                                res = udp_sock.recv_from(&mut buf) => match res {
-                                    Ok((n, _)) => n,
-                                    Err(_) => break,
+                let mut close_rx = session_close_tx.subscribe();
+                tokio::spawn(async move {
+                    let mut seq: u16 = 0;
+                    loop {
+                        let packet = tokio::select! {
+                            _ = close_rx.recv() => break,
+                            res = rx.recv() => match res {
+                                Ok(pkt) => pkt,
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                    tracing::warn!("WebRTC audio receiver lagged by {} packets", n);
+                                    continue;
                                 }
-                            };
-
-                            let mut bytes = BytesMut::from(&buf[..n]);
-                            if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
-                                rtp_pkt.header.ssrc = audio_ssrc;
-                                rtp_pkt.header.payload_type = actual_audio_pt;
-
-                                if atrack.write_rtp(rtp_pkt).await.is_err() {
-                                    break;
-                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
+                        };
+
+                        let mut bytes = BytesMut::from(&packet.raw[..]);
+                        if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
+                            rtp_pkt.header.ssrc = audio_ssrc;
+                            rtp_pkt.header.payload_type = actual_audio_pt;
+                            rtp_pkt.header.sequence_number = seq;
+                            seq = seq.wrapping_add(1);
+
+                            let _ = atrack.write_rtp(rtp_pkt).await;
                         }
-
-                        let _ = child.kill().await;
-                    });
-                } else {
-                    let mut close_rx = session_close_tx.subscribe();
-                    tokio::spawn(async move {
-                        let mut seq: u16 = 0;
-                        loop {
-                            let packet = tokio::select! {
-                                _ = close_rx.recv() => break,
-                                res = rx.recv() => match res {
-                                    Ok(pkt) => pkt,
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        tracing::warn!("WebRTC audio receiver lagged by {} packets", n);
-                                        continue;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                }
-                            };
-
-                            let mut bytes = BytesMut::from(&packet.raw[..]);
-                            if let Ok(mut rtp_pkt) = rtp::packet::Packet::unmarshal(&mut bytes) {
-                                rtp_pkt.header.ssrc = audio_ssrc;
-                                rtp_pkt.header.payload_type = actual_audio_pt;
-                                rtp_pkt.header.sequence_number = seq;
-                                seq = seq.wrapping_add(1);
-
-                                let _ = atrack.write_rtp(rtp_pkt).await;
-                            }
-                        }
-                    });
-                }
+                    }
+                });
             } else {
                 tracing::debug!(stream = %stream.name, "Audio was rejected by client in SDP answer");
             }

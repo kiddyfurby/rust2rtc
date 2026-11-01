@@ -38,3 +38,8 @@ base64 = "0.22"
 webrtc = "0.21.1"
 rtc = "0.21.1"
 uuid = { version = "1.28.0", features = ["v4"] }
+
+# Audio Codecs & Transcoding (Pure Rust)
+symphonia-core = "0.6.1"
+symphonia-codec-aac = "0.6.1"
+opus-pure = "0.2.2"

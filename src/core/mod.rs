@@ -183,6 +183,35 @@ impl RtpPacket {
     pub fn payload(&self) -> &[u8] {
         &self.raw[self.payload_offset..self.payload_offset + self.payload_len]
     }
+
+    /// Construct a valid RFC 3550 RTP packet
+    pub fn create(payload_type: u8, sequence_number: u16, timestamp: u32, ssrc: u32, marker: bool, payload: &[u8]) -> Self {
+        let mut raw = Vec::with_capacity(12 + payload.len());
+        // Byte 0: V=2, P=0, X=0, CC=0
+        raw.push(0x80);
+        // Byte 1: Marker bit + 7-bit payload type
+        raw.push(if marker { 0x80 | (payload_type & 0x7f) } else { payload_type & 0x7f });
+        // Bytes 2..4: Sequence number
+        raw.extend_from_slice(&sequence_number.to_be_bytes());
+        // Bytes 4..8: Timestamp
+        raw.extend_from_slice(&timestamp.to_be_bytes());
+        // Bytes 8..12: SSRC
+        raw.extend_from_slice(&ssrc.to_be_bytes());
+        // Payload
+        raw.extend_from_slice(payload);
+
+        let raw_bytes = Bytes::from(raw);
+        Self {
+            payload_type,
+            sequence_number,
+            timestamp,
+            ssrc,
+            marker,
+            raw: raw_bytes,
+            payload_offset: 12,
+            payload_len: payload.len(),
+        }
+    }
 }
 
 /// Track broadcaster holding a multi-consumer channel

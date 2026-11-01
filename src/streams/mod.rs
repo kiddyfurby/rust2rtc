@@ -25,6 +25,7 @@ pub struct Stream {
     pub bytes_recv: AtomicU64,
     pub packets_recv: AtomicU64,
     pub backchannel: Mutex<Option<Arc<crate::backchannel::BackchannelSession>>>,
+    pub opus_track: Mutex<Option<Arc<Track>>>,
 }
 
 impl Stream {
@@ -37,6 +38,7 @@ impl Stream {
             bytes_recv: AtomicU64::new(0),
             packets_recv: AtomicU64::new(0),
             backchannel: Mutex::new(None),
+            opus_track: Mutex::new(None),
         }
     }
 
@@ -84,11 +86,86 @@ impl Stream {
     pub async fn clear_tracks(&self) {
         let mut tracks = self.tracks.write().await;
         tracks.clear();
+        let mut opus = self.opus_track.lock().await;
+        *opus = None;
     }
 
     pub async fn get_tracks(&self) -> Vec<Arc<Track>> {
         let tracks = self.tracks.read().await;
         tracks.clone()
+    }
+
+    /// Get or dynamically spawn a shared in-process Opus transcoding track
+    pub async fn get_or_create_opus_track(&self) -> Option<Arc<Track>> {
+        // 1. If this stream already has a native OPUS track, return it directly
+        let tracks = self.tracks.read().await;
+        for t in tracks.iter() {
+            if t.kind == MediaKind::Audio && t.codec.name.eq_ignore_ascii_case("OPUS") {
+                return Some(Arc::clone(t));
+            }
+        }
+
+        // 2. Check if a shared transcoded Opus track is already active
+        let mut guard = self.opus_track.lock().await;
+        if let Some(track) = &*guard {
+            return Some(Arc::clone(track));
+        }
+
+        // 3. Find an audio track (AAC, PCMU, PCMA) to transcode from
+        let source_audio_track = tracks.iter().find(|t| t.kind == MediaKind::Audio)?.clone();
+        drop(tracks);
+
+        // 4. Create shared Opus track
+        let opus_track = Arc::new(Track::new(crate::core::Codec::new_opus(), MediaKind::Audio, 50));
+        *guard = Some(Arc::clone(&opus_track));
+
+        // 5. Spawn background in-process audio transcode worker
+        let stream_name = self.name.clone();
+        let track_for_worker = Arc::clone(&opus_track);
+        tokio::spawn(async move {
+            info!(stream = %stream_name, codec = %source_audio_track.codec.name, "Starting shared in-process Opus audio transcode worker");
+            let mut transcoder = match crate::audio::AudioTranscoder::new(&source_audio_track.codec) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(stream = %stream_name, "Failed to initialize AudioTranscoder: {}", e);
+                    return;
+                }
+            };
+
+            let mut rx = source_audio_track.subscribe();
+            let mut idle_ticks = 0;
+
+            loop {
+                // If no viewers are listening to this Opus track for ~10 seconds, shut down worker to save resources
+                if track_for_worker.consumer_count() == 0 {
+                    idle_ticks += 1;
+                    if idle_ticks > 500 { // ~10 seconds with 20ms audio packets
+                        info!(stream = %stream_name, "No active consumers on shared Opus track, terminating transcode worker");
+                        break;
+                    }
+                } else {
+                    idle_ticks = 0;
+                }
+
+                match rx.recv().await {
+                    Ok(packet) => {
+                        let opus_packets = transcoder.process_packet(&packet);
+                        for opus_pkt in opus_packets {
+                            track_for_worker.send(opus_pkt);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(stream = %stream_name, lagged = n, "Audio transcoder lagged");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Some(opus_track)
     }
 
     /// Ensure that a producer is actively running for this stream
