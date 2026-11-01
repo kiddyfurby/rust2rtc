@@ -810,9 +810,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
 
                         cmd.args([
                             "-f", "mp4",
-                            "-movflags", "empty_moov+default_base_moof+frag_every_frame",
+                            "-movflags", "empty_moov+default_base_moof+frag_keyframe",
                             "-flush_packets", "1",
-                            "-reset_timestamps", "1",
                             "pipe:1",
                         ]);
                         cmd.stdout(std::process::Stdio::piped());
