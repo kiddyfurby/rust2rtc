@@ -23,9 +23,25 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Parser, Debug)]
 #[command(author, version, about = "rust2rtc - high performance streaming gateway in Rust", long_about = None)]
 struct Args {
-    /// Path to config file (default: rust2rtc.yaml or go2rtc.yaml)
-    #[arg(short, long)]
-    config: Option<PathBuf>,
+    /// Path to config file(s) (can be specified multiple times)
+    #[arg(short = 'c', long = "config", action = clap::ArgAction::Append)]
+    config: Vec<PathBuf>,
+}
+
+fn normalize_args() -> Vec<String> {
+    std::env::args()
+        .map(|arg| {
+            if let Some(val) = arg.strip_prefix("-config=") {
+                format!("--config={}", val)
+            } else if arg == "-config" {
+                "--config".to_string()
+            } else if let Some(val) = arg.strip_prefix("-c=") {
+                format!("-c={}", val)
+            } else {
+                arg
+            }
+        })
+        .collect()
 }
 
 #[tokio::main]
@@ -38,26 +54,42 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let args = Args::parse();
+    let normalized = normalize_args();
+    let args = Args::parse_from(normalized);
 
-    // Find config file
-    let config_path = args.config.unwrap_or_else(|| {
-        if std::path::Path::new("rust2rtc.yaml").exists() {
-            PathBuf::from("rust2rtc.yaml")
-        } else if std::path::Path::new("go2rtc.yaml").exists() {
-            PathBuf::from("go2rtc.yaml")
-        } else {
-            PathBuf::from("rust2rtc.yaml")
-        }
-    });
-
-    let config = if config_path.exists() {
-        info!("Loading configuration from {:?}", config_path);
-        Config::load_from_file(&config_path)?
+    // Collect all config paths
+    let config_paths: Vec<PathBuf> = if !args.config.is_empty() {
+        args.config
+    } else if std::path::Path::new("rust2rtc.yaml").exists() {
+        vec![PathBuf::from("rust2rtc.yaml")]
+    } else if std::path::Path::new("go2rtc.yaml").exists() {
+        vec![PathBuf::from("go2rtc.yaml")]
     } else {
-        info!("No configuration file found at {:?}, using defaults", config_path);
-        Config::default()
+        vec![PathBuf::from("rust2rtc.yaml")]
     };
+
+    let mut config = Config::default();
+    let mut loaded_any = false;
+    for path in &config_paths {
+        if path.exists() {
+            info!("Loading configuration from {:?}", path);
+            match Config::load_from_file(path) {
+                Ok(loaded) => {
+                    config.merge(loaded);
+                    loaded_any = true;
+                }
+                Err(e) => {
+                    error!("Failed to load config file {:?}: {}", path, e);
+                }
+            }
+        } else {
+            info!("Config file {:?} does not exist, skipping", path);
+        }
+    }
+
+    if !loaded_any {
+        info!("No configuration files loaded, using default config");
+    }
 
     let ffmpeg_manager = Arc::new(FfmpegManager::new(
         config.ffmpeg.bin.clone(),
