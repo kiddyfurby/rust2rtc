@@ -12,11 +12,15 @@
 ## 🌟 Key Features
 
 - **⚡ Zero-Cost Asynchronous Architecture**: Built on Tokio with multi-producer, multi-consumer lock-free broadcast pipelines.
-- **🌐 Real-Time WebRTC Streaming**:
+- **🌐 Real-Time WebRTC Streaming & go2rtc Compatibility**:
   - Low-latency browser playback via standard WHEP (`/api/webrtc`).
+  - **`go2rtc` WebSocket Signaling (`/api/ws?src=<stream>`)**: Native drop-in signaling compatibility for **`advanced-camera-card`**, **Frigate**, and Home Assistant WebRTC cards supporting `webrtc/offer`, `webrtc/answer`, and trickle ICE.
   - Automatic codec negotiation supporting **H.264** (Baseline, Constrained Baseline, High Profile) and **H.265 / HEVC** (in supported browsers like Safari).
   - Audio passthrough for Opus, PCMA (G.711a), and PCMU (G.711u).
   - In-band parameter sets (SPS / PPS / VPS) caching and keyframe injection.
+- **🔄 go2rtc-Compatible REST API**:
+  - `GET /api/streams` returning standard go2rtc `{ "stream": { "producers": [...], "consumers": [...] } }` schema.
+  - Dynamic stream management via `PUT / POST / DELETE /api/streams` for Home Assistant and Frigate automated provisioning.
 - **📹 RTSP Gateway**:
   - Built-in RTSP server on port `:8554` supporting TCP interleaved media transport.
   - Native RTSP relay from IP cameras, NVRs, and video encoders.
@@ -85,6 +89,8 @@ The following features have been implemented and verified in live testing:
 | :--- | :---: | :---: | :---: |
 | **RTSP Server & Client (TCP)** | ✅ | ✅ | Working |
 | **WebRTC Gateway (WHEP)** | ✅ | ✅ | Working (H.264 & H.265) |
+| **go2rtc WS Signaling (`/api/ws`)** | ✅ | ✅ | Working (`advanced-camera-card` / Frigate) |
+| **go2rtc Streams API (`/api/streams`)** | ✅ | ✅ | Working (GET/PUT/POST/DELETE) |
 | **External FFmpeg Remux / Transcode** | ✅ | ✅ | Working |
 | **JPEG Snapshots API** | ✅ | ✅ | Working (H.264 & H.265) |
 | **SIP Gateway & Intercom** | ⚠️ | ✅ | Working (Audio, H.264 & RFC 2435 JPEG) |
@@ -183,10 +189,27 @@ Run `rust2rtc`:
 ```
 
 - **Web Dashboard**: Open [http://localhost:1984](http://localhost:1984) in your browser.
+- **WebSocket Signaling**: `ws://localhost:1984/api/ws?src=<stream_name>` (WebRTC offer/answer/candidate)
 - **Snapshot API**: `GET http://localhost:1984/api/frame.jpeg?src=<stream_name>`
 - **WebRTC WHEP**: `POST http://localhost:1984/api/webrtc?src=<stream_name>` (Body: Offer SDP, returns Answer SDP)
-- **Streams API**: `GET http://localhost:1984/api/streams`
+- **Streams API**: `GET / PUT / DELETE http://localhost:1984/api/streams`
 - **RTSP Relay**: `rtsp://localhost:8554/<stream_name>`
+
+### 🏠 Home Assistant & Advanced Camera Card Setup
+
+`rust2rtc` functions as a drop-in replacement for `go2rtc` with [advanced-camera-card](https://card.camera/):
+
+```yaml
+type: custom:advanced-camera-card
+cameras:
+  - camera_entity: camera.doorbell
+    live_provider: go2rtc
+    go2rtc:
+      url: http://192.168.1.4:1984   # Your rust2rtc IP and port
+      stream: doorbell               # Stream name in rust2rtc.yaml
+```
+
+Works automatically using native WebRTC WebSocket signaling (`/api/ws`) and instant JPEG snapshot preview (`/api/frame.jpeg`).
 
 ---
 
