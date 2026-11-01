@@ -577,6 +577,290 @@ impl H264RtpDepacketizer {
     }
 }
 
+/// Generate ISO BMFF Initialization Segment (`ftyp` + `moov`) for H.265 / HEVC (`hvc1` + `hvcC`)
+pub fn make_h265_init_segment(
+    vps: &[u8],
+    sps: &[u8],
+    pps: &[u8],
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let mut writer = BoxWriter::with_capacity(1024);
+
+    // 1. 'ftyp' box
+    let mut ftyp = Vec::with_capacity(16);
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(&0x00000200u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isomiso6mp41");
+    writer.write_box(b"ftyp", &ftyp);
+
+    // 2. 'moov' box
+    let moov_pos = writer.start_box(b"moov");
+
+    let unity_matrix: [u32; 9] = [
+        0x00010000, 0, 0,
+        0, 0x00010000, 0,
+        0, 0, 0x40000000,
+    ];
+
+    let mut mvhd = Vec::with_capacity(96);
+    mvhd.extend_from_slice(&0u32.to_be_bytes());
+    mvhd.extend_from_slice(&0u32.to_be_bytes());
+    mvhd.extend_from_slice(&90000u32.to_be_bytes());
+    mvhd.extend_from_slice(&0u32.to_be_bytes());
+    mvhd.extend_from_slice(&0x00010000u32.to_be_bytes());
+    mvhd.extend_from_slice(&0x0100u16.to_be_bytes());
+    mvhd.extend_from_slice(&[0u8; 10]);
+    for val in unity_matrix {
+        mvhd.extend_from_slice(&val.to_be_bytes());
+    }
+    mvhd.extend_from_slice(&[0u8; 24]);
+    mvhd.extend_from_slice(&2u32.to_be_bytes());
+    writer.write_full_box(b"mvhd", 0, 0, &mvhd);
+
+    let trak_pos = writer.start_box(b"trak");
+
+    let mut tkhd = Vec::with_capacity(80);
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&1u32.to_be_bytes());
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&[0u8; 8]);
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    for val in unity_matrix {
+        tkhd.extend_from_slice(&val.to_be_bytes());
+    }
+    tkhd.extend_from_slice(&(width << 16).to_be_bytes());
+    tkhd.extend_from_slice(&(height << 16).to_be_bytes());
+    writer.write_full_box(b"tkhd", 0, 0x07, &tkhd);
+
+    let mdia_pos = writer.start_box(b"mdia");
+
+    let mut mdhd = Vec::with_capacity(20);
+    mdhd.extend_from_slice(&0u32.to_be_bytes());
+    mdhd.extend_from_slice(&0u32.to_be_bytes());
+    mdhd.extend_from_slice(&90000u32.to_be_bytes());
+    mdhd.extend_from_slice(&0u32.to_be_bytes());
+    mdhd.extend_from_slice(&0x55C4u16.to_be_bytes());
+    mdhd.extend_from_slice(&0u16.to_be_bytes());
+    writer.write_full_box(b"mdhd", 0, 0, &mdhd);
+
+    let mut hdlr = Vec::with_capacity(32);
+    hdlr.extend_from_slice(&0u32.to_be_bytes());
+    hdlr.extend_from_slice(b"vide");
+    hdlr.extend_from_slice(&[0u8; 12]);
+    hdlr.extend_from_slice(b"VideoHandler\0");
+    writer.write_full_box(b"hdlr", 0, 0, &hdlr);
+
+    let minf_pos = writer.start_box(b"minf");
+    writer.write_full_box(b"vmhd", 0, 1, &[0u8; 8]);
+
+    let dinf_pos = writer.start_box(b"dinf");
+    let mut dref = Vec::with_capacity(20);
+    dref.extend_from_slice(&1u32.to_be_bytes());
+    dref.extend_from_slice(&12u32.to_be_bytes());
+    dref.extend_from_slice(b"url ");
+    dref.extend_from_slice(&[0, 0, 0, 1]);
+    writer.write_full_box(b"dref", 0, 0, &dref);
+    writer.end_box(dinf_pos);
+
+    let stbl_pos = writer.start_box(b"stbl");
+
+    let stsd_pos = writer.start_box(b"stsd");
+    writer.buf.extend_from_slice(&[0, 0, 0, 0]);
+    writer.buf.extend_from_slice(&1u32.to_be_bytes());
+
+    // 'hvc1' box
+    let hvc1_pos = writer.start_box(b"hvc1");
+    let mut hvc1_hdr = Vec::with_capacity(70);
+    hvc1_hdr.extend_from_slice(&[0u8; 6]);
+    hvc1_hdr.extend_from_slice(&1u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&[0u8; 12]);
+    hvc1_hdr.extend_from_slice(&(width as u16).to_be_bytes());
+    hvc1_hdr.extend_from_slice(&(height as u16).to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0x00480000u32.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0x00480000u32.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0u32.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&1u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&[0u8; 32]);
+    hvc1_hdr.extend_from_slice(&0x0018u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&(-1i16).to_be_bytes());
+    writer.buf.extend_from_slice(&hvc1_hdr);
+
+    // 'hvcC' box (HEVCDecoderConfigurationRecord, ISO/IEC 14496-15)
+    let mut hvcc = vec![0u8; 23];
+    hvcc[0] = 1; // configurationVersion = 1
+    if sps.len() >= 15 {
+        hvcc[1..13].copy_from_slice(&sps[3..15]);
+    } else if sps.len() >= 6 {
+        hvcc[1..4].copy_from_slice(&sps[3..6]);
+        hvcc[12] = 153; // level 5.1 default
+    } else {
+        hvcc[1] = 0x01; // Main profile
+        hvcc[2] = 0x60;
+        hvcc[12] = 153;
+    }
+    hvcc[13] = 0xF0;
+    hvcc[15] = 0xFC;
+    hvcc[16] = 0xFD; // chromaFormat = 1 (4:2:0)
+    hvcc[17] = 0xF8; // 8-bit luma
+    hvcc[18] = 0xF8; // 8-bit chroma
+    hvcc[21] = 0x03; // lengthSizeMinusOne = 3 (4-byte length prefix)
+    hvcc[22] = 0x03; // numOfArrays = 3 (VPS, SPS, PPS)
+
+    for (nal_type, nalu) in [(32u8, vps), (33u8, sps), (34u8, pps)] {
+        hvcc.push(0x80 | (nal_type & 0x3F));
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&(nalu.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(nalu);
+    }
+    writer.write_box(b"hvcC", &hvcc);
+
+    writer.end_box(hvc1_pos);
+    writer.end_box(stsd_pos);
+
+    writer.write_full_box(b"stts", 0, 0, &[0u8; 4]);
+    writer.write_full_box(b"stsc", 0, 0, &[0u8; 4]);
+    writer.write_full_box(b"stsz", 0, 0, &[0u8; 8]);
+    writer.write_full_box(b"stco", 0, 0, &[0u8; 4]);
+
+    writer.end_box(stbl_pos);
+    writer.end_box(minf_pos);
+    writer.end_box(mdia_pos);
+    writer.end_box(trak_pos);
+
+    let mvex_pos = writer.start_box(b"mvex");
+    let mut trex = Vec::with_capacity(24);
+    trex.extend_from_slice(&1u32.to_be_bytes());
+    trex.extend_from_slice(&1u32.to_be_bytes());
+    trex.extend_from_slice(&3000u32.to_be_bytes());
+    trex.extend_from_slice(&0u32.to_be_bytes());
+    trex.extend_from_slice(&0u32.to_be_bytes());
+    writer.write_full_box(b"trex", 0, 0, &trex);
+    writer.end_box(mvex_pos);
+
+    writer.end_box(moov_pos);
+
+    writer.buf
+}
+
+/// H.265 RTP Depacketizer: reconstructs complete NALUs from single NAL, AP (48), and FU (49) RTP packets
+pub struct H265RtpDepacketizer {
+    fu_buffer: Vec<u8>,
+    current_frame: Vec<Vec<u8>>,
+    last_timestamp: Option<u32>,
+    pub vps: Option<Vec<u8>>,
+    pub sps: Option<Vec<u8>>,
+    pub pps: Option<Vec<u8>>,
+}
+
+impl H265RtpDepacketizer {
+    pub fn new() -> Self {
+        Self {
+            fu_buffer: Vec::with_capacity(65536),
+            current_frame: Vec::new(),
+            last_timestamp: None,
+            vps: None,
+            sps: None,
+            pps: None,
+        }
+    }
+
+    fn cache_param_set(&mut self, nalu: &[u8]) {
+        if nalu.len() >= 2 {
+            let nal_type = (nalu[0] >> 1) & 0x3F;
+            match nal_type {
+                32 => self.vps = Some(nalu.to_vec()),
+                33 => self.sps = Some(nalu.to_vec()),
+                34 => self.pps = Some(nalu.to_vec()),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<Vec<u8>>)> {
+        let payload = packet.payload();
+        if payload.len() < 2 {
+            return None;
+        }
+
+        let mut completed_frame = None;
+
+        if let Some(last_ts) = self.last_timestamp {
+            if last_ts != packet.timestamp && !self.current_frame.is_empty() {
+                let is_keyframe = self.current_frame.iter().any(|n| {
+                    !n.is_empty() && (19..=21).contains(&((n[0] >> 1) & 0x3F))
+                });
+                let nalus = std::mem::take(&mut self.current_frame);
+                completed_frame = Some((is_keyframe, last_ts, nalus));
+            }
+        }
+        self.last_timestamp = Some(packet.timestamp);
+
+        let nal_type = (payload[0] >> 1) & 0x3F;
+
+        if nal_type < 48 {
+            self.cache_param_set(payload);
+            self.current_frame.push(payload.to_vec());
+        } else if nal_type == 48 {
+            // Aggregation Packet (AP)
+            let mut offset = 2;
+            while offset + 2 <= payload.len() {
+                let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if size > 0 && offset + size <= payload.len() {
+                    let nalu = payload[offset..offset + size].to_vec();
+                    self.cache_param_set(&nalu);
+                    self.current_frame.push(nalu);
+                    offset += size;
+                } else {
+                    break;
+                }
+            }
+        } else if nal_type == 49 && payload.len() >= 3 {
+            // Fragmentation Unit (FU)
+            let h0 = payload[0];
+            let h1 = payload[1];
+            let fu_header = payload[2];
+            let s_bit = (fu_header & 0x80) != 0;
+            let e_bit = (fu_header & 0x40) != 0;
+            let inner_type = fu_header & 0x3F;
+
+            if s_bit {
+                self.fu_buffer.clear();
+                let reconstructed_h0 = (h0 & 0x81) | (inner_type << 1);
+                self.fu_buffer.push(reconstructed_h0);
+                self.fu_buffer.push(h1);
+                self.fu_buffer.extend_from_slice(&payload[3..]);
+            } else if !self.fu_buffer.is_empty() {
+                self.fu_buffer.extend_from_slice(&payload[3..]);
+            }
+
+            if e_bit && !self.fu_buffer.is_empty() {
+                let complete_nalu = std::mem::take(&mut self.fu_buffer);
+                self.cache_param_set(&complete_nalu);
+                self.current_frame.push(complete_nalu);
+            }
+        }
+
+        if packet.marker && !self.current_frame.is_empty() {
+            let is_keyframe = self.current_frame.iter().any(|n| {
+                !n.is_empty() && (19..=21).contains(&((n[0] >> 1) & 0x3F))
+            });
+            let nalus = std::mem::take(&mut self.current_frame);
+            completed_frame = Some((is_keyframe, packet.timestamp, nalus));
+        }
+
+        completed_frame
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
