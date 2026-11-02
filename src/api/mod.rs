@@ -641,7 +641,7 @@ async fn api_webrtc_handler(
 ) -> Response {
     if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        // Wait up to 5 seconds for producer to establish RTSP recording if starting
+        // Wait up to 5 seconds for producer to establish RTSP streaming if starting
         for _ in 0..50 {
             if !stream.get_tracks().await.is_empty() {
                 break;
@@ -649,7 +649,36 @@ async fn api_webrtc_handler(
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
 
-        match state.webrtc.handle_whep(stream, &body).await {
+        let offer_upper = body.to_uppercase();
+        let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
+        let stream_to_use = if !offer_has_hevc {
+            let is_hevc = stream.get_tracks().await.iter().any(|t| {
+                t.kind == crate::core::MediaKind::Video
+                    && (t.codec.name.to_uppercase().contains("265") || t.codec.name.to_uppercase().contains("HEVC"))
+            });
+            if is_hevc {
+                let sub_name = format!("{}_sub", query.src);
+                if let Some(sub_stream) = state.streams.get(&sub_name).await {
+                    let _ = sub_stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
+                    for _ in 0..50 {
+                        if !sub_stream.get_tracks().await.is_empty() {
+                            break;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                    info!(stream = %query.src, fallback = %sub_name, "Client does not support WebRTC H.265, seamlessly serving H.264 sub-stream");
+                    sub_stream
+                } else {
+                    stream
+                }
+            } else {
+                stream
+            }
+        } else {
+            stream
+        };
+
+        match state.webrtc.handle_whep(stream_to_use, &body).await {
             Ok((answer_sdp, _pc)) => (
                 StatusCode::CREATED,
                 [
@@ -751,7 +780,36 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     }
 
-                    match state.webrtc.handle_whep(stream, &offer_sdp).await {
+                    let offer_upper = offer_sdp.to_uppercase();
+                    let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
+                    let stream_to_use = if !offer_has_hevc {
+                        let is_hevc = stream.get_tracks().await.iter().any(|t| {
+                            t.kind == crate::core::MediaKind::Video
+                                && (t.codec.name.to_uppercase().contains("265") || t.codec.name.to_uppercase().contains("HEVC"))
+                        });
+                        if is_hevc {
+                            let sub_name = format!("{}_sub", src_name);
+                            if let Some(sub_stream) = state.streams.get(&sub_name).await {
+                                let _ = sub_stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
+                                for _ in 0..50 {
+                                    if !sub_stream.get_tracks().await.is_empty() {
+                                        break;
+                                    }
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                }
+                                info!(stream = %src_name, fallback = %sub_name, "Client does not support WebRTC H.265, seamlessly serving H.264 sub-stream");
+                                sub_stream
+                            } else {
+                                stream
+                            }
+                        } else {
+                            stream
+                        }
+                    } else {
+                        stream
+                    };
+
+                    match state.webrtc.handle_whep(stream_to_use, &offer_sdp).await {
                         Ok((answer_sdp, pc)) => {
                             active_pc = Some(pc);
                             let answer_msg = WsMessage {
@@ -861,7 +919,21 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     let video_track = stream.get_tracks().await.into_iter().find(|t| t.kind == crate::core::MediaKind::Video);
                     let use_native_fmp4 = copy_video && video_track.is_some();
 
-                    // Dynamically resolve H.264 profile-level-id from stream track (e.g., 640033 for 5MP doorbell vs 640029 for 1080p)
+                    // Dynamically resolve H.264 and H.265 profile/level parameters
+                    let (_h265_w, _h265_h, h265_level) = video_track
+                        .as_ref()
+                        .and_then(|t| t.codec.fmtp.as_deref())
+                        .and_then(|f| {
+                            if let Some((_, sps, _)) = crate::webrtc::extract_h265_vps_sps_pps(f) {
+                                Some(crate::mp4::parse_h265_sps(&sps))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or((2560, 1440, 150));
+
+                    let h265_codec_str = format!("hvc1.1.6.L{}.B0", h265_level);
+
                     let h264_profile_level = video_track
                         .as_ref()
                         .and_then(|t| t.codec.fmtp.as_deref())
@@ -885,16 +957,16 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
 
                     let mime = if use_native_fmp4 {
                         if has_h265 {
-                            "video/mp4; codecs=\"hvc1.1.6.L153.B0\"".to_string()
+                            format!("video/mp4; codecs=\"{}\"", h265_codec_str)
                         } else {
                             format!("video/mp4; codecs=\"{}\"", h264_avc1)
                         }
                     } else if has_h265 {
                         if client_codecs_str.contains("hvc1") {
                             if allow_audio {
-                                "video/mp4; codecs=\"hvc1.1.6.L153.B0,mp4a.40.2\"".to_string()
+                                format!("video/mp4; codecs=\"{},mp4a.40.2\"", h265_codec_str)
                             } else {
-                                "video/mp4; codecs=\"hvc1.1.6.L153.B0\"".to_string()
+                                format!("video/mp4; codecs=\"{}\"", h265_codec_str)
                             }
                         } else {
                             if allow_audio {
@@ -966,7 +1038,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                                 continue;
                                             }
                                             if let (Some(vps), Some(sps), Some(pps)) = (&depacketizer.vps, &depacketizer.sps, &depacketizer.pps) {
-                                                let init_seg = crate::mp4::make_h265_init_segment(vps, sps, pps, 2560, 1440);
+                                                let (w, h, _) = crate::mp4::parse_h265_sps(sps);
+                                                let init_seg = crate::mp4::make_h265_init_segment(vps, sps, pps, w, h);
                                                 if tx_mse.send(Message::Binary(init_seg.into())).await.is_err() {
                                                     break;
                                                 }
