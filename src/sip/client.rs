@@ -169,6 +169,33 @@ impl SipCameraAccount {
         if self.is_stopping.load(Ordering::Relaxed) {
             return Ok(());
         }
+
+        // If Home Assistant auto-provisioning is enabled and this is initial registration,
+        // sync credentials and friendly display_name into Home Assistant voip_stack
+        if !self.registered.load(Ordering::Relaxed) {
+            if let Some(ha) = &self.config.ha_client {
+                let current_ext = self.current_extension.lock().await.clone();
+                let reg_user = if !self.config.auth_user.is_empty() {
+                    self.config.auth_user.clone()
+                } else {
+                    current_ext.clone()
+                };
+                let mut used = self.used_extensions.lock().await;
+                if let Ok(provisioned_ext) = ha
+                    .provision_account(
+                        &reg_user,
+                        &self.config.password,
+                        &current_ext,
+                        Some(&self.config.display_name),
+                        &mut used,
+                    )
+                    .await
+                {
+                    *self.current_extension.lock().await = provisioned_ext;
+                }
+            }
+        }
+
         match self.register_request(300).await {
             Ok(()) => {
                 self.registered.store(true, Ordering::Relaxed);
@@ -196,6 +223,7 @@ impl SipCameraAccount {
                                 &reg_user,
                                 &self.config.password,
                                 &current_ext,
+                                Some(&self.config.display_name),
                                 &mut used,
                             )
                             .await?
