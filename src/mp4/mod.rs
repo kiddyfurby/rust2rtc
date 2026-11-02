@@ -265,7 +265,7 @@ pub fn make_h264_media_segment(
     writer.write_full_box(b"tfdt", 1, 0, &tfdt);
 
     // 'trun' box (Track Fragment Run)
-    // Flags: 0x000F01
+    // Flags: 0x000701
     // 0x000001: data-offset-present
     // 0x000100: sample-duration-present
     // 0x000200: sample-size-present
@@ -284,7 +284,7 @@ pub fn make_h264_media_segment(
     trun.extend_from_slice(&sample_flags.to_be_bytes()); // sample_flags
 
     // We write trun and traf, then fix up data_offset = moof_size + 8 (mdat header)
-    writer.write_full_box(b"trun", 0, 0x000F01, &trun);
+    writer.write_full_box(b"trun", 0, 0x000701, &trun);
     writer.end_box(traf_pos);
     writer.end_box(moof_pos);
 
@@ -1002,5 +1002,9 @@ mod tests {
         assert!(seg.len() > 50);
         assert_eq!(&seg[4..8], b"moof");
         assert!(find_subsequence(&seg, b"mdat").is_some());
+
+        // Verify trun flags: version 0, flags 0x000701 (0x00, 0x07, 0x01)
+        let trun_idx = find_subsequence(&seg, b"trun").expect("trun box must exist");
+        assert_eq!(&seg[trun_idx + 4..trun_idx + 8], &[0x00, 0x00, 0x07, 0x01]);
     }
 }
