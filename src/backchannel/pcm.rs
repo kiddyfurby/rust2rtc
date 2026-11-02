@@ -50,6 +50,99 @@ pub fn ulaw_to_alaw(val: u8) -> u8 {
     ULAW_TO_ALAW[val as usize]
 }
 
+pub fn alaw_to_s16(a: u8) -> i16 {
+    let a = a ^ 0x55;
+    let sign = (a & 0x80) != 0;
+    let exponent = ((a >> 4) & 0x07) as usize;
+    let mantissa = (a & 0x0f) as i16;
+    let sample = if exponent == 0 {
+        (mantissa << 4) + 8
+    } else {
+        (mantissa + 16) << (exponent + 3)
+    };
+    if sign { sample } else { -sample }
+}
+
+pub fn ulaw_to_s16(u: u8) -> i16 {
+    let u = !u;
+    let sign = (u & 0x80) != 0;
+    let exponent = ((u >> 4) & 0x07) as usize;
+    let mantissa = (u & 0x0f) as i16;
+    let mut sample = ((mantissa << 3) + 0x84) << exponent;
+    sample -= 0x84;
+    if sign { -sample } else { sample }
+}
+
+pub fn s16_to_ulaw(mut pcm: i16) -> u8 {
+    let sign = if pcm < 0 {
+        pcm = -pcm;
+        0x80
+    } else {
+        0
+    };
+    if pcm > 32635 {
+        pcm = 32635;
+    }
+    pcm += 0x84;
+    let mut exponent = 7;
+    let mut mask = 0x4000;
+    while (pcm & mask) == 0 && exponent > 0 {
+        exponent -= 1;
+        mask >>= 1;
+    }
+    let mantissa = (pcm >> (exponent + 3)) & 0x0f;
+    let ulaw = (sign | (exponent << 4) | mantissa) as u8;
+    !ulaw
+}
+
+pub fn s16_to_alaw(mut pcm: i16) -> u8 {
+    let sign = if pcm < 0 {
+        pcm = -pcm;
+        0
+    } else {
+        0x80
+    };
+    let (exponent, mantissa) = if pcm >= 256 {
+        let mut exp = 7;
+        let mut mask = 0x4000;
+        while (pcm & mask) == 0 && exp > 1 {
+            exp -= 1;
+            mask >>= 1;
+        }
+        (exp, (pcm >> (exp + 3)) & 0x0f)
+    } else {
+        (0, (pcm >> 4) & 0x0f)
+    };
+    let alaw = (sign | (exponent << 4) | mantissa) as u8;
+    alaw ^ 0x55
+}
+
+/// Convert 8kHz G.711 (PCMA or PCMU) to 16kHz L16 (signed 16-bit big-endian PCM)
+pub fn g711_8k_to_l16_16k(g711: &[u8], is_alaw: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(g711.len() * 4);
+    for &b in g711 {
+        let s = if is_alaw { alaw_to_s16(b) } else { ulaw_to_s16(b) };
+        let bytes = s.to_be_bytes();
+        // 8kHz -> 16kHz: duplicate sample twice
+        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+/// Convert 16kHz L16 (signed 16-bit big-endian PCM) to 8kHz G.711 (PCMA or PCMU)
+pub fn l16_16k_to_g711_8k(l16: &[u8], to_alaw: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(l16.len() / 4);
+    for chunk in l16.chunks_exact(4) {
+        let s1 = i16::from_be_bytes([chunk[0], chunk[1]]);
+        let s2 = i16::from_be_bytes([chunk[2], chunk[3]]);
+        let avg = ((s1 as i32 + s2 as i32) / 2) as i16;
+        let b = if to_alaw { s16_to_alaw(avg) } else { s16_to_ulaw(avg) };
+        out.push(b);
+    }
+    out
+}
+
 pub fn transcode_alaw_to_ulaw(data: &mut [u8]) {
     for b in data.iter_mut() {
         *b = ALAW_TO_ULAW[*b as usize];
@@ -67,6 +160,7 @@ pub fn transcode_ulaw_to_alaw(data: &mut [u8]) {
 /// with sequential sequence numbers and monotonically increasing timestamps.
 pub struct G711Repacker {
     packet_size: usize,
+    timestamp_step: u32,
     payload_type: u8,
     ssrc: u32,
     buffer: Vec<u8>,
@@ -75,12 +169,16 @@ pub struct G711Repacker {
 }
 
 impl G711Repacker {
-    /// Create a new repacker.
-    /// `packet_size`: Frame size in bytes (e.g. 1024 for Reolink, 160 for 20ms standard)
-    /// `payload_type`: 0 for PCMU, 8 for PCMA
+    /// Create a new repacker with default timestamp step equal to packet size
     pub fn new(packet_size: usize, payload_type: u8, ssrc: u32) -> Self {
+        Self::new_with_step(packet_size, packet_size as u32, payload_type, ssrc)
+    }
+
+    /// Create a new repacker with explicit timestamp step
+    pub fn new_with_step(packet_size: usize, timestamp_step: u32, payload_type: u8, ssrc: u32) -> Self {
         Self {
             packet_size,
+            timestamp_step,
             payload_type,
             ssrc,
             buffer: Vec::with_capacity(packet_size * 2),
@@ -112,7 +210,7 @@ impl G711Repacker {
             rtp_packet.extend_from_slice(&chunk);
 
             self.sequence_number = self.sequence_number.wrapping_add(1);
-            self.timestamp = self.timestamp.wrapping_add(self.packet_size as u32);
+            self.timestamp = self.timestamp.wrapping_add(self.timestamp_step);
 
             packets.push(rtp_packet.freeze());
         }

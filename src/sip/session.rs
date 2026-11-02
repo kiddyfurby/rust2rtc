@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
 use crate::backchannel::pcm::{
-    transcode_alaw_to_ulaw, transcode_ulaw_to_alaw, G711Repacker,
+    g711_8k_to_l16_16k, l16_16k_to_g711_8k, transcode_alaw_to_ulaw, transcode_ulaw_to_alaw,
+    G711Repacker,
 };
-use super::message::VideoCodecKind;
+use super::message::{AudioCodecKind, VideoCodecKind};
 use crate::core::{MediaKind, RtpPacket};
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::Stream;
@@ -38,21 +39,70 @@ impl SipCallSession {
         stream: Arc<Stream>,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
-        _local_bind_ip: &str,
+        local_bind_ip: &str,
         remote_audio_addr: SocketAddr,
         alt_audio_addr: Option<SocketAddr>,
+        audio_codec_kind: AudioCodecKind,
         negotiated_audio_pt: u8,
         remote_video_addr: Option<SocketAddr>,
         alt_video_addr: Option<SocketAddr>,
         negotiated_video_codec: VideoCodecKind,
         negotiated_video_pt: u8,
     ) -> Result<Self> {
-        // Bind local UDP socket on 0.0.0.0 so kernel routes across any interface/VLAN
         let audio_socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .context("Failed to bind local audio RTP socket")?;
-        let local_audio_port = audio_socket.local_addr()?.port();
         let audio_socket = Arc::new(audio_socket);
+
+        let video_socket = if remote_video_addr.is_some() {
+            let v_sock = UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("Failed to bind local video RTP socket")?;
+            Some(Arc::new(v_sock))
+        } else {
+            None
+        };
+
+        Self::start_with_sockets(
+            call_id,
+            stream,
+            rtsp_port,
+            ffmpeg,
+            local_bind_ip,
+            audio_socket,
+            video_socket,
+            remote_audio_addr,
+            alt_audio_addr,
+            audio_codec_kind,
+            negotiated_audio_pt,
+            remote_video_addr,
+            alt_video_addr,
+            negotiated_video_codec,
+            negotiated_video_pt,
+        )
+        .await
+    }
+
+    /// Start bidirectional RTP audio/video bridge using pre-bound sockets (e.g. for outbound calls)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_sockets(
+        call_id: String,
+        stream: Arc<Stream>,
+        rtsp_port: u16,
+        ffmpeg: Arc<FfmpegManager>,
+        _local_bind_ip: &str,
+        audio_socket: Arc<UdpSocket>,
+        video_socket: Option<Arc<UdpSocket>>,
+        remote_audio_addr: SocketAddr,
+        alt_audio_addr: Option<SocketAddr>,
+        audio_codec_kind: AudioCodecKind,
+        negotiated_audio_pt: u8,
+        remote_video_addr: Option<SocketAddr>,
+        alt_video_addr: Option<SocketAddr>,
+        negotiated_video_codec: VideoCodecKind,
+        negotiated_video_pt: u8,
+    ) -> Result<Self> {
+        let local_audio_port = audio_socket.local_addr()?.port();
 
         info!(
             call_id = %call_id,
@@ -60,6 +110,7 @@ impl SipCallSession {
             local_audio = local_audio_port,
             remote_audio = %remote_audio_addr,
             alt_audio = ?alt_audio_addr,
+            audio_codec = ?audio_codec_kind,
             audio_pt = negotiated_audio_pt,
             remote_video = ?remote_video_addr,
             alt_video = ?alt_video_addr,
@@ -113,9 +164,14 @@ impl SipCallSession {
                                 }
                                 locked_symmetric = true;
                             }
-                            let is_pcmu = rtp.payload_type == 0;
-                            let payload = Bytes::copy_from_slice(rtp.payload());
-                            let _ = stream_bc.send_backchannel_audio(payload, is_pcmu).await;
+                            let payload = rtp.payload();
+                            if audio_codec_kind == AudioCodecKind::L16_16k {
+                                let g711_bytes = l16_16k_to_g711_8k(payload, false);
+                                let _ = stream_bc.send_backchannel_audio(Bytes::from(g711_bytes), true).await;
+                            } else {
+                                let is_pcmu = rtp.payload_type == 0;
+                                let _ = stream_bc.send_backchannel_audio(Bytes::copy_from_slice(payload), is_pcmu).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -126,8 +182,8 @@ impl SipCallSession {
             }
         }));
 
-        // 2. Task: Subscribe to camera audio track and buffer decoded/transcoded G.711 bytes
-        let pcm_queue: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::with_capacity(4096)));
+        // 2. Task: Subscribe to camera audio track and buffer decoded/transcoded audio bytes
+        let pcm_queue: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::with_capacity(8192)));
         let pcm_queue_prod = Arc::clone(&pcm_queue);
         let stream_tx = Arc::clone(&stream);
         let call_id_audio = call_id.clone();
@@ -161,22 +217,32 @@ impl SipCallSession {
                         continue;
                     }
                     let mut chunk = payload.to_vec();
-                    if track_is_pcma && negotiated_audio_pt == 0 {
-                        transcode_alaw_to_ulaw(&mut chunk);
-                    } else if track_is_pcmu && negotiated_audio_pt == 8 {
-                        transcode_ulaw_to_alaw(&mut chunk);
-                    } else if !track_is_pcma && !track_is_pcmu {
-                        // Non-G.711 track (e.g., AAC/Opus if not transcoded): skip raw payload
-                        continue;
-                    }
+                    if audio_codec_kind == AudioCodecKind::L16_16k {
+                        let l16_bytes = g711_8k_to_l16_16k(&chunk, track_is_pcma);
+                        let mut q = pcm_queue_prod.lock().await;
+                        if q.len() > 12800 {
+                            let drop_len = q.len() - 6400;
+                            q.drain(..drop_len);
+                        }
+                        q.extend(l16_bytes);
+                    } else {
+                        if track_is_pcma && negotiated_audio_pt == 0 {
+                            transcode_alaw_to_ulaw(&mut chunk);
+                        } else if track_is_pcmu && negotiated_audio_pt == 8 {
+                            transcode_ulaw_to_alaw(&mut chunk);
+                        } else if !track_is_pcma && !track_is_pcmu {
+                            // Non-G.711 track (e.g., AAC/Opus if not transcoded): skip raw payload
+                            continue;
+                        }
 
-                    let mut q = pcm_queue_prod.lock().await;
-                    // Cap queue at ~400ms (3200 bytes) to keep latency low
-                    if q.len() > 3200 {
-                        let drop_len = q.len() - 1600;
-                        q.drain(..drop_len);
+                        let mut q = pcm_queue_prod.lock().await;
+                        // Cap queue at ~400ms (3200 bytes) to keep latency low
+                        if q.len() > 3200 {
+                            let drop_len = q.len() - 1600;
+                            q.drain(..drop_len);
+                        }
+                        q.extend(chunk);
                     }
-                    q.extend(chunk);
                 }
             } else {
                 warn!(
@@ -187,14 +253,25 @@ impl SipCallSession {
             }
         }));
 
-        // 2b. Task: Paced 20ms (160-byte) G.711 RTP transmitter to SIP peer
+        // 2b. Task: Paced RTP transmitter to SIP peer (10ms for L16, 20ms for G.711)
         let tx_audio_sock = Arc::clone(&audio_socket);
         let tx_targets = Arc::clone(&audio_targets);
         tasks.push(tokio::spawn(async move {
-            let mut repacker = G711Repacker::new(160, negotiated_audio_pt, 0x52544301);
-            let silence_byte = if negotiated_audio_pt == 8 { 0xd5u8 } else { 0xffu8 };
-            let silence_frame = [silence_byte; 160];
-            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            let (frame_size, step, ptime_ms) = if audio_codec_kind == AudioCodecKind::L16_16k {
+                (320usize, 160u32, 10u64)
+            } else {
+                (160usize, 160u32, 20u64)
+            };
+            let mut repacker = G711Repacker::new_with_step(frame_size, step, negotiated_audio_pt, 0x52544301);
+            let silence_byte = if audio_codec_kind == AudioCodecKind::L16_16k {
+                0x00u8
+            } else if negotiated_audio_pt == 8 {
+                0xd5u8
+            } else {
+                0xffu8
+            };
+            let silence_frame = vec![silence_byte; frame_size];
+            let mut ticker = tokio::time::interval(Duration::from_millis(ptime_ms));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
@@ -202,10 +279,10 @@ impl SipCallSession {
 
                 let frame: Vec<u8> = {
                     let mut q = pcm_queue.lock().await;
-                    if q.len() >= 160 {
-                        q.drain(..160).collect()
+                    if q.len() >= frame_size {
+                        q.drain(..frame_size).collect()
                     } else {
-                        silence_frame.to_vec()
+                        silence_frame.clone()
                     }
                 };
 
@@ -227,13 +304,9 @@ impl SipCallSession {
         // 3. Task: Send doorbell camera video (H.264 or RFC 2435 JPEG) -> ESPHome / HA Softphone
         let mut local_video_port = None;
         let transcode_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-        if let Some(remote_video) = remote_video_addr {
-            let video_socket = UdpSocket::bind("0.0.0.0:0")
-                .await
-                .context("Failed to bind local video RTP socket")?;
+        if let (Some(remote_video), Some(video_socket)) = (remote_video_addr, video_socket) {
             let v_port = video_socket.local_addr()?.port();
             local_video_port = Some(v_port);
-            let video_socket = Arc::new(video_socket);
 
             info!(
                 call_id = %call_id,

@@ -293,6 +293,13 @@ fn hex_md5(input: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodecKind {
+    Pcma,
+    Pcmu,
+    L16_16k,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodecKind {
     H264,
     Jpeg,
@@ -307,6 +314,7 @@ pub struct SdpMediaInfo {
     pub video_payload_types: Vec<u8>,
     pub h264_payload_type: Option<u8>,
     pub jpeg_payload_type: Option<u8>,
+    pub l16_payload_type: Option<u8>,
     pub connection_ip: Option<String>,
 }
 
@@ -319,6 +327,28 @@ impl SdpMediaInfo {
             }
         }
         0
+    }
+
+    /// Pick the preferred audio codec kind and payload type
+    pub fn preferred_audio_codec(&self) -> (AudioCodecKind, u8) {
+        for &pt in &self.audio_payload_types {
+            if pt == 8 {
+                return (AudioCodecKind::Pcma, 8);
+            }
+            if pt == 0 {
+                return (AudioCodecKind::Pcmu, 0);
+            }
+            if Some(pt) == self.l16_payload_type {
+                return (AudioCodecKind::L16_16k, pt);
+            }
+        }
+        if let Some(pt) = self.l16_payload_type {
+            return (AudioCodecKind::L16_16k, pt);
+        }
+        if self.audio_payload_types.contains(&8) {
+            return (AudioCodecKind::Pcma, 8);
+        }
+        (AudioCodecKind::Pcmu, 0)
     }
 
     /// Pick the negotiated H.264 video payload type offered by the peer (e.g. 103, 96, etc.)
@@ -374,6 +404,7 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
         video_payload_types: Vec::new(),
         h264_payload_type: None,
         jpeg_payload_type: None,
+        l16_payload_type: None,
         connection_ip: None,
     };
 
@@ -429,6 +460,8 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
                             && info.jpeg_payload_type.is_none()
                         {
                             info.jpeg_payload_type = Some(pt);
+                        } else if codec_upper.starts_with("L16/") && info.l16_payload_type.is_none() {
+                            info.l16_payload_type = Some(pt);
                         }
                     }
                 }

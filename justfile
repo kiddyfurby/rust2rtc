@@ -40,8 +40,12 @@ linux-arm64:
 # Build all release binaries and package into dist/ folder
 dist: mac linux-amd64 linux-arm64
     @mkdir -p dist
-    @cp target/release/rust2rtc dist/rust2rtc-darwin-arm64
-    @cp target/x86_64-unknown-linux-musl/release/rust2rtc dist/rust2rtc-linux-amd64
-    @cp target/aarch64-unknown-linux-musl/release/rust2rtc dist/rust2rtc-linux-arm64
+    @cp target/release/rust2rtc dist/rust2rtc_mac_arm64
+    @cp target/x86_64-unknown-linux-musl/release/rust2rtc dist/rust2rtc_linux_amd64
+    @cp target/aarch64-unknown-linux-musl/release/rust2rtc dist/rust2rtc_linux_arm64
+    @cd dist && zip -9 rust2rtc_mac_arm64.zip rust2rtc_mac_arm64
+    @cd dist && tar -czvf rust2rtc_linux_amd64.tar.gz rust2rtc_linux_amd64
+    @cd dist && tar -czvf rust2rtc_linux_arm64.tar.gz rust2rtc_linux_arm64
+    @cd dist && shasum -a 256 rust2rtc_* > checksums.sha256
     @echo "\n📦 All release binaries packaged in ./dist:"
     @ls -lh dist/
