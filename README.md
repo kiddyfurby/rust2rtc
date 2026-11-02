@@ -132,8 +132,8 @@ Pre-compiled, standalone, statically linked binaries are provided for all 3 supp
 
 | Platform / Architecture | Recommended Hardware | Standalone Binary | Archive |
 | :--- | :--- | :---: | :---: |
-| **Linux ARM64** (`aarch64`) | Rockchip RK3588 (Orange Pi 5 Plus), Raspberry Pi 4 / 5, Home Assistant OS | [**`rust2rtc_linux_arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_arm64) | [`.tar.gz`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_arm64.tar.gz) |
-| **Linux x86_64** (`amd64`) | Intel & AMD 64-bit servers, mini PCs, Frigate Docker containers | [**`rust2rtc_linux_amd64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_amd64) | [`.tar.gz`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_amd64.tar.gz) |
+| **Linux ARM64** (`aarch64`) | Rockchip RK3588 (Orange Pi 5 Plus), Raspberry Pi 4 / 5, Home Assistant OS | [**`rust2rtc_linux_arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_arm64) | — |
+| **Linux x86_64** (`amd64`) | Intel & AMD 64-bit servers, mini PCs, Frigate Docker containers | [**`rust2rtc_linux_amd64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_amd64) | — |
 | **macOS Apple Silicon** (`arm64`) | Apple M1 / M2 / M3 / M4 MacBook, Mac mini, Mac Studio (macOS 12+) | [**`rust2rtc_mac_arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_mac_arm64) | [`.zip`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_mac_arm64.zip) |
 
 > [!TIP]
