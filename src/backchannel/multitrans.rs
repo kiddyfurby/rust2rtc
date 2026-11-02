@@ -47,60 +47,69 @@ impl MultitransClient {
         let uri = format!("rtsp://{}/multitrans", host);
 
         // Step 1: Challenge
+        let mut cseq = 0;
         let req0 = format!(
-            "MULTITRANS {} RTSP/1.0\r\nCSeq: 0\r\nX-Client-UUID: {}\r\n\r\n",
-            uri, self.uuid
+            "MULTITRANS {} RTSP/1.0\r\nCSeq: {}\r\nX-Client-UUID: {}\r\n\r\n",
+            uri, cseq, self.uuid
         );
         stream.write_all(req0.as_bytes()).await?;
 
-        let (status, headers, _) = read_rtsp_response(&mut stream).await?;
-        if status != 401 {
-            bail!("MULTITRANS expected 401 Unauthorized, got status {}", status);
-        }
+        let (status0, headers0, _) = read_rtsp_response(&mut stream).await?;
+        let session = if status0 == 200 {
+            headers0
+                .get("session")
+                .cloned()
+                .context("Missing Session header from camera")?
+        } else if status0 == 401 {
+            let auth_hdr = headers0
+                .get("www-authenticate")
+                .cloned()
+                .context("Missing WWW-Authenticate header")?;
 
-        let auth_hdr = headers
-            .get("www-authenticate")
-            .cloned()
-            .context("Missing WWW-Authenticate header")?;
+            let realm = extract_param(&auth_hdr, "realm=").context("Missing realm in auth header")?;
+            let nonce = extract_param(&auth_hdr, "nonce=").context("Missing nonce in auth header")?;
 
-        let realm = extract_param(&auth_hdr, "realm=").context("Missing realm in auth header")?;
-        let nonce = extract_param(&auth_hdr, "nonce=").context("Missing nonce in auth header")?;
+            // Step 2: Digest Authentication
+            let user = self.url.username();
+            let pass = self.url.password().unwrap_or("");
 
-        // Step 2: Digest Authentication
-        let user = self.url.username();
-        let pass = self.url.password().unwrap_or("");
+            let ha1 = hex_md5(&format!("{}:{}:{}", user, realm, pass));
+            let ha2 = hex_md5(&format!("MULTITRANS:{}", uri));
+            let response = hex_md5(&format!("{}:{}:{}", ha1, nonce, ha2));
 
-        let ha1 = hex_md5(&format!("{}:{}:{}", user, realm, pass));
-        let ha2 = hex_md5(&format!("MULTITRANS:{}", uri));
-        let response = hex_md5(&format!("{}:{}:{}", ha1, nonce, ha2));
+            let auth_val = format!(
+                r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}""#,
+                user, realm, nonce, uri, response
+            );
 
-        let auth_val = format!(
-            r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}""#,
-            user, realm, nonce, uri, response
-        );
+            cseq += 1;
+            let req1 = format!(
+                "MULTITRANS {} RTSP/1.0\r\nCSeq: {}\r\nAuthorization: {}\r\nX-Client-UUID: {}\r\n\r\n",
+                uri, cseq, auth_val, self.uuid
+            );
+            stream.write_all(req1.as_bytes()).await?;
 
-        let req1 = format!(
-            "MULTITRANS {} RTSP/1.0\r\nCSeq: 1\r\nAuthorization: {}\r\nX-Client-UUID: {}\r\n\r\n",
-            uri, auth_val, self.uuid
-        );
-        stream.write_all(req1.as_bytes()).await?;
+            let (status1, headers1, _) = read_rtsp_response(&mut stream).await?;
+            if status1 != 200 {
+                bail!("MULTITRANS authentication failed with status {}", status1);
+            }
 
-        let (status, headers, _) = read_rtsp_response(&mut stream).await?;
-        if status != 200 {
-            bail!("MULTITRANS authentication failed with status {}", status);
-        }
+            headers1
+                .get("session")
+                .cloned()
+                .context("Missing Session header from camera")?
+        } else {
+            bail!("MULTITRANS expected 200 or 401 status, got {}", status0);
+        };
 
-        let session = headers
-            .get("session")
-            .cloned()
-            .context("Missing Session header from camera")?;
         debug!(session = %session, "MULTITRANS session established");
 
         // Step 3: Open Talk Channel (Full Duplex)
+        cseq += 1;
         let payload = r#"{"type":"request","seq":0,"params":{"method":"get","talk":{"mode":"full_duplex"}}}"#;
         let req2 = format!(
-            "MULTITRANS {} RTSP/1.0\r\nCSeq: 2\r\nSession: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            uri, session, payload.len(), payload
+            "MULTITRANS {} RTSP/1.0\r\nCSeq: {}\r\nSession: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            uri, cseq, session, payload.len(), payload
         );
         stream.write_all(req2.as_bytes()).await?;
 
