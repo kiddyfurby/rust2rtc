@@ -37,6 +37,7 @@ impl SipCallSession {
     pub async fn start(
         call_id: String,
         stream: Arc<Stream>,
+        video_stream: Option<Arc<Stream>>,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
         local_bind_ip: &str,
@@ -66,6 +67,7 @@ impl SipCallSession {
         Self::start_with_sockets(
             call_id,
             stream,
+            video_stream,
             rtsp_port,
             ffmpeg,
             local_bind_ip,
@@ -88,6 +90,7 @@ impl SipCallSession {
     pub async fn start_with_sockets(
         call_id: String,
         stream: Arc<Stream>,
+        video_stream: Option<Arc<Stream>>,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
         _local_bind_ip: &str,
@@ -103,10 +106,12 @@ impl SipCallSession {
         negotiated_video_pt: u8,
     ) -> Result<Self> {
         let local_audio_port = audio_socket.local_addr()?.port();
+        let stream_video = video_stream.unwrap_or_else(|| Arc::clone(&stream));
 
         info!(
             call_id = %call_id,
             stream = %stream.name,
+            video_stream = %stream_video.name,
             local_audio = local_audio_port,
             remote_audio = %remote_audio_addr,
             alt_audio = ?alt_audio_addr,
@@ -129,6 +134,16 @@ impl SipCallSession {
                 warn!(stream = %stream_init.name, "Failed to start stream producer for SIP call: {}", e);
             }
         }));
+
+        if stream_video.name != stream.name {
+            let v_init = Arc::clone(&stream_video);
+            let ffmpeg_v = Arc::clone(&ffmpeg);
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = v_init.ensure_started(rtsp_port, &ffmpeg_v).await {
+                    warn!(stream = %v_init.name, "Failed to start video sub-stream producer for SIP call: {}", e);
+                }
+            }));
+        }
 
         if stream.has_backchannel() {
             let stream_bc_init = Arc::clone(&stream);
@@ -319,7 +334,7 @@ impl SipCallSession {
                 "Initializing SIP video forwarder"
             );
 
-            let stream_video = Arc::clone(&stream);
+            let stream_video = Arc::clone(&stream_video);
             let call_id_video = call_id.clone();
             let video_targets = Arc::new(Mutex::new((remote_video, alt_video_addr)));
             let tx_v_targets = Arc::clone(&video_targets);
@@ -354,11 +369,15 @@ impl SipCallSession {
 
             match negotiated_video_codec {
                 VideoCodecKind::H264 => {
+                    let ffmpeg_video = Arc::clone(&ffmpeg);
+                    let transcode_child_clone = Arc::clone(&transcode_child);
+                    let tx_v_targets_fallback = Arc::clone(&tx_v_targets);
+
                     tasks.push(tokio::spawn(async move {
                         let mut video_track = None;
                         for _ in 0..80 {
                             let tracks = stream_video.get_tracks().await;
-                            if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
+                            if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")) {
                                 video_track = Some(Arc::clone(t));
                                 break;
                             }
@@ -481,11 +500,50 @@ impl SipCallSession {
                                 }
                             }
                         } else {
-                            warn!(
+                            let (primary_target, _) = *tx_v_targets_fallback.lock().await;
+                            info!(
                                 call_id = %call_id_video,
                                 stream = %stream_video.name,
-                                "No video track found on stream after 8s for SIP call"
+                                target = %primary_target,
+                                "No native H.264 track found; starting FFmpeg H.264 transcode for SIP video"
                             );
+
+                            let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_video.name);
+                            let h264_args = ffmpeg_video.h264_encoder_args();
+                            let mut transcode_args = vec![
+                                "-hide_banner".to_string(),
+                                "-v".to_string(),
+                                "warning".to_string(),
+                                "-fflags".to_string(),
+                                "nobuffer".to_string(),
+                                "-flags".to_string(),
+                                "low_delay".to_string(),
+                                "-rtsp_transport".to_string(),
+                                "tcp".to_string(),
+                                "-i".to_string(),
+                                rtsp_url,
+                                "-an".to_string(),
+                            ];
+                            transcode_args.extend(h264_args);
+                            transcode_args.extend([
+                                "-payload_type".to_string(),
+                                negotiated_video_pt.to_string(),
+                                "-ssrc".to_string(),
+                                "1381254914".to_string(),
+                                "-f".to_string(),
+                                "rtp".to_string(),
+                                format!("rtp://{}:{}", primary_target.ip(), primary_target.port()),
+                            ]);
+
+                            match ffmpeg_video.spawn_stdout_process(&transcode_args) {
+                                Ok(c) => {
+                                    *transcode_child_clone.lock().await = Some(c);
+                                    info!(call_id = %call_id_video, "FFmpeg H.264 transcode started for SIP video call");
+                                }
+                                Err(e) => {
+                                    warn!(call_id = %call_id_video, "Failed to spawn FFmpeg H.264 transcode: {}", e);
+                                }
+                            }
                         }
                     }));
                 }
