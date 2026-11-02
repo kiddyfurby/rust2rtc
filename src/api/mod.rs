@@ -1127,6 +1127,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         // Fallback to FFmpeg transcoding process if video re-encoding is required
                         let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src_name);
                         let ffmpeg_bin = state.ffmpeg.bin().to_string();
+                        let h264_encoder_args = state.ffmpeg.h264_encoder_args();
 
                         mse_handle = Some(tokio::spawn(async move {
                             let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
@@ -1143,7 +1144,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                             if copy_video {
                                 cmd.args(["-c:v", "copy"]);
                             } else {
-                                cmd.args(["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]);
+                                cmd.args(&h264_encoder_args);
                             }
 
                             if copy_audio {

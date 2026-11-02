@@ -110,6 +110,8 @@ async fn main() -> Result<()> {
     let ffmpeg_manager = Arc::new(FfmpegManager::new(
         config.ffmpeg.bin.clone(),
         config.ffmpeg.global.clone(),
+        config.ffmpeg.hardware.clone(),
+        config.ffmpeg.templates.clone(),
     ));
 
     match ffmpeg_manager.check_version().await {
