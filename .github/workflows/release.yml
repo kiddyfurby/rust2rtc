@@ -64,11 +64,12 @@ jobs:
           fi
 
           chmod +x ${{ matrix.artifact_name }}
-          tar -czvf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
-          zip -9 ${{ matrix.artifact_name }}.zip ${{ matrix.artifact_name }}
-          shasum -a 256 ${{ matrix.artifact_name }} > ${{ matrix.artifact_name }}.sha256
-          shasum -a 256 ${{ matrix.artifact_name }}.zip > ${{ matrix.artifact_name }}.zip.sha256
-          shasum -a 256 ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+          if [[ "${{ matrix.artifact_name }}" == *"mac"* ]]; then
+            mkdir -p zip_tmp
+            cp "${{ matrix.artifact_name }}" zip_tmp/rust2rtc
+            (cd zip_tmp && zip -9 "../${{ matrix.artifact_name }}.zip" rust2rtc)
+            rm -rf zip_tmp
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -77,8 +78,6 @@ jobs:
           path: |
             ${{ matrix.artifact_name }}
             ${{ matrix.artifact_name }}.zip
-            ${{ matrix.artifact_name }}.tar.gz
-            *.sha256
 
   publish:
     name: Publish GitHub Release
