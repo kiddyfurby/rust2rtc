@@ -546,7 +546,7 @@ impl SipCameraAccount {
 
         // 3. Parse SDP Media from caller
         let media_info = parse_sdp_media(&req.body);
-        let negotiated_audio_pt = media_info.preferred_g711_pt();
+        let (audio_codec_kind, negotiated_audio_pt) = media_info.preferred_audio_codec();
         let peer_ip = peer_addr.ip().to_string();
         let sdp_ip = media_info
             .connection_ip
@@ -606,6 +606,7 @@ impl SipCameraAccount {
             &self.config.local_ip,
             remote_audio_addr,
             alt_audio_addr,
+            audio_codec_kind,
             negotiated_audio_pt,
             remote_video_addr,
             alt_video_addr,
@@ -712,43 +713,333 @@ impl SipCameraAccount {
 
     /// Trigger an outbound call to an extension or ring group (e.g. Doorbell button pressed)
     pub async fn trigger_outbound_call(&self, target_extension: &str) -> Result<()> {
-        let server_addr: SocketAddr = tokio::net::lookup_host(&self.config.server)
+        self.originate_parallel_call(&[target_extension.to_string()]).await
+    }
+
+    /// Place a parallel fork / conference call to multiple intercom targets.
+    /// Rings all target screens in parallel with camera video + audio.
+    /// The first target to answer wins, and all other ringing targets are cancelled.
+    pub async fn originate_parallel_call(&self, targets: &[String]) -> Result<()> {
+        if targets.is_empty() {
+            bail!("No targets provided for outbound parallel call");
+        }
+
+        // Check if a call is already active on this account
+        {
+            let active = self.active_call.lock().await;
+            if active.is_some() {
+                info!(
+                    stream = %self.config.stream_name,
+                    "Call session already active for stream; ignoring trigger"
+                );
+                return Ok(());
+            }
+        }
+
+        let server_default: SocketAddr = tokio::net::lookup_host(&self.config.server)
             .await?
             .next()
             .context("Failed to resolve SIP server address")?;
 
-        let local_port = self.socket.local_addr()?.port();
-        let from_uri = format!("sip:{}@{}", self.config.extension, self.config.domain);
-        let to_uri = format!("sip:{}@{}", target_extension, self.config.domain);
-        let contact = format!("sip:{}@{}:{}", self.config.extension, self.config.local_ip, local_port);
-        let call_id = format!("call-{}@{}", uuid::Uuid::new_v4(), self.config.local_ip);
-
-        let seq = self.cseq.fetch_add(1, Ordering::SeqCst);
-        let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
-
-        // Temporary audio port for offer
-        let dummy_audio_port = 20000;
-        let offer_sdp = build_sdp(&self.config.local_ip, dummy_audio_port, 0, None, None, None);
-
-        let mut invite = SipMessage::new_request(SipMethod::Invite, &to_uri);
-        invite.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch));
-        invite.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, from_uri, self.local_tag));
-        invite.set_header("To", &format!("<{}>", to_uri));
-        invite.set_header("Call-ID", &call_id);
-        invite.set_header("CSeq", &format!("{} INVITE", seq));
-        invite.set_header("Contact", &format!("<{}>", contact));
-        invite.set_header("Content-Type", "application/sdp");
-        invite.set_header("Content-Length", &offer_sdp.len().to_string());
-        invite.set_header("Max-Forwards", "70");
-        invite.set_header("User-Agent", "rust2rtc");
-        invite.body = offer_sdp;
-
-        info!(
-            target = %target_extension,
-            stream = %self.config.stream_name,
-            "Calling ESPHome / Ring Group via SIP"
+        let audio_sock = Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("Failed to bind audio RTP socket for doorbell call")?,
         );
-        self.socket.send_to(invite.serialize().as_bytes(), server_addr).await?;
+        let video_sock = Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("Failed to bind video RTP socket for doorbell call")?,
+        );
+        let local_audio_port = audio_sock.local_addr()?.port();
+        let local_video_port = video_sock.local_addr()?.port();
+        let local_sip_port = self.socket.local_addr()?.port();
+
+        let sess_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let offer_sdp = format!(
+            "v=0\r\n\
+             o=- {sess_id} 1 IN IP4 {local_ip}\r\n\
+             s=rust2rtc\r\n\
+             c=IN IP4 {local_ip}\r\n\
+             t=0 0\r\n\
+             m=audio {local_audio_port} RTP/AVP 96 8 0 101\r\n\
+             a=rtpmap:96 L16/16000/1\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=rtpmap:101 telephone-event/8000\r\n\
+             a=ptime:10\r\n\
+             a=sendrecv\r\n\
+             m=video {local_video_port} RTP/AVP 26 97\r\n\
+             a=rtpmap:26 JPEG/90000\r\n\
+             a=rtpmap:97 H264/90000\r\n\
+             a=sendonly\r\n",
+            sess_id = sess_id,
+            local_ip = self.config.local_ip,
+            local_audio_port = local_audio_port,
+            local_video_port = local_video_port,
+        );
+
+        struct DialLeg {
+            target_addr: SocketAddr,
+            call_id: String,
+            to_uri: String,
+            from_uri: String,
+            branch: String,
+            seq: u32,
+        }
+
+        let mut legs = Vec::new();
+        let (unified_tx, mut unified_rx) = mpsc::channel::<(usize, SipMessage)>(32);
+
+        for (idx, target) in targets.iter().enumerate() {
+            let target_trimmed = target.trim();
+            if target_trimmed.is_empty() {
+                continue;
+            }
+
+            let (target_user, target_domain, target_addr) = if target_trimmed.contains('@') {
+                let clean = target_trimmed.strip_prefix("sip:").unwrap_or(target_trimmed);
+                let (u, host_part) = clean.split_once('@').unwrap();
+                let addr = match tokio::net::lookup_host(host_part).await {
+                    Ok(mut addrs) => addrs.next().unwrap_or(server_default),
+                    Err(_) => server_default,
+                };
+                (u.to_string(), host_part.to_string(), addr)
+            } else if target_trimmed.contains(':') {
+                let addr = match tokio::net::lookup_host(target_trimmed).await {
+                    Ok(mut addrs) => addrs.next().unwrap_or(server_default),
+                    Err(_) => server_default,
+                };
+                ("intercom".to_string(), target_trimmed.to_string(), addr)
+            } else if target_trimmed.chars().all(|c| c.is_ascii_digit()) {
+                (target_trimmed.to_string(), self.config.domain.clone(), server_default)
+            } else {
+                (target_trimmed.to_string(), self.config.domain.clone(), server_default)
+            };
+
+            let call_id = format!("call-{}@{}", uuid::Uuid::new_v4(), self.config.local_ip);
+            let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+            let seq = self.cseq.fetch_add(1, Ordering::SeqCst);
+            let from_uri = format!("sip:{}@{}", self.config.extension, self.config.domain);
+            let to_uri = format!("sip:{}@{}", target_user, target_domain);
+            let contact = format!("sip:{}@{}:{}", self.config.extension, self.config.local_ip, local_sip_port);
+
+            let (tx, mut rx) = mpsc::channel(16);
+            self.pending_responses.lock().await.insert(call_id.clone(), tx);
+
+            let u_tx = unified_tx.clone();
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    if u_tx.send((idx, msg)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let mut invite = SipMessage::new_request(SipMethod::Invite, &to_uri);
+            invite.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_sip_port, branch));
+            invite.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, from_uri, self.local_tag));
+            invite.set_header("To", &format!("<{}>", to_uri));
+            invite.set_header("Call-ID", &call_id);
+            invite.set_header("CSeq", &format!("{} INVITE", seq));
+            invite.set_header("Contact", &format!("<{}>", contact));
+            invite.set_header("Content-Type", "application/sdp");
+            invite.set_header("Content-Length", &offer_sdp.len().to_string());
+            invite.set_header("Max-Forwards", "70");
+            invite.set_header("User-Agent", "rust2rtc");
+            invite.body = offer_sdp.clone();
+
+            info!(
+                target = %target_addr,
+                to = %to_uri,
+                stream = %self.config.stream_name,
+                "Calling intercom target via parallel SIP INVITE"
+            );
+
+            if let Err(e) = self.socket.send_to(invite.serialize().as_bytes(), target_addr).await {
+                warn!(target = %target_addr, "Failed to send INVITE to target: {}", e);
+                self.pending_responses.lock().await.remove(&call_id);
+                continue;
+            }
+
+            legs.push(DialLeg {
+                target_addr,
+                call_id,
+                to_uri,
+                from_uri,
+                branch,
+                seq,
+            });
+        }
+
+        if legs.is_empty() {
+            bail!("Failed to dispatch INVITE to any target");
+        }
+
+        drop(unified_tx);
+
+        // Wait for answers across all legs (30s overall ring timeout)
+        let ring_timeout = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(ring_timeout);
+
+        let mut winner: Option<(usize, SipMessage)> = None;
+
+        while winner.is_none() {
+            tokio::select! {
+                _ = &mut ring_timeout => {
+                    warn!(stream = %self.config.stream_name, "Doorbell conference call timed out after 30s (unanswered)");
+                    break;
+                }
+                maybe_item = unified_rx.recv() => {
+                    match maybe_item {
+                        Some((idx, msg)) => {
+                            if let Some(code) = msg.status_code {
+                                let leg = &legs[idx];
+                                debug!(target = %leg.target_addr, code = code, "Received SIP response on outbound leg");
+                                if code == 180 || code == 183 {
+                                    info!(target = %leg.target_addr, "Intercom screen is ringing (180/183)...");
+                                } else if code == 200 {
+                                    info!(target = %leg.target_addr, "Intercom answered! Winning call leg selected.");
+                                    winner = Some((idx, msg));
+                                    break;
+                                } else if code >= 300 {
+                                    warn!(target = %leg.target_addr, code = code, "Intercom leg ended without answering");
+                                    // Send ACK to terminate the non-2xx client transaction on UAS
+                                    let mut non2xx_ack = SipMessage::new_request(SipMethod::Ack, &leg.to_uri);
+                                    let ack_branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+                                    non2xx_ack.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={}", self.config.local_ip, local_sip_port, ack_branch));
+                                    non2xx_ack.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, leg.from_uri, self.local_tag));
+                                    let to_hdr = msg.get_header("to").unwrap_or(&leg.to_uri);
+                                    non2xx_ack.set_header("To", to_hdr);
+                                    non2xx_ack.set_header("Call-ID", &leg.call_id);
+                                    non2xx_ack.set_header("CSeq", &format!("{} ACK", leg.seq));
+                                    non2xx_ack.set_header("Max-Forwards", "70");
+                                    non2xx_ack.set_header("User-Agent", "rust2rtc");
+                                    let _ = self.socket.send_to(non2xx_ack.serialize().as_bytes(), leg.target_addr).await;
+                                }
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((w_idx, resp)) = winner {
+            let winning_leg = &legs[w_idx];
+
+            // 1. Send ACK to winning target
+            let mut ack = SipMessage::new_request(SipMethod::Ack, &winning_leg.to_uri);
+            let ack_branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+            ack.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={}", self.config.local_ip, local_sip_port, ack_branch));
+            ack.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, winning_leg.from_uri, self.local_tag));
+            let to_hdr = resp.get_header("to").unwrap_or(&winning_leg.to_uri);
+            ack.set_header("To", to_hdr);
+            ack.set_header("Call-ID", &winning_leg.call_id);
+            ack.set_header("CSeq", &format!("{} ACK", winning_leg.seq));
+            ack.set_header("Max-Forwards", "70");
+            ack.set_header("User-Agent", "rust2rtc");
+
+            let _ = self.socket.send_to(ack.serialize().as_bytes(), winning_leg.target_addr).await;
+
+            // 2. Parse SDP from winning target
+            let media_info = parse_sdp_media(&resp.body);
+            let (audio_codec_kind, negotiated_audio_pt) = media_info.preferred_audio_codec();
+            let peer_ip = winning_leg.target_addr.ip().to_string();
+            let sdp_ip = media_info.connection_ip.clone().unwrap_or_else(|| peer_ip.clone());
+            let audio_port = media_info.audio_port.unwrap_or(40000);
+            let remote_audio_addr = format!("{}:{}", peer_ip, audio_port).parse::<SocketAddr>().unwrap_or(winning_leg.target_addr);
+            let alt_audio_addr = if sdp_ip != peer_ip {
+                format!("{}:{}", sdp_ip, audio_port).parse::<SocketAddr>().ok()
+            } else {
+                None
+            };
+
+            let negotiated_video = media_info.preferred_video_codec();
+            let (negotiated_video_codec, negotiated_video_pt) = match negotiated_video {
+                Some((kind, pt)) => (kind, pt),
+                None => (VideoCodecKind::Jpeg, 26),
+            };
+            let remote_video_addr = media_info.video_port.and_then(|p| {
+                let ip = if sdp_ip != "0.0.0.0" && !sdp_ip.is_empty() { &sdp_ip } else { &peer_ip };
+                format!("{}:{}", ip, p).parse::<SocketAddr>().ok()
+            });
+            let alt_video_addr = media_info.video_port.and_then(|p| {
+                if sdp_ip != peer_ip && !peer_ip.is_empty() {
+                    format!("{}:{}", peer_ip, p).parse::<SocketAddr>().ok()
+                } else {
+                    None
+                }
+            });
+
+            // 3. Connect audio/video media session
+            let session = SipCallSession::start_with_sockets(
+                winning_leg.call_id.clone(),
+                Arc::clone(&self.stream),
+                self.rtsp_port,
+                Arc::clone(&self.ffmpeg),
+                &self.config.local_ip,
+                audio_sock,
+                Some(video_sock),
+                remote_audio_addr,
+                alt_audio_addr,
+                audio_codec_kind,
+                negotiated_audio_pt,
+                remote_video_addr,
+                alt_video_addr,
+                negotiated_video_codec,
+                negotiated_video_pt,
+            ).await?;
+
+            *self.active_call.lock().await = Some(session);
+            info!(target = %winning_leg.target_addr, stream = %self.config.stream_name, "Bidirectional intercom call connected!");
+
+            // 4. Cancel all other ringing legs
+            for (k, other_leg) in legs.iter().enumerate() {
+                if k != w_idx {
+                    let mut cancel = SipMessage::new_request(SipMethod::Cancel, &other_leg.to_uri);
+                    cancel.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={}", self.config.local_ip, local_sip_port, other_leg.branch));
+                    cancel.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, other_leg.from_uri, self.local_tag));
+                    cancel.set_header("To", &format!("<{}>", other_leg.to_uri));
+                    cancel.set_header("Call-ID", &other_leg.call_id);
+                    cancel.set_header("CSeq", &format!("{} CANCEL", other_leg.seq));
+                    cancel.set_header("Max-Forwards", "70");
+                    cancel.set_header("User-Agent", "rust2rtc");
+                    let _ = self.socket.send_to(cancel.serialize().as_bytes(), other_leg.target_addr).await;
+                }
+            }
+
+            // Clean up non-winning pending responses
+            let mut pending = self.pending_responses.lock().await;
+            for (k, other_leg) in legs.iter().enumerate() {
+                if k != w_idx {
+                    pending.remove(&other_leg.call_id);
+                }
+            }
+        } else {
+            // Cancel any remaining legs
+            for leg in &legs {
+                let mut cancel = SipMessage::new_request(SipMethod::Cancel, &leg.to_uri);
+                cancel.set_header("Via", &format!("SIP/2.0/UDP {}:{};branch={}", self.config.local_ip, local_sip_port, leg.branch));
+                cancel.set_header("From", &format!(r#""{}" <{}>;tag={}"#, self.config.display_name, leg.from_uri, self.local_tag));
+                cancel.set_header("To", &format!("<{}>", leg.to_uri));
+                cancel.set_header("Call-ID", &leg.call_id);
+                cancel.set_header("CSeq", &format!("{} CANCEL", leg.seq));
+                cancel.set_header("Max-Forwards", "70");
+                cancel.set_header("User-Agent", "rust2rtc");
+                let _ = self.socket.send_to(cancel.serialize().as_bytes(), leg.target_addr).await;
+            }
+            let mut pending = self.pending_responses.lock().await;
+            for leg in &legs {
+                pending.remove(&leg.call_id);
+            }
+        }
 
         Ok(())
     }

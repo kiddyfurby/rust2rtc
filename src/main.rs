@@ -4,6 +4,7 @@ mod backchannel;
 mod config;
 mod core;
 mod ffmpeg;
+mod ha;
 mod mp4;
 mod rtsp;
 mod sip;
@@ -285,6 +286,28 @@ async fn main() -> Result<()> {
                     error!(stream = %stream_name, "Failed to auto-register SIP account: {}", e);
                 }
             }
+        }
+    }
+
+    // Start Home Assistant Doorbell event subscriber if doorbells are configured
+    if !config.doorbells.is_empty() {
+        if let (Some(ha_url), Some(ha_token)) = (config.ha_url(), config.ha_token()) {
+            info!(
+                count = config.doorbells.len(),
+                ha_url = %ha_url,
+                "Starting Home Assistant doorbell subscriber for parallel intercom calling"
+            );
+            ha::start_doorbell_subscriber(
+                ha_url,
+                ha_token,
+                config.doorbells.clone(),
+                Arc::clone(&sip_manager),
+            );
+        } else {
+            error!(
+                "Doorbells are configured but Home Assistant ha_url and/or ha_token are missing; \
+                 please specify ha_url and ha_token under sip: or ha: in configuration"
+            );
         }
     }
 

@@ -242,6 +242,18 @@ sip:
       password: "YourSecurePasswordHere"
       display_name: "Front Doorbell"
       auto_answer: true
+
+# Automated Doorbell Ring Group & Conference Calling
+doorbells:
+  doorbell:
+    # Home Assistant binary sensor for the doorbell button
+    entity: "binary_sensor.reolink_video_doorbell_wifi_visitor"
+    # Intercom displays to ring simultaneously (parallel SIP forking)
+    sip_targets:
+      - "192.0.2.42:5060"   # e.g. Living Room ESPHome Intercom (Guition ESP32-P4)
+      - "192.0.2.36:5060"   # e.g. Dining Room ESPHome Intercom (Waveshare ESP32-P4 Touch)
+    # Debounce cooldown in seconds to prevent duplicate ringing
+    cooldown_seconds: 15
 ```
 
 ---
@@ -342,7 +354,20 @@ sip:
 
 ## 📝 Changelog & Release History
 
-### v0.4.0 (Current)
+### v0.5.0 (Current)
+- **Home Assistant WebSocket Event Subscriber**:
+  - Direct WebSocket client connection to Home Assistant (`ws://.../api/websocket`) with automatic authentication and connection health monitoring.
+  - Subscribes natively to doorbell visitor button events (e.g. `binary_sensor.reolink_video_doorbell_wifi_visitor`).
+  - Configurable debounce cooldown timer to prevent duplicated calls while ringing or active.
+- **Parallel Forking Conference Call & Ring Groups**:
+  - Implements RFC 3261 parallel forking to ring multiple SIP intercom screens simultaneously (e.g. [ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/) devices).
+  - "First to answer wins" race resolution: the first screen to answer (`200 OK`) is connected to live camera video + bidirectional audio, and all other ringing legs are immediately cancelled with `CANCEL`.
+  - Full client transaction lifecycle support with automated non-2xx `ACK`ing, preventing server transaction lockups.
+- **L16 16kHz & ESPHome VoIP Stack Support**:
+  - Supports uncompressed linear PCM `L16/16000/1` audio alongside G.711 PCMA/PCMU.
+  - Real-time pure-Rust conversion between 16kHz L16 audio from ESPHome smart panels and 8kHz G.711 camera talkback channels.
+
+### v0.4.0
 - **RTSP Interleaved Stream Resynchronization**:
   - Implemented automatic binary packet delimiter (`$`) scanner to recover instantly from corrupted or desynchronized interleaved TCP streams.
   - Added full response body draining based on `Content-Length` to prevent parser lockups from RTSP responses that include trailing payload bytes.

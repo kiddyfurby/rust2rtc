@@ -16,6 +16,33 @@ pub struct Config {
     pub webrtc: Option<WebRtcConfig>,
     #[serde(default)]
     pub sip: Option<SipConfig>,
+    #[serde(default)]
+    pub ha: Option<HaConfig>,
+    #[serde(default)]
+    pub doorbells: HashMap<String, DoorbellConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HaConfig {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DoorbellConfig {
+    pub entity: String,
+    #[serde(default)]
+    pub sip_targets: Vec<String>,
+    #[serde(default)]
+    pub ha_destination: Option<String>,
+    #[serde(default = "default_doorbell_cooldown")]
+    pub cooldown_seconds: u64,
+}
+
+fn default_doorbell_cooldown() -> u64 {
+    15
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -87,6 +114,8 @@ impl Default for Config {
             ffmpeg: FfmpegConfig::default(),
             webrtc: None,
             sip: None,
+            ha: None,
+            doorbells: HashMap::new(),
         }
     }
 }
@@ -204,5 +233,28 @@ impl Config {
         if let Some(sip) = other.sip {
             self.sip = Some(sip);
         }
+        if let Some(ha) = other.ha {
+            self.ha = Some(ha);
+        }
+        for (name, db) in other.doorbells {
+            self.doorbells.insert(name, db);
+        }
+    }
+
+    pub fn ha_url(&self) -> Option<String> {
+        self.ha
+            .as_ref()
+            .and_then(|h| h.url.clone())
+            .or_else(|| self.sip.as_ref().and_then(|s| s.ha_url.clone()))
+            .or_else(|| std::env::var("HA_URL").ok())
+    }
+
+    pub fn ha_token(&self) -> Option<String> {
+        self.ha
+            .as_ref()
+            .and_then(|h| h.token.clone())
+            .or_else(|| self.sip.as_ref().and_then(|s| s.ha_token.clone()))
+            .or_else(|| std::env::var("HA_TOKEN").ok())
+            .or_else(|| std::env::var("SUPERVISOR_TOKEN").ok())
     }
 }

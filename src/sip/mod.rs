@@ -92,6 +92,42 @@ impl SipManager {
         account.trigger_outbound_call(&destination).await
     }
 
+    /// Trigger doorbell call according to DoorbellConfig (parallel SIP targets or HA destination)
+    pub async fn trigger_doorbell_call(&self, stream_name: &str, config: &crate::config::DoorbellConfig) -> Result<()> {
+        let accounts = self.accounts.read().await;
+        let account = accounts
+            .get(stream_name)
+            .ok_or_else(|| anyhow::anyhow!("No SIP account registered for stream '{}'", stream_name))?;
+
+        if !config.sip_targets.is_empty() {
+            info!(
+                stream = %stream_name,
+                targets = ?config.sip_targets,
+                "Initiating parallel conference call to intercom targets"
+            );
+            account.originate_parallel_call(&config.sip_targets).await
+        } else if let Some(ref ha_dest) = config.ha_destination {
+            info!(
+                stream = %stream_name,
+                destination = %ha_dest,
+                "Initiating call to Home Assistant destination"
+            );
+            account.trigger_outbound_call(ha_dest).await
+        } else if let Some(ref ring_group) = account.config.ring_group {
+            info!(
+                stream = %stream_name,
+                ring_group = %ring_group,
+                "Initiating call to account ring group"
+            );
+            account.trigger_outbound_call(ring_group).await
+        } else {
+            anyhow::bail!(
+                "No sip_targets, ha_destination, or ring_group configured for doorbell '{}'",
+                stream_name
+            );
+        }
+    }
+
     /// List active SIP account statuses
     pub async fn list_accounts(&self) -> Vec<SipAccountStatus> {
         let accounts = self.accounts.read().await;
