@@ -50,6 +50,7 @@ impl SipManager {
             SipCameraAccount::new(
                 config.clone(),
                 stream,
+                Some(Arc::clone(&self.stream_manager)),
                 self.rtsp_port,
                 Arc::clone(&self.ffmpeg),
                 Arc::clone(&self.used_extensions),
