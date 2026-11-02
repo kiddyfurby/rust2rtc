@@ -48,7 +48,6 @@ pub struct SipCameraAccount {
     pub config: SipAccountConfig,
     pub socket: Arc<UdpSocket>,
     stream: Arc<Stream>,
-    stream_manager: Option<Arc<crate::streams::StreamManager>>,
     rtsp_port: u16,
     ffmpeg: Arc<FfmpegManager>,
     active_call: Arc<Mutex<Option<SipCallSession>>>,
@@ -65,7 +64,6 @@ impl SipCameraAccount {
     pub async fn new(
         config: SipAccountConfig,
         stream: Arc<Stream>,
-        stream_manager: Option<Arc<crate::streams::StreamManager>>,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
         used_extensions: Arc<Mutex<HashSet<String>>>,
@@ -89,7 +87,6 @@ impl SipCameraAccount {
             config,
             socket: Arc::new(socket),
             stream,
-            stream_manager,
             rtsp_port,
             ffmpeg,
             active_call: Arc::new(Mutex::new(None)),
@@ -628,47 +625,10 @@ impl SipCameraAccount {
             }
         });
 
-        // 4. Resolve video stream (sub-stream for H.264 if primary stream is H.265)
-        let mut video_stream = Arc::clone(&self.stream);
-        let _ = video_stream.ensure_started(self.rtsp_port, &self.ffmpeg).await;
-
-        if negotiated_video_codec == VideoCodecKind::H264 {
-            let mut tracks = video_stream.get_tracks().await;
-            if tracks.is_empty() {
-                for _ in 0..15 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    tracks = video_stream.get_tracks().await;
-                    if !tracks.is_empty() {
-                        break;
-                    }
-                }
-            }
-
-            let has_h264 = tracks.iter().any(|t| {
-                t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")
-            });
-
-            if !has_h264 {
-                if let Some(ref sm) = self.stream_manager {
-                    let sub_name = format!("{}_sub", self.config.stream_name);
-                    if let Some(sub_stream) = sm.get(&sub_name).await {
-                        let _ = sub_stream.ensure_started(self.rtsp_port, &self.ffmpeg).await;
-                        info!(
-                            stream = %self.config.stream_name,
-                            sub_stream = %sub_name,
-                            "Primary camera video is H.265; using H.264 sub-stream for SIP video"
-                        );
-                        video_stream = sub_stream;
-                    }
-                }
-            }
-        }
-
-        // 5. Start media bridge session
+        // 4. Start media bridge session using high-resolution primary camera stream
         let session = SipCallSession::start(
             call_id.clone(),
             Arc::clone(&self.stream),
-            Some(Arc::clone(&video_stream)),
             self.rtsp_port,
             Arc::clone(&self.ffmpeg),
             &self.config.local_ip,
@@ -690,10 +650,10 @@ impl SipCameraAccount {
         let mut active = self.active_call.lock().await;
         *active = Some(session);
 
-        // Extract sprop-parameter-sets from video_stream if available and using H.264
+        // Extract sprop-parameter-sets from video track if native H.264 is available
         let mut sprop = None;
         if negotiated_video_codec == VideoCodecKind::H264 {
-            let tracks = video_stream.get_tracks().await;
+            let tracks = self.stream.get_tracks().await;
             if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")) {
                 if let Some(ref fmtp) = vt.codec.fmtp {
                     if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
@@ -1047,26 +1007,9 @@ impl SipCameraAccount {
             });
 
             // 3. Connect audio/video media session
-            let mut video_stream = Arc::clone(&self.stream);
-            if negotiated_video_codec == VideoCodecKind::H264 {
-                let has_h264 = video_stream.get_tracks().await.iter().any(|t| {
-                    t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")
-                });
-                if !has_h264 {
-                    if let Some(ref sm) = self.stream_manager {
-                        let sub_name = format!("{}_sub", self.config.stream_name);
-                        if let Some(sub_stream) = sm.get(&sub_name).await {
-                            let _ = sub_stream.ensure_started(self.rtsp_port, &self.ffmpeg).await;
-                            video_stream = sub_stream;
-                        }
-                    }
-                }
-            }
-
             let session = SipCallSession::start_with_sockets(
                 winning_leg.call_id.clone(),
                 Arc::clone(&self.stream),
-                Some(Arc::clone(&video_stream)),
                 self.rtsp_port,
                 Arc::clone(&self.ffmpeg),
                 &self.config.local_ip,

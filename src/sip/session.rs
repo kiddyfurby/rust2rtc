@@ -37,7 +37,6 @@ impl SipCallSession {
     pub async fn start(
         call_id: String,
         stream: Arc<Stream>,
-        video_stream: Option<Arc<Stream>>,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
         local_bind_ip: &str,
@@ -67,7 +66,6 @@ impl SipCallSession {
         Self::start_with_sockets(
             call_id,
             stream,
-            video_stream,
             rtsp_port,
             ffmpeg,
             local_bind_ip,
@@ -90,7 +88,6 @@ impl SipCallSession {
     pub async fn start_with_sockets(
         call_id: String,
         stream: Arc<Stream>,
-        video_stream: Option<Arc<Stream>>,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
         _local_bind_ip: &str,
@@ -106,12 +103,11 @@ impl SipCallSession {
         negotiated_video_pt: u8,
     ) -> Result<Self> {
         let local_audio_port = audio_socket.local_addr()?.port();
-        let stream_video = video_stream.unwrap_or_else(|| Arc::clone(&stream));
+        let stream_video = Arc::clone(&stream);
 
         info!(
             call_id = %call_id,
             stream = %stream.name,
-            video_stream = %stream_video.name,
             local_audio = local_audio_port,
             remote_audio = %remote_audio_addr,
             alt_audio = ?alt_audio_addr,
@@ -134,16 +130,6 @@ impl SipCallSession {
                 warn!(stream = %stream_init.name, "Failed to start stream producer for SIP call: {}", e);
             }
         }));
-
-        if stream_video.name != stream.name {
-            let v_init = Arc::clone(&stream_video);
-            let ffmpeg_v = Arc::clone(&ffmpeg);
-            tasks.push(tokio::spawn(async move {
-                if let Err(e) = v_init.ensure_started(rtsp_port, &ffmpeg_v).await {
-                    warn!(stream = %v_init.name, "Failed to start video sub-stream producer for SIP call: {}", e);
-                }
-            }));
-        }
 
         if stream.has_backchannel() {
             let stream_bc_init = Arc::clone(&stream);
@@ -372,6 +358,7 @@ impl SipCallSession {
                     let ffmpeg_video = Arc::clone(&ffmpeg);
                     let transcode_child_clone = Arc::clone(&transcode_child);
                     let tx_v_targets_fallback = Arc::clone(&tx_v_targets);
+                    let tx_video_sock = Arc::clone(&video_socket);
 
                     tasks.push(tokio::spawn(async move {
                         let mut video_track = None;
@@ -508,6 +495,21 @@ impl SipCallSession {
                                 "No native H.264 track found; starting FFmpeg H.264 transcode for SIP video"
                             );
 
+                            let internal_sock = match UdpSocket::bind("127.0.0.1:0").await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(call_id = %call_id_video, "Failed to bind loopback socket for FFmpeg RTP transcode: {}", e);
+                                    return;
+                                }
+                            };
+                            let internal_port = match internal_sock.local_addr() {
+                                Ok(a) => a.port(),
+                                Err(e) => {
+                                    warn!(call_id = %call_id_video, "Failed to get loopback port: {}", e);
+                                    return;
+                                }
+                            };
+
                             let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_video.name);
                             let h264_args = ffmpeg_video.h264_encoder_args();
                             let mut transcode_args = vec![
@@ -532,16 +534,47 @@ impl SipCallSession {
                                 "1381254914".to_string(),
                                 "-f".to_string(),
                                 "rtp".to_string(),
-                                format!("rtp://{}:{}", primary_target.ip(), primary_target.port()),
+                                format!("rtp://127.0.0.1:{}", internal_port),
                             ]);
 
                             match ffmpeg_video.spawn_stdout_process(&transcode_args) {
                                 Ok(c) => {
                                     *transcode_child_clone.lock().await = Some(c);
-                                    info!(call_id = %call_id_video, "FFmpeg H.264 transcode started for SIP video call");
+                                    info!(call_id = %call_id_video, "FFmpeg H.264 transcode process started for SIP call");
                                 }
                                 Err(e) => {
                                     warn!(call_id = %call_id_video, "Failed to spawn FFmpeg H.264 transcode: {}", e);
+                                    return;
+                                }
+                            }
+
+                            let mut buf = [0u8; 2048];
+                            let mut pkt_count = 0u64;
+                            loop {
+                                match internal_sock.recv_from(&mut buf).await {
+                                    Ok((len, _)) => {
+                                        let (primary, alt) = *tx_v_targets_fallback.lock().await;
+                                        let packet = &buf[..len];
+                                        if let Err(e) = tx_video_sock.send_to(packet, primary).await {
+                                            debug!("Error forwarding transcoded H.264 video to SIP peer: {}", e);
+                                            break;
+                                        }
+                                        if let Some(alt_addr) = alt {
+                                            if alt_addr != primary {
+                                                let _ = tx_video_sock.send_to(packet, alt_addr).await;
+                                            }
+                                        }
+                                        pkt_count += 1;
+                                        if pkt_count == 1 || pkt_count % 300 == 0 {
+                                            info!(
+                                                call_id = %call_id_video,
+                                                packets_sent = pkt_count,
+                                                target = %primary,
+                                                "Transcoded H.264 video RTP actively streaming to SIP peer"
+                                            );
+                                        }
+                                    }
+                                    Err(_) => break,
                                 }
                             }
                         }
