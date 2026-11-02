@@ -43,10 +43,30 @@ impl FfmpegManager {
             return shell_words(custom);
         }
         match self.hardware.as_deref() {
-            Some("rkmpp") => vec!["-c:v".to_string(), "h264_rkmpp".to_string()],
-            Some("vaapi") => vec!["-c:v".to_string(), "h264_vaapi".to_string()],
-            Some("cuda") | Some("nvenc") => vec!["-c:v".to_string(), "h264_nvenc".to_string()],
-            Some("videotoolbox") => vec!["-c:v".to_string(), "h264_videotoolbox".to_string()],
+            Some("rkmpp") => vec![
+                "-c:v".to_string(),
+                "h264_rkmpp".to_string(),
+                "-b:v".to_string(),
+                "2M".to_string(),
+            ],
+            Some("vaapi") => vec![
+                "-c:v".to_string(),
+                "h264_vaapi".to_string(),
+                "-b:v".to_string(),
+                "2M".to_string(),
+            ],
+            Some("cuda") | Some("nvenc") => vec![
+                "-c:v".to_string(),
+                "h264_nvenc".to_string(),
+                "-b:v".to_string(),
+                "2M".to_string(),
+            ],
+            Some("videotoolbox") => vec![
+                "-c:v".to_string(),
+                "h264_videotoolbox".to_string(),
+                "-b:v".to_string(),
+                "2M".to_string(),
+            ],
             _ => vec![
                 "-c:v".to_string(),
                 "libx264".to_string(),
