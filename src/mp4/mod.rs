@@ -315,6 +315,83 @@ pub fn make_h264_media_segment(
     writer.buf
 }
 
+/// Remove emulation prevention bytes (0x00, 0x00, 0x03 -> 0x00, 0x00) from NAL units
+pub fn unescape_rbsp(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 3 {
+            out.push(0);
+            out.push(0);
+            i += 3;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Helper to parse H.265 SPS dimensions and level_idc
+pub fn parse_h265_sps(sps: &[u8]) -> (u32, u32, u8) {
+    if sps.len() < 3 {
+        return (2560, 1440, 150);
+    }
+    let unescaped = unescape_rbsp(if sps.len() >= 2 { &sps[2..] } else { sps });
+    let mut reader = BitReader::new(&unescaped);
+
+    reader.skip_bits(4); // sps_video_parameter_set_id
+    let max_sub_layers = reader.read_bits(3).unwrap_or(0);
+    reader.skip_bits(1); // sps_temporal_id_nesting_flag
+
+    // profile_tier_level(1, max_sub_layers)
+    reader.skip_bits(2 + 1 + 5 + 32 + 48); // profile_space(2), tier_flag(1), profile_idc(5), compat(32), constraints(48)
+    let level_idc = reader.read_bits(8).unwrap_or(150) as u8;
+
+    let mut sub_layer_profile_present = Vec::new();
+    let mut sub_layer_level_present = Vec::new();
+    for _ in 0..max_sub_layers {
+        sub_layer_profile_present.push(reader.read_bits(1).unwrap_or(0) != 0);
+        sub_layer_level_present.push(reader.read_bits(1).unwrap_or(0) != 0);
+    }
+    if max_sub_layers > 0 {
+        for _ in max_sub_layers..8 {
+            reader.skip_bits(2);
+        }
+    }
+    for i in 0..max_sub_layers as usize {
+        if sub_layer_profile_present.get(i).copied().unwrap_or(false) {
+            reader.skip_bits(2 + 1 + 5 + 32 + 48);
+        }
+        if sub_layer_level_present.get(i).copied().unwrap_or(false) {
+            reader.skip_bits(8);
+        }
+    }
+
+    let _sps_id = reader.read_ue().unwrap_or(0);
+    let chroma_idc = reader.read_ue().unwrap_or(1);
+    if chroma_idc == 3 {
+        reader.skip_bits(1);
+    }
+
+    let mut pic_w = reader.read_ue().unwrap_or(2560);
+    let mut pic_h = reader.read_ue().unwrap_or(1440);
+
+    let conf_win = reader.read_bits(1).unwrap_or(0) != 0;
+    if conf_win {
+        let c_left = reader.read_ue().unwrap_or(0);
+        let c_right = reader.read_ue().unwrap_or(0);
+        let c_top = reader.read_ue().unwrap_or(0);
+        let c_bottom = reader.read_ue().unwrap_or(0);
+        let sub_w = if chroma_idc == 1 || chroma_idc == 2 { 2 } else { 1 };
+        let sub_h = if chroma_idc == 1 { 2 } else { 1 };
+        pic_w = pic_w.saturating_sub((c_left + c_right) * sub_w);
+        pic_h = pic_h.saturating_sub((c_top + c_bottom) * sub_h);
+    }
+
+    (pic_w.max(320), pic_h.max(240), level_idc)
+}
+
 /// Helper to parse H.264 SPS width and height
 pub fn parse_h264_sps_dimensions(sps: &[u8]) -> (u32, u32) {
     if sps.len() < 4 {
@@ -694,24 +771,28 @@ pub fn make_h265_init_segment(
     writer.buf.extend_from_slice(&hvc1_hdr);
 
     // 'hvcC' box (HEVCDecoderConfigurationRecord, ISO/IEC 14496-15)
+    // Remove emulation prevention bytes from SPS RBSP before extracting profile_tier_level
+    let sps_rbsp = unescape_rbsp(if sps.len() >= 2 { &sps[2..] } else { sps });
+
     let mut hvcc = vec![0u8; 23];
     hvcc[0] = 1; // configurationVersion = 1
-    if sps.len() >= 15 {
-        hvcc[1..13].copy_from_slice(&sps[3..15]);
-    } else if sps.len() >= 6 {
-        hvcc[1..4].copy_from_slice(&sps[3..6]);
-        hvcc[12] = 153; // level 5.1 default
+    if sps_rbsp.len() >= 13 {
+        // sps_rbsp[1..13]: profile_tier_level (12 bytes: profile_space/tier/profile_idc, 32-bit compat, 48-bit constraints, 8-bit level_idc)
+        hvcc[1..13].copy_from_slice(&sps_rbsp[1..13]);
     } else {
         hvcc[1] = 0x01; // Main profile
         hvcc[2] = 0x60;
-        hvcc[12] = 153;
+        hvcc[12] = 150; // level 5.0 default
     }
     hvcc[13] = 0xF0;
+    hvcc[14] = 0x00;
     hvcc[15] = 0xFC;
     hvcc[16] = 0xFD; // chromaFormat = 1 (4:2:0)
     hvcc[17] = 0xF8; // 8-bit luma
     hvcc[18] = 0xF8; // 8-bit chroma
-    hvcc[21] = 0x03; // lengthSizeMinusOne = 3 (4-byte length prefix)
+    hvcc[19] = 0x00;
+    hvcc[20] = 0x00;
+    hvcc[21] = 0x0F; // bit(2) constantFrameRate=0, bit(3) numTemporalLayers=1, bit(1) temporalIdNested=1, lengthSizeMinusOne=3
     hvcc[22] = 0x03; // numOfArrays = 3 (VPS, SPS, PPS)
 
     for (nal_type, nalu) in [(32u8, vps), (33u8, sps), (34u8, pps)] {
@@ -864,6 +945,30 @@ impl H265RtpDepacketizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_living2_h265_sps() {
+        // living2 raw SPS with emulation prevention bytes (from camera SDP)
+        let sps = vec![
+            66, 1, 1, 1, 96, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 150, 160, 1, 64, 32, 5, 161,
+            99, 107, 146, 76, 154, 229, 156, 2, 0, 0, 3, 0, 2, 0, 0, 3, 0, 30, 16,
+        ];
+        let (w, h, level) = parse_h265_sps(&sps);
+        assert_eq!((w, h), (2560, 1440));
+        assert_eq!(level, 150);
+
+        let vps = vec![64, 1, 12, 1, 255, 255, 1, 96, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 150, 172, 9];
+        let pps = vec![68, 1, 224, 118, 176, 38, 64];
+        let init = make_h265_init_segment(&vps, &sps, &pps, w, h);
+        assert!(init.len() > 100);
+
+        // Verify hvcC box contains unescaped profile_tier_level with general_level_idc = 150
+        let hvcc_idx = find_subsequence(&init, b"hvcC").expect("hvcC box must exist");
+        let hvcc_data = &init[hvcc_idx + 4..hvcc_idx + 4 + 23];
+        assert_eq!(hvcc_data[0], 1); // configurationVersion = 1
+        assert_eq!(hvcc_data[12], 150); // general_level_idc = 150
+        assert_eq!(hvcc_data[21], 0x0F); // lengthSizeMinusOne=3, numTemporalLayers=1
+    }
 
     #[test]
     fn test_doorbell_sps() {
