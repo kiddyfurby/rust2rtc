@@ -70,6 +70,8 @@ pub struct SipConfig {
     #[serde(default = "default_auto_password")]
     pub auto_password: String,
     #[serde(default)]
+    pub names: HashMap<String, String>,
+    #[serde(default)]
     pub accounts: HashMap<String, SipAccountYamlConfig>,
 }
 
@@ -81,8 +83,8 @@ pub struct SipAccountYamlConfig {
     pub auth_user: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default = "default_display_name")]
-    pub display_name: String,
+    #[serde(alias = "name", alias = "sip_name", default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub ring_group: Option<String>,
     #[serde(default = "default_auto_answer")]
@@ -95,10 +97,6 @@ fn default_base_extension() -> u16 {
 
 fn default_auto_password() -> String {
     "YourSecurePasswordHere".to_string()
-}
-
-fn default_display_name() -> String {
-    "Camera Doorbell".to_string()
 }
 
 fn default_auto_answer() -> bool {
@@ -270,13 +268,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ffmpeg_config() {
+    fn test_sip_names_and_ffmpeg_config() {
         let yaml = r#"
+sip:
+  server: "198.51.100.4:5060"
+  names:
+    living2: "Living Room 2"
+    doorbell: "Front Door"
+  accounts:
+    patio:
+      sip_name: "Back Patio"
+
 ffmpeg:
   hardware: "rkmpp"
   h264: "-c:v h264_rkmpp -b:v 2M"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        let sip = cfg.sip.expect("SIP config missing");
+        assert_eq!(sip.names.get("living2").unwrap(), "Living Room 2");
+        assert_eq!(sip.names.get("doorbell").unwrap(), "Front Door");
+        assert_eq!(sip.accounts.get("patio").unwrap().display_name.as_deref(), Some("Back Patio"));
+
         assert_eq!(cfg.ffmpeg.hardware.as_deref(), Some("rkmpp"));
         assert_eq!(cfg.ffmpeg.templates.get("h264").unwrap(), "-c:v h264_rkmpp -b:v 2M");
     }

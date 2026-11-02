@@ -92,6 +92,7 @@ impl HaVoipClient {
         username: &str,
         password: &str,
         initial_ext: &str,
+        display_name: Option<&str>,
         used_extensions: &mut std::collections::HashSet<String>,
     ) -> Result<String> {
         let mut current_ext = initial_ext.to_string();
@@ -113,11 +114,17 @@ impl HaVoipClient {
                 }
             }
 
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "username": username,
                 "password": password,
                 "extension": current_ext,
+                "replace": true,
             });
+            if let Some(dn) = display_name {
+                if !dn.is_empty() {
+                    payload["display_name"] = serde_json::Value::String(dn.to_string());
+                }
+            }
 
             let (status, body) = self.call_voip_service("create_account", &payload).await?;
             if (200..300).contains(&status) {

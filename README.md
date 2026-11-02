@@ -239,12 +239,17 @@ sip:
   auto_register_streams: true
   base_extension: 101
   auto_password: "YourSecurePasswordHere"
+  # Friendly display names for auto-registered RTSP cameras
+  names:
+    doorbell: "Front Door"
+    living2: "Living Room 2"
+    patio: "Back Patio"
   accounts:
     doorbell:
       extension: "101"
       auth_user: "camera_doorbell"
       password: "YourSecurePasswordHere"
-      display_name: "Front Doorbell"
+      sip_name: "Front Doorbell"
       auto_answer: true
 
 # Automated Doorbell Ring Group & Conference Calling

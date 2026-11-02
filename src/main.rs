@@ -240,6 +240,12 @@ async fn main() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| sip_cfg.auto_password.clone());
 
+            let display_name = acc_cfg
+                .display_name
+                .clone()
+                .or_else(|| sip_cfg.names.get(stream_name.as_str()).cloned())
+                .unwrap_or_else(|| format!("Camera {}", stream_name));
+
             let client_cfg = sip::client::SipAccountConfig {
                 stream_name: stream_name.clone(),
                 server: server.to_string(),
@@ -247,7 +253,7 @@ async fn main() -> Result<()> {
                 extension,
                 auth_user,
                 password,
-                display_name: acc_cfg.display_name.clone(),
+                display_name,
                 ring_group: acc_cfg.ring_group.clone(),
                 auto_answer: acc_cfg.auto_answer,
                 local_ip: local_ip.to_string(),
@@ -269,7 +275,11 @@ async fn main() -> Result<()> {
                 }
                 let extension = alloc_ext();
                 let auth_user = format!("camera_{}", stream_name);
-                let display_name = format!("Camera {}", stream_name);
+                let display_name = sip_cfg
+                    .names
+                    .get(&stream_name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Camera {}", stream_name));
 
                 let client_cfg = sip::client::SipAccountConfig {
                     stream_name: stream_name.clone(),
