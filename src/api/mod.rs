@@ -898,9 +898,11 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     }
 
                     let client_codecs: Vec<String> = match &ws_msg.value {
-                        Some(serde_json::Value::String(s)) => vec![s.clone()],
+                        Some(serde_json::Value::String(s)) => {
+                            s.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
+                        }
                         Some(serde_json::Value::Array(arr)) => {
-                            arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                            arr.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).collect()
                         }
                         _ => Vec::new(),
                     };
@@ -1173,13 +1175,64 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                             };
 
                             if let Some(mut stdout) = child.stdout.take() {
-                                let mut buf = vec![0u8; 8192];
+                                let mut pending = Vec::new();
+                                let mut chunk = vec![0u8; 16384];
+                                let mut init_seg: Option<Vec<u8>> = None;
+                                let mut moof_seg: Option<Vec<u8>> = None;
+
                                 loop {
-                                    match stdout.read(&mut buf).await {
+                                    match stdout.read(&mut chunk).await {
                                         Ok(0) => break,
                                         Ok(n) => {
-                                            if tx_mse.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
-                                                break;
+                                            pending.extend_from_slice(&chunk[..n]);
+                                            while pending.len() >= 8 {
+                                                let box_size = u32::from_be_bytes([
+                                                    pending[0], pending[1], pending[2], pending[3],
+                                                ]) as usize;
+                                                if box_size < 8 {
+                                                    // Invalid box header or EOS
+                                                    break;
+                                                }
+                                                if pending.len() < box_size {
+                                                    // Wait for full box
+                                                    break;
+                                                }
+                                                let mut box_name = [0u8; 4];
+                                                box_name.copy_from_slice(&pending[4..8]);
+                                                let box_data = pending.drain(..box_size).collect::<Vec<u8>>();
+
+                                                if &box_name == b"ftyp" {
+                                                    init_seg = Some(box_data);
+                                                } else if &box_name == b"moov" {
+                                                    if let Some(mut init) = init_seg.take() {
+                                                        init.extend_from_slice(&box_data);
+                                                        if tx_mse.send(Message::Binary(init.into())).await.is_err() {
+                                                            return;
+                                                        }
+                                                    } else {
+                                                        if tx_mse.send(Message::Binary(box_data.into())).await.is_err() {
+                                                            return;
+                                                        }
+                                                    }
+                                                } else if &box_name == b"moof" {
+                                                    moof_seg = Some(box_data);
+                                                } else if &box_name == b"mdat" {
+                                                    if let Some(mut moof) = moof_seg.take() {
+                                                        moof.extend_from_slice(&box_data);
+                                                        if tx_mse.send(Message::Binary(moof.into())).await.is_err() {
+                                                            return;
+                                                        }
+                                                    } else {
+                                                        if tx_mse.send(Message::Binary(box_data.into())).await.is_err() {
+                                                            return;
+                                                        }
+                                                    }
+                                                } else {
+                                                    // Other top-level box
+                                                    if tx_mse.send(Message::Binary(box_data.into())).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(_) => break,
