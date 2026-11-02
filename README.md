@@ -225,6 +225,10 @@ rtsp:
 
 ffmpeg:
   bin: "ffmpeg"
+  # Hardware acceleration profile: rkmpp (Rockchip RK3588), vaapi (Intel/AMD), cuda/nvenc (Nvidia), videotoolbox (Apple Silicon)
+  hardware: "rkmpp"
+  # Custom FFmpeg encoding templates (optional overrides)
+  h264: "-c:v h264_rkmpp -b:v 2M"
 
 sip:
   server: "198.51.100.1:5060"

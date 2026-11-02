@@ -181,6 +181,10 @@ pub struct FfmpegConfig {
     pub bin: String,
     #[serde(default = "default_ffmpeg_global")]
     pub global: String,
+    #[serde(default)]
+    pub hardware: Option<String>,
+    #[serde(flatten, default)]
+    pub templates: HashMap<String, String>,
 }
 
 impl Default for FfmpegConfig {
@@ -188,6 +192,8 @@ impl Default for FfmpegConfig {
         Self {
             bin: default_ffmpeg_bin(),
             global: default_ffmpeg_global(),
+            hardware: None,
+            templates: HashMap::new(),
         }
     }
 }
@@ -256,5 +262,22 @@ impl Config {
             .or_else(|| self.sip.as_ref().and_then(|s| s.ha_token.clone()))
             .or_else(|| std::env::var("HA_TOKEN").ok())
             .or_else(|| std::env::var("SUPERVISOR_TOKEN").ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ffmpeg_config() {
+        let yaml = r#"
+ffmpeg:
+  hardware: "rkmpp"
+  h264: "-c:v h264_rkmpp -b:v 2M"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+        assert_eq!(cfg.ffmpeg.hardware.as_deref(), Some("rkmpp"));
+        assert_eq!(cfg.ffmpeg.templates.get("h264").unwrap(), "-c:v h264_rkmpp -b:v 2M");
     }
 }

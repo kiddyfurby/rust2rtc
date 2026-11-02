@@ -8,19 +8,56 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone)]
 pub struct FfmpegManager {
     bin: String,
     global_args: String,
+    pub hardware: Option<String>,
+    pub templates: HashMap<String, String>,
 }
 
 impl FfmpegManager {
-    pub fn new(bin: String, global_args: String) -> Self {
-        Self { bin, global_args }
+    pub fn new(
+        bin: String,
+        global_args: String,
+        hardware: Option<String>,
+        templates: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            bin,
+            global_args,
+            hardware,
+            templates,
+        }
     }
 
     pub fn bin(&self) -> &str {
         &self.bin
+    }
+
+    /// Resolve H.264 encoder arguments based on configured templates or hardware profile
+    pub fn h264_encoder_args(&self) -> Vec<String> {
+        if let Some(custom) = self.templates.get("h264") {
+            return shell_words(custom);
+        }
+        match self.hardware.as_deref() {
+            Some("rkmpp") => vec!["-c:v".to_string(), "h264_rkmpp".to_string()],
+            Some("vaapi") => vec!["-c:v".to_string(), "h264_vaapi".to_string()],
+            Some("cuda") | Some("nvenc") => vec!["-c:v".to_string(), "h264_nvenc".to_string()],
+            Some("videotoolbox") => vec!["-c:v".to_string(), "h264_videotoolbox".to_string()],
+            _ => vec![
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "superfast".to_string(),
+                "-tune".to_string(),
+                "zerolatency".to_string(),
+                "-pix_fmt".to_string(),
+                "yuv420p".to_string(),
+            ],
+        }
     }
 
     /// Check if FFmpeg is available and return version info
@@ -100,6 +137,46 @@ impl FfmpegManager {
 
         let mut args = vec!["-hide_banner".to_string(), "-v".to_string(), "warning".to_string()];
 
+        // Check if stream explicitly requests hardware acceleration (e.g. #hardware=rkmpp)
+        let mut hardware_profile = self.hardware.clone();
+        if let Some(params) = params_str {
+            for param in params.split('#') {
+                if let Some((k, v)) = param.split_once('=') {
+                    if k == "hardware" || k == "hw" {
+                        hardware_profile = Some(v.to_string());
+                    }
+                }
+            }
+        }
+
+        // Apply hardware decode acceleration before input
+        if let Some(ref hw) = hardware_profile {
+            match hw.as_str() {
+                "rkmpp" => {
+                    args.extend([
+                        "-hwaccel".to_string(),
+                        "rkmpp".to_string(),
+                        "-hwaccel_output_format".to_string(),
+                        "drm_prime".to_string(),
+                    ]);
+                }
+                "vaapi" => {
+                    args.extend(["-hwaccel".to_string(), "vaapi".to_string()]);
+                }
+                "cuda" => {
+                    args.extend(["-hwaccel".to_string(), "cuda".to_string()]);
+                }
+                "videotoolbox" => {
+                    args.extend(["-hwaccel".to_string(), "videotoolbox".to_string()]);
+                }
+                custom => {
+                    if let Some(custom_flags) = self.templates.get(custom) {
+                        args.extend(shell_words(custom_flags));
+                    }
+                }
+            }
+        }
+
         // If input looks like RTSP, use TCP low delay
         if resolved_input.starts_with("rtsp://") {
             args.extend([
@@ -123,37 +200,65 @@ impl FfmpegManager {
                     match k {
                         "video" => {
                             has_video = true;
-                            match v {
-                                "h264" => {
-                                    args.extend([
-                                        "-c:v".to_string(),
-                                        "libx264".to_string(),
-                                        "-preset".to_string(),
-                                        "superfast".to_string(),
-                                        "-tune".to_string(),
-                                        "zerolatency".to_string(),
-                                        "-pix_fmt".to_string(),
-                                        "yuv420p".to_string(),
-                                    ]);
-                                }
-                                "h265" => {
-                                    args.extend([
-                                        "-c:v".to_string(),
-                                        "libx265".to_string(),
-                                        "-preset".to_string(),
-                                        "superfast".to_string(),
-                                        "-tune".to_string(),
-                                        "zerolatency".to_string(),
-                                    ]);
-                                }
-                                "mjpeg" => {
-                                    args.extend(["-c:v".to_string(), "mjpeg".to_string()]);
-                                }
-                                "copy" => {
-                                    args.extend(["-c:v".to_string(), "copy".to_string()]);
-                                }
-                                _ => {
-                                    args.extend(["-c:v".to_string(), v.to_string()]);
+                            if let Some(custom) = self.templates.get(v) {
+                                args.extend(shell_words(custom));
+                            } else {
+                                match v {
+                                    "h264" => {
+                                        if hardware_profile.as_deref() == Some("rkmpp") {
+                                            args.extend(["-c:v".to_string(), "h264_rkmpp".to_string()]);
+                                        } else if hardware_profile.as_deref() == Some("vaapi") {
+                                            args.extend(["-c:v".to_string(), "h264_vaapi".to_string()]);
+                                        } else if hardware_profile.as_deref() == Some("cuda") || hardware_profile.as_deref() == Some("nvenc") {
+                                            args.extend(["-c:v".to_string(), "h264_nvenc".to_string()]);
+                                        } else if hardware_profile.as_deref() == Some("videotoolbox") {
+                                            args.extend(["-c:v".to_string(), "h264_videotoolbox".to_string()]);
+                                        } else {
+                                            args.extend([
+                                                "-c:v".to_string(),
+                                                "libx264".to_string(),
+                                                "-preset".to_string(),
+                                                "superfast".to_string(),
+                                                "-tune".to_string(),
+                                                "zerolatency".to_string(),
+                                                "-pix_fmt".to_string(),
+                                                "yuv420p".to_string(),
+                                            ]);
+                                        }
+                                    }
+                                    "h265" | "hevc" => {
+                                        if hardware_profile.as_deref() == Some("rkmpp") {
+                                            args.extend(["-c:v".to_string(), "hevc_rkmpp".to_string()]);
+                                        } else if hardware_profile.as_deref() == Some("vaapi") {
+                                            args.extend(["-c:v".to_string(), "hevc_vaapi".to_string()]);
+                                        } else if hardware_profile.as_deref() == Some("cuda") || hardware_profile.as_deref() == Some("nvenc") {
+                                            args.extend(["-c:v".to_string(), "hevc_nvenc".to_string()]);
+                                        } else if hardware_profile.as_deref() == Some("videotoolbox") {
+                                            args.extend(["-c:v".to_string(), "hevc_videotoolbox".to_string()]);
+                                        } else {
+                                            args.extend([
+                                                "-c:v".to_string(),
+                                                "libx265".to_string(),
+                                                "-preset".to_string(),
+                                                "superfast".to_string(),
+                                                "-tune".to_string(),
+                                                "zerolatency".to_string(),
+                                            ]);
+                                        }
+                                    }
+                                    "mjpeg" => {
+                                        if hardware_profile.as_deref() == Some("rkmpp") {
+                                            args.extend(["-c:v".to_string(), "mjpeg_rkmpp".to_string()]);
+                                        } else {
+                                            args.extend(["-c:v".to_string(), "mjpeg".to_string()]);
+                                        }
+                                    }
+                                    "copy" => {
+                                        args.extend(["-c:v".to_string(), "copy".to_string()]);
+                                    }
+                                    _ => {
+                                        args.extend(["-c:v".to_string(), v.to_string()]);
+                                    }
                                 }
                             }
                         }
