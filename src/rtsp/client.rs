@@ -253,7 +253,10 @@ impl RtspClient {
         info!(stream = %stream.name, "RTSP PLAY active, streaming in-process interleaved RTP");
 
         // 6. Interleaved RTP packet loop
-        let mut keepalive_timer = tokio::time::interval(Duration::from_secs(25));
+        let mut keepalive_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(25),
+            Duration::from_secs(25),
+        );
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -337,36 +340,65 @@ impl RtspClient {
                     return Ok(true);
                 }
                 _ = keepalive_timer.tick() => {
-                    // Send RTSP keepalive (OPTIONS is universally supported without a response body)
                     trace!(stream = %stream.name, "Sending RTSP keepalive");
-                    let _ = tokio::time::timeout(
+                    // Try GET_PARAMETER with session first (RFC 2326 standard, preferred by Reolink)
+                    let gp_res = tokio::time::timeout(
                         Duration::from_millis(5000),
-                        Self::send_raw_request(
+                        Self::send_request_with_auth(
                             &mut tcp,
                             &mut buffer,
-                            "OPTIONS",
+                            "GET_PARAMETER",
                             &clean_url,
                             &mut cseq,
+                            &username,
+                            &password,
+                            &mut auth_info,
                             session_id.as_deref(),
-                            auth_info.as_ref().and_then(|a| a.generate_header("OPTIONS", &clean_url, &username, &password)).as_deref(),
                             None,
                             Some(&channel_map),
                             Some(&stream),
                         ),
                     ).await;
+
+                    if let Ok(Ok((_, _, status))) = gp_res {
+                        if status == 405 || status == 501 {
+                            // Fall back to OPTIONS with auth if GET_PARAMETER is not implemented
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(5000),
+                                Self::send_request_with_auth(
+                                    &mut tcp,
+                                    &mut buffer,
+                                    "OPTIONS",
+                                    &clean_url,
+                                    &mut cseq,
+                                    &username,
+                                    &password,
+                                    &mut auth_info,
+                                    session_id.as_deref(),
+                                    None,
+                                    Some(&channel_map),
+                                    Some(&stream),
+                                ),
+                            ).await;
+                        }
+                    }
                 }
-                read_res = tcp.read_buf(&mut buffer) => {
+                read_res = tokio::time::timeout(Duration::from_secs(8), tcp.read_buf(&mut buffer)) => {
                     match read_res {
-                        Ok(0) => {
+                        Ok(Ok(0)) => {
                             warn!(stream = %stream.name, "RTSP connection reached EOF");
                             return Ok(false);
                         }
-                        Ok(_) => {
+                        Ok(Ok(_)) => {
                             // Loop around to process buffered data
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(stream = %stream.name, "RTSP TCP socket read error: {}", e);
                             return Err(e.into());
+                        }
+                        Err(_) => {
+                            warn!(stream = %stream.name, "RTSP stream read timeout (no packets for 8s), reconnecting");
+                            return Ok(false);
                         }
                     }
                 }
