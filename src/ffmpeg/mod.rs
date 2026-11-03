@@ -80,6 +80,43 @@ impl FfmpegManager {
         }
     }
 
+    /// Resolve H.264 encoder arguments tailored for SIP softphones:
+    /// Constrained Baseline profile (level 3.1), repeated headers (SPS/PPS on every keyframe),
+    /// short GOP (1s) for instant recovery, and downscaling to max 720p (matching level 3.1 max-fs limit).
+    pub fn sip_h264_encoder_args(&self) -> Vec<String> {
+        if let Some(custom) = self.templates.get("sip_h264") {
+            return shell_words(custom);
+        }
+        vec![
+            "-vf".to_string(),
+            "scale=w='min(1280,iw)':h=-2".to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            "ultrafast".to_string(),
+            "-tune".to_string(),
+            "zerolatency".to_string(),
+            "-profile:v".to_string(),
+            "baseline".to_string(),
+            "-level".to_string(),
+            "3.1".to_string(),
+            "-x264-params".to_string(),
+            "repeat-headers=1".to_string(),
+            "-g".to_string(),
+            "15".to_string(),
+            "-keyint_min".to_string(),
+            "15".to_string(),
+            "-b:v".to_string(),
+            "1500k".to_string(),
+            "-maxrate".to_string(),
+            "2000k".to_string(),
+            "-bufsize".to_string(),
+            "3000k".to_string(),
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
+        ]
+    }
+
     /// Check if FFmpeg is available and return version info
     pub async fn check_version(&self) -> Result<String> {
         let output = Command::new(&self.bin)
