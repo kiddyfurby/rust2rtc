@@ -26,7 +26,12 @@ pub struct OnvifBackchannelClient {
 
 impl OnvifBackchannelClient {
     pub fn new(raw_url: &str) -> Result<Self> {
-        let clean_url = raw_url.split('#').next().unwrap_or(raw_url);
+        let clean_url = raw_url
+            .split('#')
+            .next()
+            .unwrap_or(raw_url)
+            .trim_end_matches("?backchannel=1")
+            .trim_end_matches("&backchannel=1");
         let mut url = Url::parse(clean_url).context("Failed to parse RTSP/ONVIF URL")?;
         // If scheme is onvif, normalize to standard rtsp port 554 if needed
         if url.scheme() == "onvif" {
@@ -192,9 +197,21 @@ impl OnvifBackchannelClient {
         mut self,
         mut rx: mpsc::Receiver<(Bytes, bool)>, // (payload, is_pcmu)
     ) -> Result<()> {
-        let mut stream = self.stream.take().context("Not connected")?;
+        let stream = self.stream.take().context("Not connected")?;
         let channel = self.interleaved_channel;
         let mut repacker = G711Repacker::new(1024, 0, 0x99887766); // 1024 bytes (128ms PCMU/8000)
+
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Background task to drain and discard incoming RTCP reports from camera
+        let drain_handle = tokio::spawn(async move {
+            let mut discard = [0u8; 1024];
+            while let Ok(n) = reader.read(&mut discard).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
 
         while let Some((payload, is_pcmu)) = rx.recv().await {
             let mut data = payload.to_vec();
@@ -209,13 +226,15 @@ impl OnvifBackchannelClient {
                 frame.extend_from_slice(&[b'$', channel, (size >> 8) as u8, (size & 0xff) as u8]);
                 frame.extend_from_slice(&rtp);
 
-                if let Err(e) = stream.write_all(&frame).await {
+                if let Err(e) = writer.write_all(&frame).await {
                     error!("Error writing RTSP backchannel frame: {}", e);
+                    drain_handle.abort();
                     return Err(e.into());
                 }
             }
         }
 
+        drain_handle.abort();
         debug!("ONVIF backchannel sender finished");
         Ok(())
     }
@@ -331,8 +350,14 @@ async fn read_rtsp_response(
         }
         buf.extend_from_slice(&chunk[..n]);
 
-        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
-            header_end = Some(pos);
+        // Discard any interleaved RTP/RTCP binary frames preceding the RTSP response line
+        if let Some(rtsp_pos) = find_subsequence(&buf, b"RTSP/1.") {
+            if rtsp_pos > 0 {
+                buf.drain(..rtsp_pos);
+            }
+            if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                header_end = Some(pos);
+            }
         }
     }
 
@@ -409,6 +434,29 @@ a=sendonly\r\n";
         assert_eq!(
             ctrl,
             Some("rtsp://192.168.1.42/Preview_01_main/trackID=2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_backchannel_sdp_rtspserver_living() {
+        let sdp = "\
+v=0\r\n\
+o=- 1793567930791778 1 IN IP4 192.0.2.25\r\n\
+s=Session streamed by \"rRTSPServer\"\r\n\
+m=video 0 RTP/AVP 96\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=control:track1\r\n\
+m=audio 0 RTP/AVP 97\r\n\
+a=rtpmap:97 MPEG4-GENERIC/16000\r\n\
+a=control:track2\r\n\
+m=audio 0 RTP/AVP 0\r\n\
+a=sendonly\r\n\
+a=control:track3\r\n";
+
+        let ctrl = parse_backchannel_control(sdp, "rtsp://192.0.2.25/ch0_0.h264");
+        assert_eq!(
+            ctrl,
+            Some("rtsp://192.0.2.25/ch0_0.h264/track3".to_string())
         );
     }
 }
