@@ -281,7 +281,21 @@ impl Stream {
                     track.codec.payload_type, track.codec.name, track.codec.clock_rate, rtpmap_suffix
                 ));
 
-                if let Some(ref fmtp) = track.codec.fmtp {
+                let effective_fmtp = if let Some(ref fmtp) = track.codec.fmtp {
+                    if fmtp.contains("sprop-parameter-sets") || fmtp.contains("sprop-sps") {
+                        Some(fmtp.clone())
+                    } else if let Some(sprop) = track.get_sprop() {
+                        Some(format!("{};{}", fmtp, sprop))
+                    } else {
+                        Some(fmtp.clone())
+                    }
+                } else if let Some(sprop) = track.get_sprop() {
+                    Some(format!("packetization-mode=1;{}", sprop))
+                } else {
+                    None
+                };
+
+                if let Some(ref fmtp) = effective_fmtp {
                     sdp.push_str(&format!(
                         "a=fmtp:{} {}\r\n",
                         track.codec.payload_type, fmtp

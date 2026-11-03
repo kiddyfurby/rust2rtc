@@ -351,7 +351,14 @@ impl RtspServer {
                             for (&ch, track) in &track_channels {
                                 let mut track_rx = track.subscribe();
                                 let tx_clone = tx.clone();
+                                let initial_param_sets = track.get_param_sets();
                                 tokio::spawn(async move {
+                                    // Burst cached SPS/PPS/VPS parameter sets immediately to prime decoder
+                                    for pkt in initial_param_sets {
+                                        if tx_clone.send(RtspOutgoing::Rtp(ch, pkt.raw)).await.is_err() {
+                                            return;
+                                        }
+                                    }
                                     while let Ok(packet) = track_rx.recv().await {
                                         if tx_clone.send(RtspOutgoing::Rtp(ch, packet.raw)).await.is_err() {
                                             break;

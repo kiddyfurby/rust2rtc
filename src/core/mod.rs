@@ -1,9 +1,10 @@
 #![allow(dead_code)]
 
+use base64::Engine;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
@@ -214,6 +215,17 @@ impl RtpPacket {
     }
 }
 
+/// Cached parameter sets for video tracks (SPS, PPS, VPS)
+#[derive(Debug, Default, Clone)]
+pub struct ParamSets {
+    pub h264_sps: Option<Vec<u8>>,
+    pub h264_pps: Option<Vec<u8>>,
+    pub h265_vps: Option<Vec<u8>>,
+    pub h265_sps: Option<Vec<u8>>,
+    pub h265_pps: Option<Vec<u8>>,
+    pub rtp_packets: Vec<RtpPacket>,
+}
+
 /// Track broadcaster holding a multi-consumer channel
 #[derive(Debug)]
 pub struct Track {
@@ -222,23 +234,55 @@ pub struct Track {
     tx: broadcast::Sender<RtpPacket>,
     pub packets_total: Arc<AtomicU64>,
     pub bytes_total: Arc<AtomicU64>,
+    param_sets: RwLock<ParamSets>,
 }
 
 impl Track {
     pub fn new(codec: Codec, kind: MediaKind, capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
+        let mut param_sets = ParamSets::default();
+
+        if kind == MediaKind::Video {
+            let is_hevc = codec.name.eq_ignore_ascii_case("H265") || codec.name.eq_ignore_ascii_case("HEVC");
+            if let Some(ref fmtp) = codec.fmtp {
+                if !is_hevc {
+                    if let Some((sps, pps)) = extract_h264_sps_pps(fmtp) {
+                        let stap_a = build_h264_stap_a(&sps, &pps);
+                        let rtp = RtpPacket::create(codec.payload_type, 1, 0, 0x12345678, false, &stap_a);
+                        param_sets.h264_sps = Some(sps);
+                        param_sets.h264_pps = Some(pps);
+                        param_sets.rtp_packets = vec![rtp];
+                    }
+                } else if let Some((vps, sps, pps)) = extract_h265_vps_sps_pps(fmtp) {
+                    let p1 = RtpPacket::create(codec.payload_type, 1, 0, 0x12345678, false, &vps);
+                    let p2 = RtpPacket::create(codec.payload_type, 2, 0, 0x12345678, false, &sps);
+                    let p3 = RtpPacket::create(codec.payload_type, 3, 0, 0x12345678, false, &pps);
+                    param_sets.h265_vps = Some(vps);
+                    param_sets.h265_sps = Some(sps);
+                    param_sets.h265_pps = Some(pps);
+                    param_sets.rtp_packets = vec![p1, p2, p3];
+                }
+            }
+        }
+
         Self {
             codec,
             kind,
             tx,
             packets_total: Arc::new(AtomicU64::new(0)),
             bytes_total: Arc::new(AtomicU64::new(0)),
+            param_sets: RwLock::new(param_sets),
         }
     }
 
     pub fn send(&self, packet: RtpPacket) {
         self.packets_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_total.fetch_add(packet.raw.len() as u64, Ordering::Relaxed);
+
+        if self.kind == MediaKind::Video {
+            self.inspect_and_cache_params(&packet);
+        }
+
         let _ = self.tx.send(packet);
     }
 
@@ -248,5 +292,302 @@ impl Track {
 
     pub fn consumer_count(&self) -> usize {
         self.tx.receiver_count()
+    }
+
+    pub fn get_param_sets(&self) -> Vec<RtpPacket> {
+        self.param_sets.read().unwrap().rtp_packets.clone()
+    }
+
+    pub fn get_sprop(&self) -> Option<String> {
+        let ps = self.param_sets.read().unwrap();
+        if let (Some(sps), Some(pps)) = (&ps.h264_sps, &ps.h264_pps) {
+            let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps);
+            let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps);
+            Some(format!("sprop-parameter-sets={},{}", sps_b64, pps_b64))
+        } else if let (Some(vps), Some(sps), Some(pps)) = (&ps.h265_vps, &ps.h265_sps, &ps.h265_pps) {
+            let vps_b64 = base64::engine::general_purpose::STANDARD.encode(vps);
+            let sps_b64 = base64::engine::general_purpose::STANDARD.encode(sps);
+            let pps_b64 = base64::engine::general_purpose::STANDARD.encode(pps);
+            Some(format!("sprop-vps={};sprop-sps={};sprop-pps={}", vps_b64, sps_b64, pps_b64))
+        } else {
+            None
+        }
+    }
+
+    fn inspect_and_cache_params(&self, packet: &RtpPacket) {
+        let payload = packet.payload();
+        if payload.is_empty() {
+            return;
+        }
+
+        let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
+        let (_, is_param_set) = is_keyframe_or_param_set(is_hevc, payload);
+        if !is_param_set {
+            return;
+        }
+
+        let mut ps = self.param_sets.write().unwrap();
+        if !is_hevc {
+            let nalu_type = payload[0] & 0x1F;
+            if nalu_type == 7 {
+                ps.h264_sps = Some(payload.to_vec());
+            } else if nalu_type == 8 {
+                ps.h264_pps = Some(payload.to_vec());
+            } else if nalu_type == 24 {
+                let nals = unpack_h264_stap_a(payload);
+                for nal in nals {
+                    if !nal.is_empty() {
+                        let sub_type = nal[0] & 0x1F;
+                        if sub_type == 7 {
+                            ps.h264_sps = Some(nal);
+                        } else if sub_type == 8 {
+                            ps.h264_pps = Some(nal);
+                        }
+                    }
+                }
+            }
+            if let (Some(sps), Some(pps)) = (&ps.h264_sps, &ps.h264_pps) {
+                let stap_a = build_h264_stap_a(sps, pps);
+                let rtp = RtpPacket::create(packet.payload_type, packet.sequence_number, packet.timestamp, packet.ssrc, false, &stap_a);
+                ps.rtp_packets = vec![rtp];
+            }
+        } else {
+            let nalu_type = (payload[0] >> 1) & 0x3F;
+            if nalu_type == 32 {
+                ps.h265_vps = Some(payload.to_vec());
+            } else if nalu_type == 33 {
+                ps.h265_sps = Some(payload.to_vec());
+            } else if nalu_type == 34 {
+                ps.h265_pps = Some(payload.to_vec());
+            } else if nalu_type == 48 {
+                let nals = unpack_h265_ap(payload);
+                for nal in nals {
+                    if !nal.is_empty() {
+                        let sub_type = (nal[0] >> 1) & 0x3F;
+                        if sub_type == 32 {
+                            ps.h265_vps = Some(nal);
+                        } else if sub_type == 33 {
+                            ps.h265_sps = Some(nal);
+                        } else if sub_type == 34 {
+                            ps.h265_pps = Some(nal);
+                        }
+                    }
+                }
+            }
+            let mut rtp_pkts = Vec::new();
+            if let Some(ref vps) = ps.h265_vps {
+                rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number, packet.timestamp, packet.ssrc, false, vps));
+            }
+            if let Some(ref sps) = ps.h265_sps {
+                rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number.wrapping_add(1), packet.timestamp, packet.ssrc, false, sps));
+            }
+            if let Some(ref pps) = ps.h265_pps {
+                rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number.wrapping_add(2), packet.timestamp, packet.ssrc, false, pps));
+            }
+            if !rtp_pkts.is_empty() {
+                ps.rtp_packets = rtp_pkts;
+            }
+        }
+    }
+}
+
+pub fn unpack_h264_stap_a(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut nals = Vec::new();
+    if payload.len() < 3 || (payload[0] & 0x1F) != 24 {
+        return nals;
+    }
+    let mut idx = 1;
+    while idx + 2 <= payload.len() {
+        let nlen = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+        idx += 2;
+        if nlen > 0 && idx + nlen <= payload.len() {
+            nals.push(payload[idx..idx + nlen].to_vec());
+            idx += nlen;
+        } else {
+            break;
+        }
+    }
+    nals
+}
+
+pub fn extract_h264_sps_pps(fmtp: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
+        let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
+        let val = after.split(';').next()?.trim();
+        let (sps_b64, pps_b64) = val.split_once(',')?;
+        let sps = base64::engine::general_purpose::STANDARD
+            .decode(sps_b64.trim())
+            .ok()?;
+        let pps = base64::engine::general_purpose::STANDARD
+            .decode(pps_b64.trim())
+            .ok()?;
+        return Some((sps, pps));
+    }
+    None
+}
+
+pub fn extract_h265_vps_sps_pps(fmtp: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut vps = None;
+    let mut sps = None;
+    let mut pps = None;
+
+    for part in fmtp.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            match k.trim() {
+                "sprop-vps" => {
+                    vps = base64::engine::general_purpose::STANDARD
+                        .decode(v.trim())
+                        .ok();
+                }
+                "sprop-sps" => {
+                    sps = base64::engine::general_purpose::STANDARD
+                        .decode(v.trim())
+                        .ok();
+                }
+                "sprop-pps" => {
+                    pps = base64::engine::general_purpose::STANDARD
+                        .decode(v.trim())
+                        .ok();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let (Some(v), Some(s), Some(p)) = (vps, sps, pps) {
+        Some((v, s, p))
+    } else {
+        None
+    }
+}
+
+pub fn build_h264_stap_a(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 2 + sps.len() + 2 + pps.len());
+    payload.push(0x78); // STAP-A header: F=0, NRI=3, Type=24
+    payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    payload.extend_from_slice(sps);
+    payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    payload.extend_from_slice(pps);
+    payload
+}
+
+pub fn build_h265_ap(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + 2 + vps.len() + 2 + sps.len() + 2 + pps.len());
+    payload.push(0x60); // AP header byte 1: Type=48 << 1
+    payload.push(0x01); // AP header byte 2: LayerId=0, TID=1
+    payload.extend_from_slice(&(vps.len() as u16).to_be_bytes());
+    payload.extend_from_slice(vps);
+    payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    payload.extend_from_slice(sps);
+    payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    payload.extend_from_slice(pps);
+    payload
+}
+
+pub fn unpack_h265_ap(payload: &[u8]) -> Vec<Vec<u8>> {
+    let mut nals = Vec::new();
+    if payload.len() < 4 || ((payload[0] >> 1) & 0x3F) != 48 {
+        return nals;
+    }
+    let mut idx = 2;
+    while idx + 2 <= payload.len() {
+        let nlen = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+        idx += 2;
+        if nlen > 0 && idx + nlen <= payload.len() {
+            nals.push(payload[idx..idx + nlen].to_vec());
+            idx += nlen;
+        } else {
+            break;
+        }
+    }
+    nals
+}
+
+pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
+    if payload.is_empty() {
+        return (false, false);
+    }
+    if is_hevc {
+        let nalu_type = (payload[0] >> 1) & 0x3F;
+        if nalu_type == 32 || nalu_type == 33 || nalu_type == 34 || nalu_type == 48 {
+            return (false, true); // VPS, SPS, PPS, or AP
+        }
+        if (19..=21).contains(&nalu_type) {
+            return (true, false); // IDR / CRA
+        }
+        if nalu_type == 49 && payload.len() >= 3 {
+            let start = (payload[2] & 0x80) != 0;
+            let fu_type = payload[2] & 0x3F;
+            if (19..=21).contains(&fu_type) {
+                return (start, false);
+            }
+        }
+    } else {
+        let nalu_type = payload[0] & 0x1F;
+        if nalu_type == 7 || nalu_type == 8 || nalu_type == 24 {
+            return (false, true); // SPS, PPS, or STAP-A
+        }
+        if nalu_type == 5 {
+            return (true, false); // IDR slice
+        }
+        if nalu_type == 28 && payload.len() >= 2 {
+            let start = (payload[1] & 0x80) != 0;
+            let fu_type = payload[1] & 0x1F;
+            if fu_type == 5 {
+                return (start, false);
+            }
+        }
+    }
+    (false, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_h264_sps_pps_caching() {
+        let codec = Codec::new_h264();
+        let track = Track::new(codec, MediaKind::Video, 100);
+
+        // Initially no parameter sets
+        assert!(track.get_param_sets().is_empty());
+        assert!(track.get_sprop().is_none());
+
+        // Send SPS (NAL type 7)
+        let sps_payload = vec![0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed];
+        let sps_pkt = RtpPacket::create(96, 1, 1000, 0x1234, false, &sps_payload);
+        track.send(sps_pkt);
+
+        // Send PPS (NAL type 8)
+        let pps_payload = vec![0x68, 0xce, 0x38, 0x80];
+        let pps_pkt = RtpPacket::create(96, 2, 1000, 0x1234, false, &pps_payload);
+        track.send(pps_pkt);
+
+        // Track should now have cached STAP-A packet and sprop string
+        let ps = track.get_param_sets();
+        assert_eq!(ps.len(), 1);
+        let stap_payload = ps[0].payload();
+        assert_eq!(stap_payload[0] & 0x1F, 24); // STAP-A
+
+        let sprop = track.get_sprop().expect("sprop should be generated");
+        assert!(sprop.starts_with("sprop-parameter-sets="));
+        assert!(sprop.contains(","));
+    }
+
+    #[test]
+    fn test_track_fmtp_init() {
+        let mut codec = Codec::new_h264();
+        codec.fmtp = Some("packetization-mode=1;sprop-parameter-sets=Z0IAKeNQDwBE/LgLcBAQFA==,aM48gA==".to_string());
+        let track = Track::new(codec, MediaKind::Video, 100);
+
+        let ps = track.get_param_sets();
+        assert_eq!(ps.len(), 1);
+        let stap_payload = ps[0].payload();
+        assert_eq!(stap_payload[0] & 0x1F, 24);
+
+        let sprop = track.get_sprop().expect("sprop should exist from fmtp");
+        assert!(sprop.contains("Z0IAKeNQDwBE/LgLcBAQFA=="));
     }
 }
