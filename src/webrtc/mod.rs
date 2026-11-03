@@ -1,7 +1,7 @@
 use crate::core::MediaKind;
 use crate::streams::Stream;
 use anyhow::Result;
-use base64::Engine;
+
 use bytes::{Bytes, BytesMut};
 use rtc::interceptor::Registry;
 use rtc::media_stream::MediaStreamTrack;
@@ -743,140 +743,10 @@ fn is_audio_active(sdp: &str) -> bool {
     false
 }
 
-pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
-    if payload.is_empty() {
-        return (false, false);
-    }
-    if is_hevc {
-        let nalu_type = (payload[0] >> 1) & 0x3F;
-        if nalu_type == 32 || nalu_type == 33 || nalu_type == 34 || nalu_type == 48 {
-            return (false, true); // VPS, SPS, PPS, or AP
-        }
-        if (19..=21).contains(&nalu_type) {
-            return (true, false); // IDR / CRA
-        }
-        if nalu_type == 49 && payload.len() >= 3 {
-            let start = (payload[2] & 0x80) != 0;
-            let fu_type = payload[2] & 0x3F;
-            if (19..=21).contains(&fu_type) {
-                return (start, false);
-            }
-        }
-    } else {
-        let nalu_type = payload[0] & 0x1F;
-        if nalu_type == 7 || nalu_type == 8 || nalu_type == 24 {
-            return (false, true); // SPS, PPS, or STAP-A
-        }
-        if nalu_type == 5 {
-            return (true, false); // IDR slice
-        }
-        if nalu_type == 28 && payload.len() >= 2 {
-            let start = (payload[1] & 0x80) != 0;
-            let fu_type = payload[1] & 0x1F;
-            if fu_type == 5 {
-                return (start, false);
-            }
-        }
-    }
-    (false, false)
-}
-
-
-pub fn extract_h264_sps_pps(fmtp: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-    if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
-        let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
-        let val = after.split(';').next()?.trim();
-        let (sps_b64, pps_b64) = val.split_once(',')?;
-        let sps = base64::engine::general_purpose::STANDARD
-            .decode(sps_b64.trim())
-            .ok()?;
-        let pps = base64::engine::general_purpose::STANDARD
-            .decode(pps_b64.trim())
-            .ok()?;
-        return Some((sps, pps));
-    }
-    None
-}
-
-pub fn extract_h265_vps_sps_pps(fmtp: &str) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let mut vps = None;
-    let mut sps = None;
-    let mut pps = None;
-
-    for part in fmtp.split(';') {
-        let part = part.trim();
-        if let Some((k, v)) = part.split_once('=') {
-            match k.trim() {
-                "sprop-vps" => {
-                    vps = base64::engine::general_purpose::STANDARD
-                        .decode(v.trim())
-                        .ok();
-                }
-                "sprop-sps" => {
-                    sps = base64::engine::general_purpose::STANDARD
-                        .decode(v.trim())
-                        .ok();
-                }
-                "sprop-pps" => {
-                    pps = base64::engine::general_purpose::STANDARD
-                        .decode(v.trim())
-                        .ok();
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if let (Some(v), Some(s), Some(p)) = (vps, sps, pps) {
-        Some((v, s, p))
-    } else {
-        None
-    }
-}
-
-pub fn build_h264_stap_a(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + 2 + sps.len() + 2 + pps.len());
-    payload.push(0x78); // STAP-A header: F=0, NRI=3, Type=24
-    payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(sps);
-    payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(pps);
-    payload
-}
-
-#[allow(dead_code)]
-pub fn build_h265_ap(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(2 + 2 + vps.len() + 2 + sps.len() + 2 + pps.len());
-    payload.push(0x60); // AP header byte 1: Type=48 << 1
-    payload.push(0x01); // AP header byte 2: LayerId=0, TID=1
-    payload.extend_from_slice(&(vps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(vps);
-    payload.extend_from_slice(&(sps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(sps);
-    payload.extend_from_slice(&(pps.len() as u16).to_be_bytes());
-    payload.extend_from_slice(pps);
-    payload
-}
-
-/// Unpack an H.265 Aggregation Packet (NAL type 48) into individual Single NAL Unit payloads.
-pub fn unpack_h265_ap(payload: &[u8]) -> Vec<Vec<u8>> {
-    let mut nals = Vec::new();
-    if payload.len() < 4 || ((payload[0] >> 1) & 0x3F) != 48 {
-        return nals;
-    }
-    let mut idx = 2;
-    while idx + 2 <= payload.len() {
-        let nlen = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
-        idx += 2;
-        if nlen > 0 && idx + nlen <= payload.len() {
-            nals.push(payload[idx..idx + nlen].to_vec());
-            idx += nlen;
-        } else {
-            break;
-        }
-    }
-    nals
-}
+pub use crate::core::{
+    build_h264_stap_a, extract_h264_sps_pps, extract_h265_vps_sps_pps,
+    is_keyframe_or_param_set, unpack_h265_ap,
+};
 
 /// Re-fragment oversized video payloads into safe MTU slices (<= 1180 bytes)
 /// to prevent IP fragmentation and UDP packet loss across WebRTC paths.
