@@ -743,6 +743,7 @@ fn is_audio_active(sdp: &str) -> bool {
     false
 }
 
+#[allow(unused_imports)]
 pub use crate::core::{
     build_h264_stap_a, build_h265_ap, extract_h264_sps_pps, extract_h265_vps_sps_pps,
     is_keyframe_or_param_set, unpack_h265_ap,

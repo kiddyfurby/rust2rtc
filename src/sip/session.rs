@@ -190,7 +190,7 @@ impl SipCallSession {
         let call_id_audio = call_id.clone();
         tasks.push(tokio::spawn(async move {
             let mut audio_track = None;
-            for _ in 0..80 {
+            for _ in 0..30 {
                 let tracks = stream_tx.get_tracks().await;
                 if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Audio) {
                     audio_track = Some(Arc::clone(t));
@@ -249,7 +249,7 @@ impl SipCallSession {
                 warn!(
                     call_id = %call_id_audio,
                     stream = %stream_tx.name,
-                    "No audio track found on stream after 8s; sending comfort silence"
+                    "No audio track found on stream after 3s; sending comfort silence"
                 );
             }
         }));
@@ -362,10 +362,15 @@ impl SipCallSession {
 
                     tasks.push(tokio::spawn(async move {
                         let mut video_track = None;
-                        for _ in 0..80 {
+                        for _ in 0..30 {
                             let tracks = stream_video.get_tracks().await;
                             if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")) {
                                 video_track = Some(Arc::clone(t));
+                                break;
+                            }
+                            if tracks.iter().any(|t| t.kind == MediaKind::Video) {
+                                // Camera already registered its video track and it is not H.264 (e.g. H.265 / HEVC);
+                                // break immediately instead of blocking the call for 8s waiting for H.264 to appear
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -511,7 +516,7 @@ impl SipCallSession {
                             };
 
                             let rtsp_url = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, stream_video.name);
-                            let h264_args = ffmpeg_video.h264_encoder_args();
+                            let h264_args = ffmpeg_video.sip_h264_encoder_args();
                             let mut transcode_args = vec![
                                 "-hide_banner".to_string(),
                                 "-v".to_string(),
