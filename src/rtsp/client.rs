@@ -659,6 +659,7 @@ struct TrackDraft {
     channels: Option<u8>,
     fmtp: Option<String>,
     control: Option<String>,
+    is_sendonly: bool,
 }
 
 impl TrackDraft {
@@ -681,6 +682,7 @@ impl TrackDraft {
             channels,
             fmtp: None,
             control: None,
+            is_sendonly: false,
         }
     }
 
@@ -735,7 +737,9 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks:
         let line = line.trim();
         if let Some(m) = line.strip_prefix("m=") {
             if let Some(draft) = current_draft.take() {
-                tracks.push(draft.to_track_info(content_base, existing_tracks));
+                if !draft.is_sendonly {
+                    tracks.push(draft.to_track_info(content_base, existing_tracks));
+                }
             }
 
             let parts: Vec<&str> = m.split_whitespace().collect();
@@ -753,6 +757,10 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks:
                     };
                     current_draft = Some(TrackDraft::new(kind, pt));
                 }
+            }
+        } else if line == "a=sendonly" {
+            if let Some(ref mut draft) = current_draft {
+                draft.is_sendonly = true;
             }
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
@@ -792,7 +800,9 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks:
     }
 
     if let Some(draft) = current_draft.take() {
-        tracks.push(draft.to_track_info(content_base, existing_tracks));
+        if !draft.is_sendonly {
+            tracks.push(draft.to_track_info(content_base, existing_tracks));
+        }
     }
 
     tracks

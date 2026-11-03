@@ -56,7 +56,11 @@ pub fn detect_backchannel(sources: &[String]) -> Option<BackchannelKind> {
         if source.starts_with("multitrans://") {
             return Some(BackchannelKind::Multitrans(source.clone()));
         }
-        if source.starts_with("onvif://") || source.contains("#backchannel=1") {
+        if source.starts_with("onvif://")
+            || source.contains("#backchannel=1")
+            || source.contains("?backchannel=1")
+            || source.contains("&backchannel=1")
+        {
             return Some(BackchannelKind::Onvif(source.clone()));
         }
     }
@@ -132,6 +136,12 @@ mod tests {
         assert_eq!(
             detect_backchannel(&s2),
             Some(BackchannelKind::Onvif("onvif://admin:pass@198.51.100.42:8000".to_string()))
+        );
+
+        let s_living = vec!["rtsp://192.0.2.25/ch0_0.h264#backchannel=1".to_string()];
+        assert_eq!(
+            detect_backchannel(&s_living),
+            Some(BackchannelKind::Onvif("rtsp://192.0.2.25/ch0_0.h264#backchannel=1".to_string()))
         );
 
         let s3 = vec!["rtsp://198.51.100.50/cam".to_string()];
