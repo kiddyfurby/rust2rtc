@@ -185,6 +185,8 @@ async fn main() -> Result<()> {
         .and_then(|w| w.engine.clone())
         .unwrap_or_else(|| "webrtc-rs".to_string());
 
+    info!(engine = %webrtc_engine, "WebRTC engine selected");
+
     let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(
         webrtc_candidates,
         rtsp_port,
