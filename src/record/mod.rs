@@ -7,8 +7,10 @@ use crate::mp4::{
     H265RtpDepacketizer, VideoCodecConfig, VideoSample,
 };
 use crate::streams::Stream;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 pub struct SegmentRecorder {
@@ -46,7 +48,7 @@ impl SegmentRecorder {
         }
     }
 
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>, mut stop_rx: Option<watch::Receiver<bool>>) {
         info!(
             stream = %self.stream_name,
             dir = %self.output_dir.display(),
@@ -57,6 +59,13 @@ impl SegmentRecorder {
         let _ = tokio::fs::create_dir_all(&self.output_dir).await;
 
         loop {
+            if let Some(ref rx) = stop_rx {
+                if *rx.borrow() {
+                    info!(stream = %self.stream_name, "Stop signal active; terminating recorder");
+                    return;
+                }
+            }
+
             // 1. Ensure producer is running
             if let Err(e) = self.stream.ensure_started(self.rtsp_port, &self.ffmpeg).await {
                 warn!(stream = %self.stream_name, error = %e, "Failed to start stream producer; retrying in 3s");
@@ -121,15 +130,35 @@ impl SegmentRecorder {
             let mut current_segment: Option<ActiveSegment> = None;
 
             loop {
-                let packet = match rx.recv().await {
-                    Ok(p) => p,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(stream = %self.stream_name, skipped = n, "Recorder subscriber lagged");
+                let packet = tokio::select! {
+                    stop_signal = async {
+                        if let Some(ref mut rx) = stop_rx {
+                            while rx.changed().await.is_ok() {
+                                if *rx.borrow() {
+                                    return true;
+                                }
+                            }
+                        }
+                        std::future::pending().await
+                    } => {
+                        if stop_signal {
+                            info!(stream = %self.stream_name, "Stop signal received; exiting recorder");
+                            return;
+                        }
                         continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        warn!(stream = %self.stream_name, "Track channel closed; reconnecting");
-                        break;
+                    res = rx.recv() => {
+                        match res {
+                            Ok(p) => p,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(stream = %self.stream_name, skipped = n, "Recorder subscriber lagged");
+                                continue;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                warn!(stream = %self.stream_name, "Track channel closed; reconnecting");
+                                break;
+                            }
+                        }
                     }
                 };
 
@@ -155,7 +184,7 @@ impl SegmentRecorder {
                         last_rtp_ts: rtp_ts,
                         samples: vec![VideoSample {
                             is_keyframe: true,
-                            duration: 6000, // Default 15fps duration placeholder, updated when next frame arrives
+                            duration: 6000,
                             nalus,
                         }],
                     });
@@ -223,7 +252,7 @@ impl SegmentRecorder {
                     };
 
                     if let Some(codec_config) = codec_config_opt {
-                        let mp4_bytes = build_standalone_mp4(&codec_config, &finished_seg.samples);
+                        let mp4_bytes = build_standalone_mp4(&codec_config, &finished_seg.samples, None);
                         let date_str = finished_seg.start_utc.format("%Y%m%d%H%M%S+0000").to_string();
                         let target_file = self
                             .output_dir
@@ -280,26 +309,84 @@ impl SegmentRecorder {
     }
 }
 
-pub fn start_recording(
-    record_config: crate::config::RecordConfig,
-    stream_manager: Arc<crate::streams::StreamManager>,
-    rtsp_port: u16,
-    ffmpeg: Arc<FfmpegManager>,
-) {
-    let output_dir = PathBuf::from(&record_config.dir);
-    let duration = record_config.segment_duration;
+pub struct RecordManager {
+    pub stream_manager: Arc<crate::streams::StreamManager>,
+    pub rtsp_port: u16,
+    pub ffmpeg: Arc<FfmpegManager>,
+    pub dir: PathBuf,
+    pub segment_duration: u32,
+    configured_streams: RwLock<HashSet<String>>,
+    active_recorders: tokio::sync::Mutex<HashMap<String, watch::Sender<bool>>>,
+}
 
-    for stream_name in record_config.streams {
-        let stream_mgr = Arc::clone(&stream_manager);
-        let ffmpeg_clone = Arc::clone(&ffmpeg);
-        let out_dir = output_dir.clone();
-        let s_name = stream_name.clone();
+impl RecordManager {
+    pub fn new(
+        record_config: Option<crate::config::RecordConfig>,
+        stream_manager: Arc<crate::streams::StreamManager>,
+        rtsp_port: u16,
+        ffmpeg: Arc<FfmpegManager>,
+    ) -> Arc<Self> {
+        let (dir, duration, streams) = if let Some(cfg) = record_config {
+            (
+                PathBuf::from(cfg.dir),
+                cfg.segment_duration,
+                cfg.streams.into_iter().collect::<HashSet<_>>(),
+            )
+        } else {
+            (PathBuf::from("/tmp/cache"), 10, HashSet::new())
+        };
+
+        let mgr = Arc::new(Self {
+            stream_manager,
+            rtsp_port,
+            ffmpeg,
+            dir,
+            segment_duration: duration,
+            configured_streams: RwLock::new(streams),
+            active_recorders: tokio::sync::Mutex::new(HashMap::new()),
+        });
+
+        // Auto-start any streams configured in YAML
+        let configured = mgr.configured_streams.read().unwrap().clone();
+        for stream_name in configured {
+            let m = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                let _ = m.start(&stream_name).await;
+            });
+        }
+
+        mgr
+    }
+
+    pub fn is_configured(&self, stream: &str) -> bool {
+        self.configured_streams.read().unwrap().contains(stream)
+    }
+
+    pub async fn is_active(&self, stream: &str) -> bool {
+        self.active_recorders.lock().await.contains_key(stream)
+    }
+
+    pub async fn start(self: &Arc<Self>, stream_name: &str) -> Result<(), String> {
+        if !self.is_configured(stream_name) {
+            return Err(format!("Stream '{}' not configured for in-process recording", stream_name));
+        }
+
+        let mut recorders = self.active_recorders.lock().await;
+        if recorders.contains_key(stream_name) {
+            info!(stream = %stream_name, "In-process recorder already active for stream");
+            return Ok(());
+        }
+
+        let (tx, rx) = watch::channel(false);
+        recorders.insert(stream_name.to_string(), tx);
+
+        let this = Arc::clone(self);
+        let s_name = stream_name.to_string();
 
         tokio::spawn(async move {
-            // Wait for stream to be registered in StreamManager
             let mut stream = None;
-            for _ in 0..20 {
-                if let Some(s) = stream_mgr.get(&s_name).await {
+            for _ in 0..30 {
+                if let Some(s) = this.stream_manager.get(&s_name).await {
                     stream = Some(s);
                     break;
                 }
@@ -309,21 +396,154 @@ pub fn start_recording(
             let stream = match stream {
                 Some(s) => s,
                 None => {
-                    error!(stream = %s_name, "Configured recording stream not found in streams");
+                    error!(stream = %s_name, "Recording stream not found in StreamManager");
+                    this.active_recorders.lock().await.remove(&s_name);
                     return;
                 }
             };
 
             let recorder = Arc::new(SegmentRecorder::new(
-                s_name,
+                s_name.clone(),
                 stream,
-                out_dir,
-                duration,
-                rtsp_port,
-                ffmpeg_clone,
+                this.dir.clone(),
+                this.segment_duration,
+                this.rtsp_port,
+                Arc::clone(&this.ffmpeg),
             ));
 
-            recorder.run().await;
+            recorder.run(Some(rx)).await;
+            this.active_recorders.lock().await.remove(&s_name);
         });
+
+        Ok(())
+    }
+
+    pub async fn stop(&self, stream_name: &str) -> Result<(), String> {
+        let mut recorders = self.active_recorders.lock().await;
+        if let Some(tx) = recorders.remove(stream_name) {
+            let _ = tx.send(true);
+            info!(stream = %stream_name, "Stopped in-process recorder for stream");
+        }
+        Ok(())
+    }
+}
+
+pub fn run_ffmpeg_shim(args: Vec<String>) -> ! {
+    let real_ffmpeg = std::env::var("REAL_FFMPEG")
+        .unwrap_or_else(|_| "/usr/lib/ffmpeg/6.0/bin/ffmpeg".to_string());
+
+    // 1. Detect if this is a segment recording command
+    let is_segment = args.windows(2).any(|w| w[0] == "-f" && w[1] == "segment")
+        || args.iter().any(|a| a == "-f segment" || a.starts_with("-segment_format"));
+
+    if !is_segment {
+        exec_real_ffmpeg(&real_ffmpeg, &args);
+    }
+
+    // 2. Identify camera / stream name from /tmp/cache/<camera>@%Y%m%d%H%M%S%z.mp4
+    let mut camera_name = None;
+    for arg in &args {
+        if arg.contains("/tmp/cache/") && arg.contains('@') {
+            if let Some(filename) = std::path::Path::new(arg).file_name().and_then(|f| f.to_str()) {
+                if let Some((cam, _)) = filename.split_once('@') {
+                    camera_name = Some(cam.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    let camera = match camera_name {
+        Some(c) => c,
+        None => {
+            exec_real_ffmpeg(&real_ffmpeg, &args);
+        }
+    };
+
+    // 3. Ask rust2rtc if this stream should be recorded in-process
+    let handled = call_rust2rtc_record_api(&camera, "start");
+    if !handled {
+        exec_real_ffmpeg(&real_ffmpeg, &args);
+    }
+
+    eprintln!(
+        "[rust2rtc ffmpeg-shim] Stream '{}' recording handled in-process by rust2rtc. Shim standing by.",
+        camera
+    );
+
+    // 4. Block waiting for SIGINT, SIGTERM, or SIGHUP
+    wait_for_shutdown_signal();
+
+    eprintln!("[rust2rtc ffmpeg-shim] Stopping in-process recording for '{}'", camera);
+    let _ = call_rust2rtc_record_api(&camera, "stop");
+    std::process::exit(0);
+}
+
+fn exec_real_ffmpeg(real_ffmpeg: &str, args: &[String]) -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(real_ffmpeg).args(args).exec();
+        eprintln!("[rust2rtc ffmpeg-shim] Failed to exec {}: {}", real_ffmpeg, err);
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::exit(1);
+    }
+}
+
+fn call_rust2rtc_record_api(stream: &str, action: &str) -> bool {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let api_port: u16 = std::env::var("GO2RTC_API_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1984);
+
+    let mut retries = 5;
+    while retries > 0 {
+        if let Ok(mut conn) = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], api_port)),
+            Duration::from_millis(500),
+        ) {
+            let req = format!(
+                "GET /api/record?stream={}&action={} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                stream, action, api_port
+            );
+            if conn.write_all(req.as_bytes()).is_ok() {
+                let mut reader = BufReader::new(conn);
+                let mut status_line = String::new();
+                if reader.read_line(&mut status_line).is_ok() {
+                    if status_line.contains(" 200 ") {
+                        return true;
+                    } else if status_line.contains(" 404 ") {
+                        return false;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        retries -= 1;
+    }
+    false
+}
+
+fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        extern "C" fn on_sig(_: std::os::raw::c_int) {}
+        unsafe {
+            libc::signal(libc::SIGINT, on_sig as *const () as usize);
+            libc::signal(libc::SIGTERM, on_sig as *const () as usize);
+            libc::signal(libc::SIGHUP, on_sig as *const () as usize);
+            libc::pause();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::thread::park();
     }
 }

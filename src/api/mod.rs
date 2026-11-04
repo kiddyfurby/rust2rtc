@@ -21,6 +21,7 @@ pub struct AppState {
     pub ffmpeg: Arc<FfmpegManager>,
     pub webrtc: Arc<WebRtcManager>,
     pub sip: Arc<crate::sip::SipManager>,
+    pub record: Arc<crate::record::RecordManager>,
     pub rtsp_port: u16,
 }
 
@@ -85,6 +86,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ws", get(api_ws_handler))
         .route("/api/sip/call", post(api_sip_call_handler))
         .route("/api/sip/accounts", get(api_sip_accounts_handler))
+        .route("/api/record", get(api_record_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -1296,6 +1298,77 @@ async fn api_sip_accounts_handler(
 ) -> impl IntoResponse {
     let accounts = state.sip.list_accounts().await;
     Json(serde_json::json!({ "accounts": accounts }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecordQuery {
+    pub stream: String,
+    pub action: Option<String>,
+}
+
+pub async fn api_record_handler(
+    State(state): State<AppState>,
+    Query(query): Query<RecordQuery>,
+) -> Response {
+    let action = query.action.as_deref().unwrap_or("start");
+    match action {
+        "start" => {
+            if !state.record.is_configured(&query.stream) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Stream not configured for in-process recording",
+                        "stream": query.stream
+                    })),
+                )
+                    .into_response();
+            }
+            if let Err(e) = state.record.start(&query.stream).await {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "recording",
+                    "stream": query.stream
+                })),
+            )
+                .into_response()
+        }
+        "stop" => {
+            let _ = state.record.stop(&query.stream).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "stopped",
+                    "stream": query.stream
+                })),
+            )
+                .into_response()
+        }
+        "status" => {
+            let active = state.record.is_active(&query.stream).await;
+            let configured = state.record.is_configured(&query.stream);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "stream": query.stream,
+                    "configured": configured,
+                    "active": active
+                })),
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Unknown action" })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
