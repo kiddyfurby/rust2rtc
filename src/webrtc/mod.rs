@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tracing::debug;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
     RTCIceGatheringState, RTCPeerConnectionState,
@@ -33,6 +34,7 @@ use webrtc::runtime::{channel, Sender};
 #[derive(Clone)]
 struct WebRtcHandler {
     session_id: String,
+    stream: Arc<Stream>,
     gather_complete_tx: Sender<()>,
     connected_tx: Sender<()>,
     session_close_tx: tokio::sync::broadcast::Sender<()>,
@@ -55,6 +57,42 @@ impl PeerConnectionEventHandler for WebRtcHandler {
             || state == RTCPeerConnectionState::Disconnected
         {
             let _ = self.session_close_tx.send(());
+        }
+    }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        if track.kind().await == RtpCodecKind::Audio {
+            let stream = Arc::clone(&self.stream);
+            let mut close_rx = self.session_close_tx.subscribe();
+            tokio::spawn(async move {
+                if let Ok(Some(_)) = stream.start_backchannel().await {
+                    debug!(stream = %stream.name, "WebRTC incoming backchannel audio track established");
+                    let mut decoder = match crate::audio::OpusToG711Decoder::new() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            debug!("Failed to create Opus to G.711 decoder: {}", e);
+                            return;
+                        }
+                    };
+                    loop {
+                        tokio::select! {
+                            _ = close_rx.recv() => break,
+                            event_opt = track.poll() => match event_opt {
+                                Some(TrackRemoteEvent::OnRtpPacket(pkt)) => {
+                                    if let Ok(g711) = decoder.decode_to_g711(&pkt.payload, true) {
+                                        if !g711.is_empty() {
+                                            let _ = stream.send_backchannel_audio(g711, true).await;
+                                        }
+                                    }
+                                }
+                                Some(TrackRemoteEvent::OnEnded) | None => break,
+                                _ => continue,
+                            }
+                        }
+                    }
+                    stream.stop_backchannel().await;
+                }
+            });
         }
     }
 }
@@ -363,6 +401,7 @@ impl WebRtcManager {
 
         let handler = Arc::new(WebRtcHandler {
             session_id: session_id.clone(),
+            stream: Arc::clone(&stream),
             gather_complete_tx,
             connected_tx,
             session_close_tx: session_close_tx.clone(),
