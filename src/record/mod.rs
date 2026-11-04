@@ -315,6 +315,7 @@ pub struct RecordManager {
     pub ffmpeg: Arc<FfmpegManager>,
     pub dir: PathBuf,
     pub segment_duration: u32,
+    pub enabled: bool,
     configured_streams: RwLock<HashSet<String>>,
     active_recorders: tokio::sync::Mutex<HashMap<String, watch::Sender<bool>>>,
 }
@@ -326,14 +327,15 @@ impl RecordManager {
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
     ) -> Arc<Self> {
-        let (dir, duration, streams) = if let Some(cfg) = record_config {
+        let (enabled, dir, duration, streams) = if let Some(cfg) = record_config {
             (
+                cfg.enabled,
                 PathBuf::from(cfg.dir),
                 cfg.segment_duration,
                 cfg.streams.into_iter().collect::<HashSet<_>>(),
             )
         } else {
-            (PathBuf::from("/tmp/cache"), 10, HashSet::new())
+            (true, PathBuf::from("/tmp/cache"), 10, HashSet::new())
         };
 
         let mgr = Arc::new(Self {
@@ -342,6 +344,7 @@ impl RecordManager {
             ffmpeg,
             dir,
             segment_duration: duration,
+            enabled,
             configured_streams: RwLock::new(streams),
             active_recorders: tokio::sync::Mutex::new(HashMap::new()),
         });
@@ -359,7 +362,12 @@ impl RecordManager {
     }
 
     pub fn is_configured(&self, stream: &str) -> bool {
-        self.configured_streams.read().unwrap().contains(stream)
+        if !self.enabled {
+            return false;
+        }
+        let configured = self.configured_streams.read().unwrap();
+        // When streams list is empty, all streams are handled in-process
+        configured.is_empty() || configured.contains(stream)
     }
 
     pub async fn is_active(&self, stream: &str) -> bool {
@@ -440,10 +448,10 @@ pub fn run_ffmpeg_shim(args: Vec<String>) -> ! {
         exec_real_ffmpeg(&real_ffmpeg, &args);
     }
 
-    // 2. Identify camera / stream name from /tmp/cache/<camera>@%Y%m%d%H%M%S%z.mp4
+    // 2. Identify camera / stream name from segment output pattern (e.g. /tmp/cache/<camera>@%Y%m%d%H%M%S%z.mp4)
     let mut camera_name = None;
     for arg in &args {
-        if arg.contains("/tmp/cache/") && arg.contains('@') {
+        if arg.contains('@') && (arg.contains("/cache/") || arg.ends_with(".mp4") || arg.contains("%Y%m%d")) {
             if let Some(filename) = std::path::Path::new(arg).file_name().and_then(|f| f.to_str()) {
                 if let Some((cam, _)) = filename.split_once('@') {
                     camera_name = Some(cam.to_string());
@@ -545,5 +553,65 @@ fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_record_manager_is_configured_defaults() {
+        let stream_mgr = Arc::new(crate::streams::StreamManager::new());
+        let ffmpeg_mgr = Arc::new(FfmpegManager::new("ffmpeg".into(), "".into(), None, HashMap::new()));
+
+        // 1. When record config is None -> default is enabled for ALL streams
+        let mgr_default = RecordManager::new(None, stream_mgr.clone(), 8554, ffmpeg_mgr.clone());
+        assert!(mgr_default.is_configured("any_camera"));
+        assert!(mgr_default.is_configured("doorbell"));
+
+        // 2. When record config has empty streams list -> enabled for ALL streams
+        let mgr_empty_streams = RecordManager::new(
+            Some(crate::config::RecordConfig {
+                enabled: true,
+                dir: "/tmp/cache".into(),
+                segment_duration: 10,
+                streams: vec![],
+            }),
+            stream_mgr.clone(),
+            8554,
+            ffmpeg_mgr.clone(),
+        );
+        assert!(mgr_empty_streams.is_configured("plato"));
+        assert!(mgr_empty_streams.is_configured("kitchen"));
+
+        // 3. When record config has specific streams -> only those return true
+        let mgr_whitelist = RecordManager::new(
+            Some(crate::config::RecordConfig {
+                enabled: true,
+                dir: "/tmp/cache".into(),
+                segment_duration: 10,
+                streams: vec!["plato".into()],
+            }),
+            stream_mgr.clone(),
+            8554,
+            ffmpeg_mgr.clone(),
+        );
+        assert!(mgr_whitelist.is_configured("plato"));
+        assert!(!mgr_whitelist.is_configured("kitchen"));
+
+        // 4. When record is disabled -> returns false for all
+        let mgr_disabled = RecordManager::new(
+            Some(crate::config::RecordConfig {
+                enabled: false,
+                dir: "/tmp/cache".into(),
+                segment_duration: 10,
+                streams: vec![],
+            }),
+            stream_mgr,
+            8554,
+            ffmpeg_mgr,
+        );
+        assert!(!mgr_disabled.is_configured("plato"));
     }
 }

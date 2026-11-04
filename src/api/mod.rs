@@ -1313,11 +1313,11 @@ pub async fn api_record_handler(
     let action = query.action.as_deref().unwrap_or("start");
     match action {
         "start" => {
-            if !state.record.is_configured(&query.stream) {
+            if !state.record.is_configured(&query.stream) || state.streams.get(&query.stream).await.is_none() {
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({
-                        "error": "Stream not configured for in-process recording",
+                        "error": "Stream not found or not configured for in-process recording",
                         "stream": query.stream
                     })),
                 )
