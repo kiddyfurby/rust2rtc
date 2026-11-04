@@ -6,6 +6,7 @@ mod core;
 mod ffmpeg;
 mod ha;
 mod mp4;
+mod record;
 mod rtsp;
 mod sip;
 mod streams;
@@ -319,6 +320,24 @@ async fn main() -> Result<()> {
             error!(
                 "Doorbells are configured but Home Assistant ha_url and/or ha_token are missing; \
                  please specify ha_url and ha_token under sip: or ha: in configuration"
+            );
+        }
+    }
+
+    // Start in-process MP4 segment recording for Frigate cache if configured
+    if let Some(ref record_cfg) = config.record {
+        if record_cfg.enabled && !record_cfg.streams.is_empty() {
+            info!(
+                streams = ?record_cfg.streams,
+                dir = %record_cfg.dir,
+                duration = record_cfg.segment_duration,
+                "Starting in-process MP4 segment recording for Frigate cache"
+            );
+            record::start_recording(
+                record_cfg.clone(),
+                Arc::clone(&stream_manager),
+                rtsp_port,
+                Arc::clone(&ffmpeg_manager),
             );
         }
     }

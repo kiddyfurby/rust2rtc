@@ -49,6 +49,351 @@ impl BoxWriter {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoSample {
+    pub is_keyframe: bool,
+    pub duration: u32,
+    pub nalus: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum VideoCodecConfig {
+    H264 {
+        sps: Vec<u8>,
+        pps: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    H265 {
+        vps: Vec<u8>,
+        sps: Vec<u8>,
+        pps: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+}
+
+pub fn write_avc1_stsd(writer: &mut BoxWriter, sps: &[u8], pps: &[u8], width: u32, height: u32) {
+    let stsd_pos = writer.start_box(b"stsd");
+    writer.buf.extend_from_slice(&[0, 0, 0, 0]); // version 0, flags 0
+    writer.buf.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+
+    let avc1_pos = writer.start_box(b"avc1");
+    let mut avc1_hdr = Vec::with_capacity(70);
+    avc1_hdr.extend_from_slice(&[0u8; 6]); // reserved
+    avc1_hdr.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index = 1
+    avc1_hdr.extend_from_slice(&0u16.to_be_bytes()); // pre-defined
+    avc1_hdr.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    avc1_hdr.extend_from_slice(&[0u8; 12]); // pre-defined
+    avc1_hdr.extend_from_slice(&(width as u16).to_be_bytes()); // width
+    avc1_hdr.extend_from_slice(&(height as u16).to_be_bytes()); // height
+    avc1_hdr.extend_from_slice(&0x00480000u32.to_be_bytes()); // horizresolution 72 dpi
+    avc1_hdr.extend_from_slice(&0x00480000u32.to_be_bytes()); // vertresolution 72 dpi
+    avc1_hdr.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    avc1_hdr.extend_from_slice(&1u16.to_be_bytes()); // frame_count = 1
+    avc1_hdr.extend_from_slice(&[0u8; 32]); // compressorname (32 bytes)
+    avc1_hdr.extend_from_slice(&0x0018u16.to_be_bytes()); // depth = 24
+    avc1_hdr.extend_from_slice(&(-1i16).to_be_bytes()); // pre-defined = -1
+    writer.buf.extend_from_slice(&avc1_hdr);
+
+    let profile = if sps.len() > 1 { sps[1] } else { 0x64 };
+    let compat = if sps.len() > 2 { sps[2] } else { 0x00 };
+    let level = if sps.len() > 3 { sps[3] } else { 0x28 };
+
+    let mut avcc = Vec::with_capacity(32 + sps.len() + pps.len());
+    avcc.push(1); // configurationVersion = 1
+    avcc.push(profile); // AVCProfileIndication
+    avcc.push(compat); // profile_compatibility
+    avcc.push(level); // AVCLevelIndication
+    avcc.push(0xFF); // lengthSizeMinusOne = 3 (4 bytes length prefix)
+    avcc.push(0xE1); // numOfSequenceParameterSets = 1
+    avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    avcc.extend_from_slice(sps);
+    avcc.push(1); // numOfPictureParameterSets = 1
+    avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    avcc.extend_from_slice(pps);
+    writer.write_box(b"avcC", &avcc);
+
+    writer.end_box(avc1_pos);
+    writer.end_box(stsd_pos);
+}
+
+pub fn write_hvc1_stsd(writer: &mut BoxWriter, vps: &[u8], sps: &[u8], pps: &[u8], width: u32, height: u32) {
+    let stsd_pos = writer.start_box(b"stsd");
+    writer.buf.extend_from_slice(&[0, 0, 0, 0]); // version 0, flags 0
+    writer.buf.extend_from_slice(&1u32.to_be_bytes()); // entry_count = 1
+
+    let hvc1_pos = writer.start_box(b"hvc1");
+    let mut hvc1_hdr = Vec::with_capacity(70);
+    hvc1_hdr.extend_from_slice(&[0u8; 6]);
+    hvc1_hdr.extend_from_slice(&1u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&[0u8; 12]);
+    hvc1_hdr.extend_from_slice(&(width as u16).to_be_bytes());
+    hvc1_hdr.extend_from_slice(&(height as u16).to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0x00480000u32.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0x00480000u32.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&0u32.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&1u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&[0u8; 32]);
+    hvc1_hdr.extend_from_slice(&0x0018u16.to_be_bytes());
+    hvc1_hdr.extend_from_slice(&(-1i16).to_be_bytes());
+    writer.buf.extend_from_slice(&hvc1_hdr);
+
+    let sps_rbsp = unescape_rbsp(if sps.len() >= 2 { &sps[2..] } else { sps });
+    let mut hvcc = vec![0u8; 23];
+    hvcc[0] = 1;
+    if sps_rbsp.len() >= 13 {
+        hvcc[1..13].copy_from_slice(&sps_rbsp[1..13]);
+    } else {
+        hvcc[1] = 0x01;
+        hvcc[2] = 0x60;
+        hvcc[12] = 150;
+    }
+    hvcc[13] = 0xF0;
+    hvcc[14] = 0x00;
+    hvcc[15] = 0xFC;
+    hvcc[16] = 0xFD; // chroma 4:2:0
+    hvcc[17] = 0xF8;
+    hvcc[18] = 0xF8;
+    hvcc[19] = 0x00;
+    hvcc[20] = 0x00;
+    hvcc[21] = 0x0F;
+    hvcc[22] = 0x03;
+
+    for (nal_type, nalu) in [(32u8, vps), (33u8, sps), (34u8, pps)] {
+        hvcc.push(0x80 | (nal_type & 0x3F));
+        hvcc.extend_from_slice(&1u16.to_be_bytes());
+        hvcc.extend_from_slice(&(nalu.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(nalu);
+    }
+    writer.write_box(b"hvcC", &hvcc);
+
+    writer.end_box(hvc1_pos);
+    writer.end_box(stsd_pos);
+}
+
+/// Generate a complete, standalone progressive MP4 file (`ftyp` + `moov` + `mdat`)
+/// compatible with Frigate, FFmpeg, QuickTime, and browsers.
+pub fn build_standalone_mp4(
+    codec_config: &VideoCodecConfig,
+    samples: &[VideoSample],
+) -> Vec<u8> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+
+    let (width, height) = match codec_config {
+        VideoCodecConfig::H264 { width, height, .. } => (*width, *height),
+        VideoCodecConfig::H265 { width, height, .. } => (*width, *height),
+    };
+
+    let total_media_bytes: usize = samples
+        .iter()
+        .map(|s| s.nalus.iter().map(|n| 4 + n.len()).sum::<usize>())
+        .sum();
+    let mut writer = BoxWriter::with_capacity(4096 + total_media_bytes);
+
+    // 1. 'ftyp'
+    let mut ftyp = Vec::with_capacity(16);
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(&0x00000200u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isomiso2mp41");
+    writer.write_box(b"ftyp", &ftyp);
+
+    let total_duration: u32 = samples.iter().map(|s| s.duration).sum();
+
+    // 2. 'moov'
+    let moov_pos = writer.start_box(b"moov");
+
+    let unity_matrix: [u32; 9] = [
+        0x00010000, 0, 0,
+        0, 0x00010000, 0,
+        0, 0, 0x40000000,
+    ];
+
+    // 'mvhd'
+    let mut mvhd = Vec::with_capacity(96);
+    mvhd.extend_from_slice(&0u32.to_be_bytes()); // creation time
+    mvhd.extend_from_slice(&0u32.to_be_bytes()); // modification time
+    mvhd.extend_from_slice(&90000u32.to_be_bytes()); // timescale 90k
+    mvhd.extend_from_slice(&total_duration.to_be_bytes()); // duration
+    mvhd.extend_from_slice(&0x00010000u32.to_be_bytes()); // rate 1.0
+    mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // vol 1.0
+    mvhd.extend_from_slice(&[0u8; 10]); // reserved
+    for val in unity_matrix {
+        mvhd.extend_from_slice(&val.to_be_bytes());
+    }
+    mvhd.extend_from_slice(&[0u8; 24]);
+    mvhd.extend_from_slice(&2u32.to_be_bytes()); // next track id = 2
+    writer.write_full_box(b"mvhd", 0, 0, &mvhd);
+
+    // 'trak'
+    let trak_pos = writer.start_box(b"trak");
+
+    // 'tkhd'
+    let mut tkhd = Vec::with_capacity(80);
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&1u32.to_be_bytes()); // track_id = 1
+    tkhd.extend_from_slice(&0u32.to_be_bytes());
+    tkhd.extend_from_slice(&total_duration.to_be_bytes());
+    tkhd.extend_from_slice(&[0u8; 8]);
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    tkhd.extend_from_slice(&0u16.to_be_bytes());
+    for val in unity_matrix {
+        tkhd.extend_from_slice(&val.to_be_bytes());
+    }
+    tkhd.extend_from_slice(&(width << 16).to_be_bytes());
+    tkhd.extend_from_slice(&(height << 16).to_be_bytes());
+    writer.write_full_box(b"tkhd", 0, 0x07, &tkhd);
+
+    // 'mdia'
+    let mdia_pos = writer.start_box(b"mdia");
+
+    // 'mdhd'
+    let mut mdhd = Vec::with_capacity(20);
+    mdhd.extend_from_slice(&0u32.to_be_bytes());
+    mdhd.extend_from_slice(&0u32.to_be_bytes());
+    mdhd.extend_from_slice(&90000u32.to_be_bytes());
+    mdhd.extend_from_slice(&total_duration.to_be_bytes());
+    mdhd.extend_from_slice(&0x55C4u16.to_be_bytes()); // und
+    mdhd.extend_from_slice(&0u16.to_be_bytes());
+    writer.write_full_box(b"mdhd", 0, 0, &mdhd);
+
+    // 'hdlr'
+    let mut hdlr = Vec::with_capacity(32);
+    hdlr.extend_from_slice(&0u32.to_be_bytes());
+    hdlr.extend_from_slice(b"vide");
+    hdlr.extend_from_slice(&[0u8; 12]);
+    hdlr.extend_from_slice(b"VideoHandler\0");
+    writer.write_full_box(b"hdlr", 0, 0, &hdlr);
+
+    // 'minf'
+    let minf_pos = writer.start_box(b"minf");
+    writer.write_full_box(b"vmhd", 0, 1, &[0u8; 8]);
+
+    // 'dinf'
+    let dinf_pos = writer.start_box(b"dinf");
+    let mut dref = Vec::with_capacity(20);
+    dref.extend_from_slice(&1u32.to_be_bytes());
+    dref.extend_from_slice(&12u32.to_be_bytes());
+    dref.extend_from_slice(b"url ");
+    dref.extend_from_slice(&[0, 0, 0, 1]);
+    writer.write_full_box(b"dref", 0, 0, &dref);
+    writer.end_box(dinf_pos);
+
+    // 'stbl'
+    let stbl_pos = writer.start_box(b"stbl");
+
+    // 'stsd'
+    match codec_config {
+        VideoCodecConfig::H264 { sps, pps, width, height } => {
+            write_avc1_stsd(&mut writer, sps, pps, *width, *height);
+        }
+        VideoCodecConfig::H265 { vps, sps, pps, width, height } => {
+            write_hvc1_stsd(&mut writer, vps, sps, pps, *width, *height);
+        }
+    }
+
+    // 'stts' (run-length encoded delta entries)
+    let mut stts_entries: Vec<(u32, u32)> = Vec::new();
+    for s in samples {
+        if let Some(last) = stts_entries.last_mut() {
+            if last.1 == s.duration {
+                last.0 += 1;
+                continue;
+            }
+        }
+        stts_entries.push((1, s.duration));
+    }
+    let mut stts_payload = Vec::with_capacity(4 + stts_entries.len() * 8);
+    stts_payload.extend_from_slice(&(stts_entries.len() as u32).to_be_bytes());
+    for (count, delta) in stts_entries {
+        stts_payload.extend_from_slice(&count.to_be_bytes());
+        stts_payload.extend_from_slice(&delta.to_be_bytes());
+    }
+    writer.write_full_box(b"stts", 0, 0, &stts_payload);
+
+    // 'stss' (keyframes / sync samples)
+    let mut keyframes: Vec<u32> = Vec::new();
+    for (idx, s) in samples.iter().enumerate() {
+        if s.is_keyframe {
+            keyframes.push((idx + 1) as u32);
+        }
+    }
+    if keyframes.is_empty() && !samples.is_empty() {
+        keyframes.push(1);
+    }
+    let mut stss_payload = Vec::with_capacity(4 + keyframes.len() * 4);
+    stss_payload.extend_from_slice(&(keyframes.len() as u32).to_be_bytes());
+    for kf in keyframes {
+        stss_payload.extend_from_slice(&kf.to_be_bytes());
+    }
+    writer.write_full_box(b"stss", 0, 0, &stss_payload);
+
+    // 'stsc' (sample to chunk: 1 sample per chunk)
+    let mut stsc_payload = Vec::with_capacity(16);
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes()); // entry count = 1
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes()); // first chunk = 1
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes()); // samples per chunk = 1
+    stsc_payload.extend_from_slice(&1u32.to_be_bytes()); // sample description index = 1
+    writer.write_full_box(b"stsc", 0, 0, &stsc_payload);
+
+    // 'stsz' (sample sizes)
+    let mut stsz_payload = Vec::with_capacity(8 + samples.len() * 4);
+    stsz_payload.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0 (variable)
+    stsz_payload.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+    for s in samples {
+        let s_size: u32 = s.nalus.iter().map(|n| 4 + n.len() as u32).sum();
+        stsz_payload.extend_from_slice(&s_size.to_be_bytes());
+    }
+    writer.write_full_box(b"stsz", 0, 0, &stsz_payload);
+
+    // 'stco' (chunk offsets placeholder)
+    let stco_pos = writer.buf.len();
+    let mut stco_payload = vec![0u8; 4 + samples.len() * 4];
+    stco_payload[0..4].copy_from_slice(&(samples.len() as u32).to_be_bytes());
+    writer.write_full_box(b"stco", 0, 0, &stco_payload);
+
+    writer.end_box(stbl_pos);
+    writer.end_box(minf_pos);
+    writer.end_box(mdia_pos);
+    writer.end_box(trak_pos);
+    writer.end_box(moov_pos);
+
+    // Now moov is closed and its length is fixed!
+    let mdat_pos = writer.buf.len();
+    let first_sample_offset = (mdat_pos + 8) as u32; // 8 bytes for mdat box header
+    let mut current_offset = first_sample_offset;
+
+    // Patch stco offsets
+    // Box structure: [4 bytes size][4 bytes name 'stco'][1 byte ver][3 bytes flags][4 bytes count]
+    let stco_entries_pos = stco_pos + 16;
+    for (i, s) in samples.iter().enumerate() {
+        let target = stco_entries_pos + i * 4;
+        writer.buf[target..target + 4].copy_from_slice(&current_offset.to_be_bytes());
+        let s_size: u32 = s.nalus.iter().map(|n| 4 + n.len() as u32).sum();
+        current_offset += s_size;
+    }
+
+    // 3. 'mdat'
+    let mdat_size = (8 + total_media_bytes) as u32;
+    writer.buf.extend_from_slice(&mdat_size.to_be_bytes());
+    writer.buf.extend_from_slice(b"mdat");
+    for s in samples {
+        for nalu in &s.nalus {
+            writer.buf.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
+            writer.buf.extend_from_slice(nalu);
+        }
+    }
+
+    writer.buf
+}
+
 /// Generate ISO BMFF Initialization Segment (`ftyp` + `moov`) for H.264
 pub fn make_h264_init_segment(sps: &[u8], pps: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut writer = BoxWriter::with_capacity(1024);
@@ -1006,5 +1351,69 @@ mod tests {
         // Verify trun flags: version 0, flags 0x000701 (0x00, 0x07, 0x01)
         let trun_idx = find_subsequence(&seg, b"trun").expect("trun box must exist");
         assert_eq!(&seg[trun_idx + 4..trun_idx + 8], &[0x00, 0x00, 0x07, 0x01]);
+    }
+
+    #[test]
+    fn test_standalone_mp4_h264_and_h265() {
+        let sps = vec![0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9, 0x40, 0x78, 0x02, 0x27, 0xE5, 0xC0, 0x5A, 0x80, 0x80, 0x80, 0x82];
+        let pps = vec![0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0];
+        let (w, h) = parse_h264_sps_dimensions(&sps);
+
+        let samples = vec![
+            VideoSample {
+                is_keyframe: true,
+                duration: 6000,
+                nalus: vec![vec![0x65, 0x88, 0x84, 0x00, 0x10]],
+            },
+            VideoSample {
+                is_keyframe: false,
+                duration: 6000,
+                nalus: vec![vec![0x41, 0x9a, 0x12, 0x34]],
+            },
+        ];
+
+        let mp4_h264 = build_standalone_mp4(
+            &VideoCodecConfig::H264 {
+                sps: sps.clone(),
+                pps: pps.clone(),
+                width: w,
+                height: h,
+            },
+            &samples,
+        );
+
+        assert!(mp4_h264.len() > 100);
+        assert_eq!(&mp4_h264[4..8], b"ftyp");
+        assert!(find_subsequence(&mp4_h264, b"moov").is_some());
+        assert!(find_subsequence(&mp4_h264, b"avc1").is_some());
+        assert!(find_subsequence(&mp4_h264, b"stco").is_some());
+        assert!(find_subsequence(&mp4_h264, b"mdat").is_some());
+
+        // Test H.265
+        let vps = vec![64, 1, 12, 1, 255, 255, 1, 96, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 150, 172, 9];
+        let h265_sps = vec![
+            66, 1, 1, 1, 96, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 0, 3, 0, 150, 160, 1, 64, 32, 5, 161,
+            99, 107, 146, 76, 154, 229, 156, 2, 0, 0, 3, 0, 2, 0, 0, 3, 0, 30, 16,
+        ];
+        let h265_pps = vec![68, 1, 224, 118, 176, 38, 64];
+        let (h265_w, h265_h, _) = parse_h265_sps(&h265_sps);
+
+        let mp4_h265 = build_standalone_mp4(
+            &VideoCodecConfig::H265 {
+                vps,
+                sps: h265_sps,
+                pps: h265_pps,
+                width: h265_w,
+                height: h265_h,
+            },
+            &samples,
+        );
+
+        assert!(mp4_h265.len() > 100);
+        assert_eq!(&mp4_h265[4..8], b"ftyp");
+        assert!(find_subsequence(&mp4_h265, b"moov").is_some());
+        assert!(find_subsequence(&mp4_h265, b"hvc1").is_some());
+        assert!(find_subsequence(&mp4_h265, b"stco").is_some());
+        assert!(find_subsequence(&mp4_h265, b"mdat").is_some());
     }
 }
