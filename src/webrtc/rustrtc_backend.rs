@@ -49,6 +49,13 @@ impl RustRtcSession {
                     || t.codec.name.to_uppercase().contains("HEVC"))
         });
 
+        let is_high_51 = tracks.iter().any(|t| {
+            t.codec.fmtp.as_deref().map_or(false, |f| f.contains("640033"))
+        });
+        let is_high = tracks.iter().any(|t| {
+            t.codec.fmtp.as_deref().map_or(false, |f| f.contains("6400"))
+        });
+
         let mut video_caps = Vec::new();
         if is_stream_hevc {
             video_caps.push(VideoCapability {
@@ -64,8 +71,36 @@ impl RustRtcSession {
                 rtx_payload_type: None,
             });
         }
+        if is_high_51 {
+            video_caps.push(VideoCapability {
+                payload_type: 97,
+                codec_name: "H264".to_string(),
+                clock_rate: 90000,
+                fmtp: Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640033".to_string()),
+                rtcp_fbs: vec![
+                    "nack".to_string(),
+                    "nack pli".to_string(),
+                    "goog-remb".to_string(),
+                ],
+                rtx_payload_type: None,
+            });
+        }
+        if is_high {
+            video_caps.push(VideoCapability {
+                payload_type: 98,
+                codec_name: "H264".to_string(),
+                clock_rate: 90000,
+                fmtp: Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032".to_string()),
+                rtcp_fbs: vec![
+                    "nack".to_string(),
+                    "nack pli".to_string(),
+                    "goog-remb".to_string(),
+                ],
+                rtx_payload_type: None,
+            });
+        }
         video_caps.push(VideoCapability {
-            payload_type: 97,
+            payload_type: 99,
             codec_name: "H264".to_string(),
             clock_rate: 90000,
             fmtp: Some("level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".to_string()),
@@ -126,7 +161,15 @@ impl RustRtcSession {
                 name: if is_stream_hevc { "H265".to_string() } else { "H264".to_string() },
                 clock_rate: 90000,
                 channels: 1,
-                payload_type: if is_stream_hevc { 96 } else { 97 },
+                payload_type: if is_stream_hevc {
+                    96
+                } else if is_high_51 {
+                    97
+                } else if is_high {
+                    98
+                } else {
+                    99
+                },
             };
 
             let _ = pc.add_track(v_track, v_params);
@@ -208,10 +251,40 @@ impl RustRtcSession {
                 let mut rx = video_track.subscribe();
                 let mut sent_first_keyframe = false;
 
+                // Extract parameter sets from SDP fmtp if present
+                let mut param_sets = Vec::new();
+                if let Some(ref fmtp) = video_track.codec.fmtp {
+                    if is_hevc {
+                        if let Some((vps, sps, pps)) = crate::core::extract_h265_vps_sps_pps(fmtp) {
+                            param_sets.push(vps);
+                            param_sets.push(sps);
+                            param_sets.push(pps);
+                        }
+                    } else if let Some((sps, pps)) = crate::core::extract_h264_sps_pps(fmtp) {
+                        param_sets.push(sps);
+                        param_sets.push(pps);
+                    }
+                }
+
                 while let Ok(pkt) = rx.recv().await {
                     let payload = pkt.payload();
                     if payload.is_empty() {
                         continue;
+                    }
+
+                    // Dynamically cache any in-band parameter sets
+                    if !is_hevc {
+                        let nalu_type = payload[0] & 0x1F;
+                        if nalu_type == 7 || nalu_type == 8 {
+                            param_sets.retain(|ps| (ps[0] & 0x1F) != nalu_type);
+                            param_sets.push(payload.to_vec());
+                        }
+                    } else {
+                        let nalu_type = (payload[0] >> 1) & 0x3F;
+                        if (32..=34).contains(&nalu_type) {
+                            param_sets.retain(|ps| ((ps[0] >> 1) & 0x3F) != nalu_type);
+                            param_sets.push(payload.to_vec());
+                        }
                     }
 
                     // Keyframe detection to ensure clean playback start
@@ -225,6 +298,26 @@ impl RustRtcSession {
                         };
                         if !is_kf {
                             continue;
+                        }
+
+                        // Send parameter sets immediately before first keyframe for instant decode
+                        for ps in &param_sets {
+                            let ps_frame = rustrtc::media::frame::VideoFrame {
+                                rtp_timestamp: pkt.timestamp,
+                                width: 0,
+                                height: 0,
+                                format: rustrtc::media::VideoPixelFormat::Unspecified,
+                                rotation_deg: 0,
+                                is_last_packet: false,
+                                data: bytes::Bytes::copy_from_slice(ps),
+                                header_extension: None,
+                                csrcs: vec![],
+                                sequence_number: None,
+                                payload_type: None,
+                                source_addr: None,
+                                raw_packet: None,
+                            };
+                            let _ = v_source.send_video(ps_frame);
                         }
                         sent_first_keyframe = true;
                     }
