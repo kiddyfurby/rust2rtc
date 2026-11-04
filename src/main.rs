@@ -179,11 +179,17 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|w| w.candidates.clone())
         .unwrap_or_default();
+    let webrtc_engine = config
+        .webrtc
+        .as_ref()
+        .and_then(|w| w.engine.clone())
+        .unwrap_or_else(|| "webrtc-rs".to_string());
 
     let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(
         webrtc_candidates,
         rtsp_port,
         ffmpeg_manager.bin().to_string(),
+        webrtc_engine,
     ));
 
     // Initialize SIP Manager
