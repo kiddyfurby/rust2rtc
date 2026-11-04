@@ -456,4 +456,42 @@ a=control:track3\r\n";
             Some("rtsp://192.0.2.25/ch0_0.h264/track3".to_string())
         );
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_living_connect() {
+        let mut client = OnvifBackchannelClient::new("rtsp://192.0.2.25/ch0_0.h264#backchannel=1").unwrap();
+        let res = client.connect().await;
+        println!("Connect result: {:?}", res);
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_living_send_audio() {
+        let mut client = OnvifBackchannelClient::new("rtsp://192.0.2.25/ch0_0.h264#backchannel=1").unwrap();
+        client.connect().await.unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<(bytes::Bytes, bool)>(32);
+        let sender_handle = tokio::spawn(async move {
+            client.run_sender(rx).await
+        });
+
+        // 1 second tone
+        let mut samples = Vec::new();
+        for i in 0..8000 {
+            let s = (16000.0 * (2.0 * std::f32::consts::PI * 800.0 * (i as f32) / 8000.0).sin()) as i16;
+            samples.push(crate::backchannel::pcm::s16_to_ulaw(s));
+        }
+
+        for chunk in samples.chunks(320) {
+            tx.send((bytes::Bytes::copy_from_slice(chunk), true)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+
+        drop(tx);
+        let res = sender_handle.await.unwrap();
+        println!("Sender result: {:?}", res);
+        assert!(res.is_ok());
+    }
 }
