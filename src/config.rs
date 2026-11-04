@@ -86,6 +86,8 @@ fn default_doorbell_cooldown() -> u64 {
 pub struct WebRtcConfig {
     #[serde(default)]
     pub candidates: Vec<String>,
+    #[serde(default)]
+    pub engine: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
