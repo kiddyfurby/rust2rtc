@@ -20,6 +20,28 @@ pub struct Config {
     pub ha: Option<HaConfig>,
     #[serde(default)]
     pub doorbells: HashMap<String, DoorbellConfig>,
+    #[serde(default)]
+    pub record: Option<RecordConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecordConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_record_dir")]
+    pub dir: String,
+    #[serde(default = "default_segment_duration")]
+    pub segment_duration: u32,
+    #[serde(default)]
+    pub streams: Vec<String>,
+}
+
+fn default_record_dir() -> String {
+    "/tmp/cache".to_string()
+}
+
+fn default_segment_duration() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -114,6 +136,7 @@ impl Default for Config {
             sip: None,
             ha: None,
             doorbells: HashMap::new(),
+            record: None,
         }
     }
 }
@@ -242,6 +265,9 @@ impl Config {
         }
         for (name, db) in other.doorbells {
             self.doorbells.insert(name, db);
+        }
+        if let Some(record) = other.record {
+            self.record = Some(record);
         }
     }
 

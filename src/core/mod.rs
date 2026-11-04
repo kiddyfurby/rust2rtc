@@ -298,6 +298,10 @@ impl Track {
         self.param_sets.read().unwrap().rtp_packets.clone()
     }
 
+    pub fn get_param_sets_data(&self) -> ParamSets {
+        self.param_sets.read().unwrap().clone()
+    }
+
     pub fn get_sprop(&self) -> Option<String> {
         let ps = self.param_sets.read().unwrap();
         if let (Some(sps), Some(pps)) = (&ps.h264_sps, &ps.h264_pps) {
