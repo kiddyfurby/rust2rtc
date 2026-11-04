@@ -36,6 +36,7 @@ In addition, `rust2rtc` functions as a **high-performance bidirectional SIP brid
   - Built-in transparent `ffmpeg-shim` stands in for Frigate's recording subprocesses, slashing recording subprocess RSS from ~25–38 MB down to **~1.5–2.0 MB per camera (-93% memory savings)** with 0% CPU overhead. Frigate's `RecordingMaintainer` indexes and archives segments seamlessly to disk/NFS.
 - **🌐 Real-Time WebRTC Streaming & Dual-Engine Selection**:
   - **Dual WebRTC Engine**: Runtime selection between the lightweight, pure-Rust **`rustrtc`** engine (reduces process RSS down to **~14 MB**, -76% memory footprint) and the standard **`webrtc-rs`** engine via `webrtc.engine: "rustrtc"` in `rust2rtc.yaml`.
+  - **🎙️ Full-Duplex WebRTC Two-Way Audio (Talkback)**: Built-in pure-Rust **`OpusToG711Decoder`** captures incoming microphone Opus audio from browsers, Frigate WebUI, and Home Assistant cards (`a=sendrecv`), decodes directly to 8kHz PCM, and relays it into the camera's RTSP backchannel speaker in real time.
   - **Low-Latency Browser Playback**: Standard WHEP (`/api/webrtc`) and native **`go2rtc` WebSocket Signaling (`/api/ws?src=<stream>`)** supporting `webrtc/offer`, `webrtc/answer`, and trickle ICE for **`advanced-camera-card`**, **Frigate**, and Home Assistant.
   - **Codec Support**: Automatic negotiation supporting **H.264** (Baseline, Constrained Baseline, High Profile up to Level 5.1) and **H.265 / HEVC** (in supported browsers like Safari).
   - **Audio Passthrough & Transcoding**: In-process Opus, PCMA (G.711a), and PCMU (G.711u).
@@ -392,6 +393,9 @@ sip:
 ## 📝 Changelog & Release History
 
 ### v0.5.0 (Current)
+- **🎙️ WebRTC Full-Duplex Two-Way Talkback**:
+  - Pure-Rust in-process `OpusToG711Decoder` automatically decodes incoming Opus audio from browser microphones / Home Assistant cards (`a=sendrecv`) down to 8kHz G.711 $\mu$-law/A-law.
+  - Relays audio directly into camera RTSP backchannel sessions in real time across both `webrtc-rs` and `rustrtc` engines.
 - **💾 In-Process MP4 Segment Recorder for Frigate Cache (Zero-FFmpeg Recording)**:
   - Generates standalone progressive ISO BMFF `.mp4` segment files directly in `/tmp/cache/` in pure Rust.
   - Automatically cuts segments on IDR keyframes matching Frigate's naming convention (`<stream>@%Y%m%d%H%M%S%z.mp4`) with atomic temporary file renaming.
