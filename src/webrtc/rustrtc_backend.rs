@@ -220,6 +220,45 @@ impl RustRtcSession {
 
         let session_id = uuid::Uuid::new_v4().to_string();
 
+        // 6. Spawn incoming event listener for two-way audio (backchannel)
+        let pc_events = Arc::clone(&pc);
+        let s_clone = Arc::clone(&stream);
+        tokio::spawn(async move {
+            use rustrtc::media::track::MediaStreamTrack;
+            while let Some(event) = pc_events.recv().await {
+                if let rustrtc::peer_connection::PeerConnectionEvent::Track(transceiver) = event {
+                    if transceiver.kind() == rustrtc::MediaKind::Audio {
+                        if let Some(receiver) = transceiver.receiver() {
+                            let s = Arc::clone(&s_clone);
+                            tokio::spawn(async move {
+                                if let Ok(Some(_)) = s.start_backchannel().await {
+                                    tracing::info!(stream = %s.name, "rustrtc incoming backchannel audio track established");
+                                    let mut decoder = match crate::audio::OpusToG711Decoder::new() {
+                                        Ok(d) => d,
+                                        Err(e) => {
+                                            tracing::error!("Failed to create Opus to G.711 decoder: {}", e);
+                                            return;
+                                        }
+                                    };
+                                    let track = receiver.track();
+                                    while let Ok(sample) = track.recv().await {
+                                        if let rustrtc::media::frame::MediaSample::Audio(frame) = sample {
+                                            if let Ok(g711) = decoder.decode_to_g711(&frame.data, true) {
+                                                if !g711.is_empty() {
+                                                    let _ = s.send_backchannel_audio(g711, true).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    s.stop_backchannel().await;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+
         Ok((
             Self {
                 session_id,

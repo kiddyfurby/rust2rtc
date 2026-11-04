@@ -2,6 +2,7 @@
 
 use crate::core::{Codec, RtpPacket};
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use opus_pure::multistream::OpusMSEncoder;
 use opus_pure::Application;
 use symphonia_codec_aac::AacDecoder;
@@ -374,6 +375,45 @@ fn generate_asc(rate: u32, channels: usize) -> Vec<u8> {
     vec![b0, b1]
 }
 
+pub struct OpusToG711Decoder {
+    decoder: opus_pure::OpusDecoder,
+    pcm_out: [i16; 960],
+}
+
+impl OpusToG711Decoder {
+    pub fn new() -> Result<Self> {
+        let decoder = opus_pure::OpusDecoder::new(8000, 1)
+            .map_err(|e| anyhow::anyhow!("Failed to init Opus decoder: {:?}", e))?;
+        Ok(Self {
+            decoder,
+            pcm_out: [0i16; 960],
+        })
+    }
+
+    /// Decode incoming Opus packet and return G.711 (PCMU or PCMA) audio bytes.
+    pub fn decode_to_g711(&mut self, opus_data: &[u8], is_pcmu: bool) -> Result<Bytes> {
+        let n_samples = self
+            .decoder
+            .decode_s16(opus_data, 960, &mut self.pcm_out)
+            .map_err(|e| anyhow::anyhow!("Opus decode error: {:?}", e))?;
+        if n_samples == 0 {
+            return Ok(Bytes::new());
+        }
+
+        let mut out = Vec::with_capacity(n_samples);
+        if is_pcmu {
+            for &s in &self.pcm_out[..n_samples] {
+                out.push(crate::backchannel::pcm::s16_to_ulaw(s));
+            }
+        } else {
+            for &s in &self.pcm_out[..n_samples] {
+                out.push(crate::backchannel::pcm::s16_to_alaw(s));
+            }
+        }
+        Ok(Bytes::from(out))
+    }
+}
+
 mod rand {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEED: AtomicU32 = AtomicU32::new(0x1337cafe);
@@ -423,5 +463,18 @@ mod tests {
         let codec = Codec::new_aac();
         let transcoder = AudioTranscoder::new(&codec);
         assert!(transcoder.is_ok());
+    }
+
+    #[test]
+    fn test_opus_to_g711_decoder() {
+        let codec = Codec::new_pcmu();
+        let mut transcoder = AudioTranscoder::new(&codec).expect("transcoder init");
+        let rtp = RtpPacket::create(0, 1, 0, 1234, false, &[0xFF; 160]);
+        let opus_pkts = transcoder.process_packet(&rtp);
+        assert!(!opus_pkts.is_empty());
+
+        let mut dec = OpusToG711Decoder::new().expect("decoder init");
+        let g711 = dec.decode_to_g711(opus_pkts[0].payload(), true).expect("decode");
+        assert_eq!(g711.len(), 160); // 20ms at 8kHz is 160 samples
     }
 }
