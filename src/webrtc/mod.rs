@@ -1,3 +1,5 @@
+pub mod rustrtc_backend;
+
 use crate::core::MediaKind;
 use crate::streams::Stream;
 use anyhow::Result;
