@@ -60,18 +60,58 @@ impl PeerConnectionEventHandler for WebRtcHandler {
 }
 
 #[derive(Clone)]
+pub enum ActivePeerConnection {
+    WebRtc(Arc<dyn PeerConnection>),
+    RustRtc(Arc<rustrtc_backend::RustRtcSession>),
+}
+
+impl ActivePeerConnection {
+    pub async fn add_ice_candidate(&self, cand_str: &str) -> Result<()> {
+        match self {
+            ActivePeerConnection::WebRtc(pc) => {
+                let init = webrtc::peer_connection::RTCIceCandidateInit {
+                    candidate: cand_str.to_string(),
+                    ..Default::default()
+                };
+                pc.add_ice_candidate(init).await?;
+            }
+            ActivePeerConnection::RustRtc(session) => {
+                let clean_cand = cand_str.trim().trim_start_matches("a=");
+                let parsed = rustrtc::transports::ice::IceCandidate::from_sdp(clean_cand)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse ICE candidate: {:?}", e))?;
+                session.add_ice_candidate(parsed)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        match self {
+            ActivePeerConnection::WebRtc(pc) => {
+                let _ = pc.close().await;
+            }
+            ActivePeerConnection::RustRtc(session) => {
+                session.pc.close();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct WebRtcManager {
+    pub engine: String,
     candidates: Vec<String>,
     #[allow(dead_code)]
     pub rtsp_port: u16,
     #[allow(dead_code)]
     pub ffmpeg_bin: String,
-    pub sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn PeerConnection>>>>,
+    pub sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, ActivePeerConnection>>>,
 }
 
 impl WebRtcManager {
-    pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String) -> Self {
+    pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String, engine: String) -> Self {
         Self {
+            engine,
             candidates,
             rtsp_port,
             ffmpeg_bin,
@@ -83,7 +123,7 @@ impl WebRtcManager {
         &self,
         stream: Arc<Stream>,
         offer_sdp: &str,
-    ) -> Result<(String, Arc<dyn PeerConnection>)> {
+    ) -> Result<(String, ActivePeerConnection)> {
         let tracks = stream.get_tracks().await;
         let is_stream_hevc = tracks.iter().any(|t| {
             t.kind == MediaKind::Video
@@ -99,6 +139,24 @@ impl WebRtcManager {
                 "Camera stream is H.265 (HEVC), but this browser does not support WebRTC H.265. Please view the H.264 sub-stream ({}_sub) or use a browser with HEVC WebRTC enabled (e.g. Safari).",
                 stream.name
             );
+        }
+
+        if self.engine.eq_ignore_ascii_case("rustrtc") {
+            let (rustrtc_session, answer_sdp) = rustrtc_backend::RustRtcSession::create(
+                Arc::clone(&stream),
+                offer_sdp,
+                &self.candidates,
+            )
+            .await?;
+            rustrtc_session.start_forwarding(Arc::clone(&stream), is_stream_hevc);
+            let session_id = rustrtc_session.session_id.clone();
+            let session_arc = Arc::new(rustrtc_session);
+            let active_pc = ActivePeerConnection::RustRtc(Arc::clone(&session_arc));
+            {
+                let mut guard = self.sessions.write().await;
+                guard.insert(session_id, active_pc.clone());
+            }
+            return Ok((answer_sdp, active_pc));
         }
 
         let mut media_engine = MediaEngine::default();
@@ -430,15 +488,16 @@ impl WebRtcManager {
             .ok_or_else(|| anyhow::anyhow!("Failed to generate local SDP answer"))?;
 
         let pc_arc: Arc<dyn PeerConnection> = Arc::new(peer_connection);
+        let active_pc = ActivePeerConnection::WebRtc(Arc::clone(&pc_arc));
         {
             let mut guard = self.sessions.write().await;
-            guard.insert(session_id.clone(), Arc::clone(&pc_arc));
+            guard.insert(session_id.clone(), active_pc.clone());
         }
 
         let mut keeper_rx = session_close_tx.subscribe();
         let sessions_clone = Arc::clone(&self.sessions);
         let sid = session_id.clone();
-        let pc_holder = Arc::clone(&pc_arc);
+        let pc_holder = active_pc.clone();
         tokio::spawn(async move {
             let _ = keeper_rx.recv().await;
             debug!(session = %sid, "WebRTC session closed, removing from active sessions");
@@ -446,7 +505,7 @@ impl WebRtcManager {
                 let mut guard = sessions_clone.write().await;
                 guard.remove(&sid);
             }
-            let _ = pc_holder.close().await;
+            pc_holder.close().await;
         });
 
         // Spawn video RTP forwarder after the track is bound
@@ -641,7 +700,7 @@ impl WebRtcManager {
             }
         }
 
-        Ok((local_desc.sdp, pc_arc))
+        Ok((local_desc.sdp, active_pc))
     }
 }
 
@@ -995,6 +1054,59 @@ mod tests {
                    a=fmtp:49 level-id=180;profile-id=1;tier-flag=0;tx-mode=SRST\r\n";
         for _ in 0..20 {
             assert_eq!(find_negotiated_video_pt(sdp, true, true, 100), 49);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_webrtc_manager_rustrtc_engine_selection() {
+        let stream = Arc::new(Stream::new("test_cam".to_string(), vec![]));
+        let offer_sdp = "\
+v=0\r\n\
+o=- 1495799811084970 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:testufrag\r\n\
+a=ice-pwd:testpassword0123456789abcdef\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendrecv\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
+
+        // Test rustrtc engine
+        let manager_rustrtc = WebRtcManager::new(
+            vec!["127.0.0.1".to_string()],
+            8554,
+            "ffmpeg".to_string(),
+            "rustrtc".to_string(),
+        );
+        let (answer_sdp, active_pc) = manager_rustrtc.handle_whep(Arc::clone(&stream), offer_sdp).await.unwrap();
+        assert!(answer_sdp.contains("v=0"));
+        match active_pc {
+            ActivePeerConnection::RustRtc(session) => {
+                assert!(!session.session_id.is_empty());
+            }
+            _ => panic!("Expected ActivePeerConnection::RustRtc"),
+        }
+
+        // Test webrtc-rs engine (default)
+        let manager_default = WebRtcManager::new(
+            vec!["127.0.0.1".to_string()],
+            8554,
+            "ffmpeg".to_string(),
+            "webrtc-rs".to_string(),
+        );
+        let (answer_sdp_default, active_pc_default) = manager_default.handle_whep(Arc::clone(&stream), offer_sdp).await.unwrap();
+        assert!(answer_sdp_default.contains("v=0"));
+        match active_pc_default {
+            ActivePeerConnection::WebRtc(_) => {}
+            _ => panic!("Expected ActivePeerConnection::WebRtc"),
         }
     }
 }
