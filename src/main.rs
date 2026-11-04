@@ -51,7 +51,7 @@ fn normalize_args() -> Vec<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
-    let exe = raw_args.get(0).map(|s| s.as_str()).unwrap_or("");
+    let exe = raw_args.first().map(|s| s.as_str()).unwrap_or("");
     if exe.ends_with("ffmpeg") || raw_args.get(1).map(|s| s.as_str()) == Some("ffmpeg-shim") {
         let shim_args: Vec<String> = if raw_args.get(1).map(|s| s.as_str()) == Some("ffmpeg-shim") {
             raw_args.into_iter().skip(2).collect()
@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
 
     let rtsp_port: u16 = rtsp_listen
         .split(':')
-        .last()
+        .next_back()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8554);
 
@@ -411,13 +411,11 @@ fn detect_local_ip(server: &str) -> String {
         } else {
             None
         };
-        if let Some(addr) = target {
-            if socket.connect(addr).is_ok() {
-                if let Ok(local) = socket.local_addr() {
+        if let Some(addr) = target
+            && socket.connect(addr).is_ok()
+                && let Ok(local) = socket.local_addr() {
                     return local.ip().to_string();
                 }
-            }
-        }
     }
     "127.0.0.1".to_string()
 }

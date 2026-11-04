@@ -84,21 +84,19 @@ pub fn parse_jpeg_for_rtp(data: &[u8]) -> Option<RtpJpegFrame<'_>> {
                     }
                 }
             }
-            0xC0 => {
+            0xC0
                 // SOF0 (Baseline DCT frame header)
-                if seg.len() >= 8 {
+                if seg.len() >= 8 => {
                     height = u16::from_be_bytes([seg[1], seg[2]]);
                     width = u16::from_be_bytes([seg[3], seg[4]]);
                     // Component 1 sampling factors: 0x22 = 4:2:0, 0x21 = 4:2:2
                     jpeg_type = if seg[7] == 0x21 { 0 } else { 1 };
                 }
-            }
-            0xDD => {
+            0xDD
                 // DRI (Define Restart Interval)
-                if seg.len() >= 2 {
+                if seg.len() >= 2 => {
                     dri = u16::from_be_bytes([seg[0], seg[1]]);
                 }
-            }
             0xDA => {
                 // SOS (Start of Scan)
                 scan_start = Some(pos + seg_len);
@@ -149,8 +147,8 @@ pub fn packetize_jpeg_rtp(
     max_payload: usize,
 ) -> Option<Vec<Vec<u8>>> {
     let frame = parse_jpeg_for_rtp(jpeg_data)?;
-    let width_blocks = ((frame.width + 7) / 8).min(255) as u8;
-    let height_blocks = ((frame.height + 7) / 8).min(255) as u8;
+    let width_blocks = frame.width.div_ceil(8).min(255) as u8;
+    let height_blocks = frame.height.div_ceil(8).min(255) as u8;
 
     let mut packets = Vec::new();
     let mut offset: usize = 0;

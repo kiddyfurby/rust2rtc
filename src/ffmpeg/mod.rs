@@ -198,11 +198,10 @@ impl FfmpegManager {
         let mut hardware_profile = self.hardware.clone();
         if let Some(params) = params_str {
             for param in params.split('#') {
-                if let Some((k, v)) = param.split_once('=') {
-                    if k == "hardware" || k == "hw" {
+                if let Some((k, v)) = param.split_once('=')
+                    && (k == "hardware" || k == "hw") {
                         hardware_profile = Some(v.to_string());
                     }
-                }
             }
         }
 
@@ -482,21 +481,19 @@ pub fn resolve_source(source: &str, rtsp_port: u16) -> String {
         .unwrap_or(source)
         .trim_end_matches("?backchannel=1");
 
-    if clean_source.starts_with("onvif://") {
-        if let Ok(url) = url::Url::parse(clean_source) {
+    if clean_source.starts_with("onvif://")
+        && let Ok(url) = url::Url::parse(clean_source) {
             let host = url.host_str().unwrap_or("127.0.0.1");
             let user = url.username();
             let pass = url.password().unwrap_or("");
             return format!("rtsp://{}:{}@{}/Preview_01_main", user, pass, host);
         }
-    }
 
-    if clean_source.starts_with("tapo://") {
-        if let Ok(url) = url::Url::parse(clean_source) {
+    if clean_source.starts_with("tapo://")
+        && let Ok(url) = url::Url::parse(clean_source) {
             let host = url.host_str().unwrap_or("127.0.0.1");
             return format!("rtsp://frigate:REDACTED_PASSWORD@{}/stream1", host);
         }
-    }
 
     if !clean_source.contains("://") && !clean_source.starts_with("exec:") && !clean_source.starts_with("ffmpeg:") {
         // References another stream by name

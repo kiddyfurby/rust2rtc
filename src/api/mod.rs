@@ -509,11 +509,10 @@ async fn api_streams_put_handler(
     if let Some(query) = raw_query {
         for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
             match k.as_ref() {
-                "name" => {
-                    if name.is_none() {
+                "name"
+                    if name.is_none() => {
                         name = Some(v.into_owned());
                     }
-                }
                 "src" => {
                     sources.push(v.into_owned());
                 }
@@ -525,8 +524,8 @@ async fn api_streams_put_handler(
         }
     }
 
-    if !body.is_empty() {
-        if let Ok(p) = serde_json::from_slice::<StreamPayload>(&body) {
+    if !body.is_empty()
+        && let Ok(p) = serde_json::from_slice::<StreamPayload>(&body) {
             if name.is_none() {
                 name = p.name.or(p.src);
             }
@@ -537,14 +536,13 @@ async fn api_streams_put_handler(
                 sources.push(val);
             }
         }
-    }
 
     if name.is_none() && !sources.is_empty() {
         name = Some(sources[0].clone());
     }
 
-    if let Some(name) = name {
-        if !sources.is_empty() {
+    if let Some(name) = name
+        && !sources.is_empty() {
             state.streams.add_configured_stream(name.clone(), sources).await;
             info!(stream = %name, "Dynamically configured stream via /api/streams");
             return (
@@ -553,7 +551,6 @@ async fn api_streams_put_handler(
             )
                 .into_response();
         }
-    }
 
     (StatusCode::BAD_REQUEST, "Missing stream name or source URL").into_response()
 }
@@ -858,11 +855,10 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         Some(serde_json::Value::String(s)) => s,
                         _ => String::new(),
                     };
-                    if !cand_str.is_empty() {
-                        if let Err(e) = pc.add_ice_candidate(&cand_str).await {
+                    if !cand_str.is_empty()
+                        && let Err(e) = pc.add_ice_candidate(&cand_str).await {
                             debug!("Failed to add ICE candidate: {}", e);
                         }
-                    }
                 }
             }
             "mse" => {
@@ -940,14 +936,13 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         .and_then(|f| {
                             for part in f.split(';') {
                                 let part = part.trim();
-                                if let Some((k, v)) = part.split_once('=') {
-                                    if k.trim().eq_ignore_ascii_case("profile-level-id") {
+                                if let Some((k, v)) = part.split_once('=')
+                                    && k.trim().eq_ignore_ascii_case("profile-level-id") {
                                         let v = v.trim();
                                         if v.len() == 6 && v.chars().all(|c| c.is_ascii_hexdigit()) {
                                             return Some(v.to_lowercase());
                                         }
                                     }
-                                }
                             }
                             None
                         })
@@ -1014,13 +1009,12 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
 
                             if has_h265 {
                                 let mut depacketizer = crate::mp4::H265RtpDepacketizer::new();
-                                if let Some(ref fmtp) = vtrack.codec.fmtp {
-                                    if let Some((vps, sps, pps)) = crate::webrtc::extract_h265_vps_sps_pps(fmtp) {
+                                if let Some(ref fmtp) = vtrack.codec.fmtp
+                                    && let Some((vps, sps, pps)) = crate::webrtc::extract_h265_vps_sps_pps(fmtp) {
                                         depacketizer.vps = Some(vps);
                                         depacketizer.sps = Some(sps);
                                         depacketizer.pps = Some(pps);
                                     }
-                                }
 
                                 loop {
                                     let packet = match rx.recv().await {
@@ -1069,12 +1063,11 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                 let mut depacketizer = crate::mp4::H264RtpDepacketizer::new();
 
                                 // Pre-load SPS / PPS from track SDP fmtp if available
-                                if let Some(ref fmtp) = vtrack.codec.fmtp {
-                                    if let Some((sps, pps)) = crate::webrtc::extract_h264_sps_pps(fmtp) {
+                                if let Some(ref fmtp) = vtrack.codec.fmtp
+                                    && let Some((sps, pps)) = crate::webrtc::extract_h264_sps_pps(fmtp) {
                                         depacketizer.sps = Some(sps);
                                         depacketizer.pps = Some(pps);
                                     }
-                                }
 
                                 loop {
                                     let packet = match rx.recv().await {

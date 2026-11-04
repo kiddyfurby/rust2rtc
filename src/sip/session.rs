@@ -293,11 +293,10 @@ impl SipCallSession {
                     if let Err(e) = tx_audio_sock.send_to(&pkt, primary).await {
                         debug!("Error forwarding audio to primary SIP peer {}: {}", primary, e);
                     }
-                    if let Some(alt_addr) = alt {
-                        if alt_addr != primary {
+                    if let Some(alt_addr) = alt
+                        && alt_addr != primary {
                             let _ = tx_audio_sock.send_to(&pkt, alt_addr).await;
                         }
-                    }
                 }
             }
         }));
@@ -434,8 +433,8 @@ impl SipCallSession {
                                 }
 
                                 // Before keyframes, inject the parameter sets packet (STAP-A) if not immediately preceded by parameter sets
-                                if is_keyframe && !last_was_param_set {
-                                    if let Some(ref ps_bytes) = param_set_payload {
+                                if is_keyframe && !last_was_param_set
+                                    && let Some(ref ps_bytes) = param_set_payload {
                                         let mut stap_rtp = Vec::with_capacity(12 + ps_bytes.len());
                                         stap_rtp.push(0x80); // V=2
                                         stap_rtp.push(negotiated_video_pt & 0x7F); // M=0 (parameter sets packet)
@@ -447,15 +446,13 @@ impl SipCallSession {
 
                                         let (primary, alt) = *tx_v_targets.lock().await;
                                         let _ = video_socket.send_to(&stap_rtp, primary).await;
-                                        if let Some(alt_addr) = alt {
-                                            if alt_addr != primary {
+                                        if let Some(alt_addr) = alt
+                                            && alt_addr != primary {
                                                 let _ = video_socket.send_to(&stap_rtp, alt_addr).await;
                                             }
-                                        }
                                         pkt_count += 1;
                                         info!(call_id = %call_id_video, "Injected H.264 SPS/PPS STAP-A packet before keyframe into SIP video stream");
                                     }
-                                }
 
                                 last_was_param_set = is_param_set;
 
@@ -476,13 +473,12 @@ impl SipCallSession {
                                     debug!("Error forwarding video to SIP peer: {}", e);
                                     break;
                                 }
-                                if let Some(alt_addr) = alt {
-                                    if alt_addr != primary {
+                                if let Some(alt_addr) = alt
+                                    && alt_addr != primary {
                                         let _ = video_socket.send_to(&raw, alt_addr).await;
                                     }
-                                }
                                 pkt_count += 1;
-                                if pkt_count == 1 || pkt_count % 300 == 0 {
+                                if pkt_count == 1 || pkt_count.is_multiple_of(300) {
                                     info!(
                                         call_id = %call_id_video,
                                         packets_sent = pkt_count,
@@ -564,13 +560,12 @@ impl SipCallSession {
                                             debug!("Error forwarding transcoded H.264 video to SIP peer: {}", e);
                                             break;
                                         }
-                                        if let Some(alt_addr) = alt {
-                                            if alt_addr != primary {
+                                        if let Some(alt_addr) = alt
+                                            && alt_addr != primary {
                                                 let _ = tx_video_sock.send_to(packet, alt_addr).await;
                                             }
-                                        }
                                         pkt_count += 1;
-                                        if pkt_count == 1 || pkt_count % 300 == 0 {
+                                        if pkt_count == 1 || pkt_count.is_multiple_of(300) {
                                             info!(
                                                 call_id = %call_id_video,
                                                 packets_sent = pkt_count,
@@ -740,14 +735,13 @@ impl SipCallSession {
                                             debug!("Error forwarding RFC 2435 JPEG RTP: {}", e);
                                             break;
                                         }
-                                        if let Some(alt_addr) = alt {
-                                            if alt_addr != primary {
+                                        if let Some(alt_addr) = alt
+                                            && alt_addr != primary {
                                                 let _ = video_socket.send_to(&pkt, alt_addr).await;
                                             }
-                                        }
                                         pkt_count += 1;
                                     }
-                                    if pkt_count == 1 || pkt_count % 300 == 0 {
+                                    if pkt_count == 1 || pkt_count.is_multiple_of(300) {
                                         info!(
                                             call_id = %call_id_video,
                                             packets_sent = pkt_count,
@@ -802,11 +796,10 @@ impl Drop for SipCallSession {
         for task in &self.tasks {
             task.abort();
         }
-        if let Ok(mut child) = self.transcode_child.try_lock() {
-            if let Some(mut c) = child.take() {
+        if let Ok(mut child) = self.transcode_child.try_lock()
+            && let Some(mut c) = child.take() {
                 let _ = c.start_kill();
             }
-        }
     }
 }
 

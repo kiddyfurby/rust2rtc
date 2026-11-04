@@ -291,20 +291,18 @@ fn parse_backchannel_control(sdp: &str, base_url: &str) -> Option<String> {
         let line = line.trim();
         if line.starts_with("m=audio") {
             // Check previous section
-            if current_media_is_audio && (current_is_sendonly || current_control.as_deref().map_or(false, |c| c.contains("backchannel"))) {
-                if let Some(ctrl) = current_control {
+            if current_media_is_audio && (current_is_sendonly || current_control.as_deref().is_some_and(|c| c.contains("backchannel")))
+                && let Some(ctrl) = current_control {
                     return Some(resolve_control_url(&ctrl, base_url));
                 }
-            }
             current_media_is_audio = true;
             current_is_sendonly = false;
             current_control = None;
         } else if line.starts_with("m=video") {
-            if current_media_is_audio && (current_is_sendonly || current_control.as_deref().map_or(false, |c| c.contains("backchannel"))) {
-                if let Some(ctrl) = current_control {
+            if current_media_is_audio && (current_is_sendonly || current_control.as_deref().is_some_and(|c| c.contains("backchannel")))
+                && let Some(ctrl) = current_control {
                     return Some(resolve_control_url(&ctrl, base_url));
                 }
-            }
             current_media_is_audio = false;
         } else if current_media_is_audio {
             if line == "a=sendonly" {
@@ -315,11 +313,10 @@ fn parse_backchannel_control(sdp: &str, base_url: &str) -> Option<String> {
         }
     }
 
-    if current_media_is_audio && (current_is_sendonly || current_control.as_deref().map_or(false, |c| c.contains("backchannel"))) {
-        if let Some(ctrl) = current_control {
+    if current_media_is_audio && (current_is_sendonly || current_control.as_deref().is_some_and(|c| c.contains("backchannel")))
+        && let Some(ctrl) = current_control {
             return Some(resolve_control_url(&ctrl, base_url));
         }
-    }
 
     None
 }

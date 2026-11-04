@@ -50,10 +50,10 @@ impl RustRtcSession {
         });
 
         let is_high_51 = tracks.iter().any(|t| {
-            t.codec.fmtp.as_deref().map_or(false, |f| f.contains("640033"))
+            t.codec.fmtp.as_deref().is_some_and(|f| f.contains("640033"))
         });
         let is_high = tracks.iter().any(|t| {
-            t.codec.fmtp.as_deref().map_or(false, |f| f.contains("6400"))
+            t.codec.fmtp.as_deref().is_some_and(|f| f.contains("6400"))
         });
 
         let mut video_caps = Vec::new();

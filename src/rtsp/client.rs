@@ -197,12 +197,11 @@ impl RtspClient {
                 continue;
             }
 
-            if session_id.is_none() {
-                if let Some(sess) = setup_headers.get("session") {
+            if session_id.is_none()
+                && let Some(sess) = setup_headers.get("session") {
                     let id = sess.split(';').next().unwrap_or(sess).trim().to_string();
                     session_id = Some(id);
                 }
-            }
 
             channel_map.insert(rtp_ch, Arc::clone(&t_info.track));
             registered_tracks.push(Arc::clone(&t_info.track));
@@ -243,7 +242,7 @@ impl RtspClient {
             session_id.as_deref(),
             Some(&[("Range", "npt=0.000-")]),
             Some(&channel_map),
-            Some(&stream),
+            Some(stream),
         ).await?;
 
         if play_code != 200 {
@@ -280,13 +279,12 @@ impl RtspClient {
                 let packet_bytes = buffer.split_to(length).freeze();
 
                 // Channel is RTP
-                if let Some(track) = channel_map.get(&ch) {
-                    if let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
+                if let Some(track) = channel_map.get(&ch)
+                    && let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
                         stream.packets_recv.fetch_add(1, Ordering::Relaxed);
                         stream.bytes_recv.fetch_add(packet_bytes.len() as u64, Ordering::Relaxed);
                         track.send(rtp);
                     }
-                }
             }
 
             // Check if buffer starts with plain text (e.g. RTSP response to keepalive) or desynchronized data
@@ -297,11 +295,10 @@ impl RtspClient {
                         let mut body_len = 0usize;
                         let header_str = String::from_utf8_lossy(header_bytes);
                         for line in header_str.lines() {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.trim().eq_ignore_ascii_case("content-length") {
+                            if let Some((k, v)) = line.split_once(':')
+                                && k.trim().eq_ignore_ascii_case("content-length") {
                                     body_len = v.trim().parse::<usize>().unwrap_or(0);
                                 }
-                            }
                         }
                         if buffer.len() >= pos + 4 + body_len {
                             let _ = buffer.split_to(pos + 4 + body_len);
@@ -356,12 +353,12 @@ impl RtspClient {
                             session_id.as_deref(),
                             None,
                             Some(&channel_map),
-                            Some(&stream),
+                            Some(stream),
                         ),
                     ).await;
 
-                    if let Ok(Ok((_, _, status))) = gp_res {
-                        if status == 405 || status == 501 {
+                    if let Ok(Ok((_, _, status))) = gp_res
+                        && (status == 405 || status == 501) {
                             // Fall back to OPTIONS with auth if GET_PARAMETER is not implemented
                             let _ = tokio::time::timeout(
                                 Duration::from_millis(5000),
@@ -377,11 +374,10 @@ impl RtspClient {
                                     session_id.as_deref(),
                                     None,
                                     Some(&channel_map),
-                                    Some(&stream),
+                                    Some(stream),
                                 ),
                             ).await;
                         }
-                    }
                 }
                 read_res = tokio::time::timeout(Duration::from_secs(8), tcp.read_buf(&mut buffer)) => {
                     match read_res {
@@ -436,9 +432,9 @@ impl RtspClient {
             stream,
         ).await?;
 
-        if status == 401 {
-            if let Some(auth_str) = headers.get("www-authenticate") {
-                if let Some(parsed_auth) = AuthMethod::parse(auth_str) {
+        if status == 401
+            && let Some(auth_str) = headers.get("www-authenticate")
+                && let Some(parsed_auth) = AuthMethod::parse(auth_str) {
                     *auth_info = Some(parsed_auth);
                     let new_auth_hdr = auth_info.as_ref().and_then(|a| a.generate_header(method, url, user, pass));
                     return Self::send_raw_request(
@@ -454,8 +450,6 @@ impl RtspClient {
                         stream,
                     ).await;
                 }
-            }
-        }
 
         Ok((body, headers, status))
     }
@@ -512,17 +506,15 @@ impl RtspClient {
                 let _len = buffer.get_u16();
                 let packet_bytes = buffer.split_to(length).freeze();
 
-                if let Some(cmap) = channel_map {
-                    if let Some(track) = cmap.get(&ch) {
-                        if let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
+                if let Some(cmap) = channel_map
+                    && let Some(track) = cmap.get(&ch)
+                        && let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
                             if let Some(st) = stream {
                                 st.packets_recv.fetch_add(1, Ordering::Relaxed);
                                 st.bytes_recv.fetch_add(packet_bytes.len() as u64, Ordering::Relaxed);
                             }
                             track.send(rtp);
                         }
-                    }
-                }
             }
 
             // 2. Discard leading non-RTSP, non-$ bytes (whitespace, newlines, or dangling body bytes)
@@ -531,8 +523,8 @@ impl RtspClient {
             }
 
             // 3. Check if buffer starts with RTSP/ and contains complete headers
-            if buffer.starts_with(b"RTSP/") {
-                if let Some(pos) = find_crlf_crlf(buffer) {
+            if buffer.starts_with(b"RTSP/")
+                && let Some(pos) = find_crlf_crlf(buffer) {
                     let header_bytes = buffer.split_to(pos + 4);
                     let header_str = String::from_utf8_lossy(&header_bytes);
                     let mut lines = header_str.lines();
@@ -555,7 +547,6 @@ impl RtspClient {
                     }
                     break;
                 }
-            }
 
             let n = tcp.read_buf(buffer).await.context("Failed reading RTSP response headers")?;
             if n == 0 {
@@ -736,11 +727,10 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks:
     for line in sdp.lines() {
         let line = line.trim();
         if let Some(m) = line.strip_prefix("m=") {
-            if let Some(draft) = current_draft.take() {
-                if !draft.is_sendonly {
+            if let Some(draft) = current_draft.take()
+                && !draft.is_sendonly {
                     tracks.push(draft.to_track_info(content_base, existing_tracks));
                 }
-            }
 
             let parts: Vec<&str> = m.split_whitespace().collect();
             if !parts.is_empty() {
@@ -764,14 +754,14 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks:
             }
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(pt) = parts[0].parse::<u8>() {
+            if parts.len() >= 2
+                && let Ok(pt) = parts[0].parse::<u8>() {
                     let (name, rate_chan) = parts[1].split_once('/').unwrap_or((parts[1], "90000"));
                     let rate = rate_chan.split('/').next().unwrap_or("90000").parse::<u32>().unwrap_or(90000);
                     let chan = rate_chan.split('/').nth(1).and_then(|c| c.parse::<u8>().ok());
 
-                    if let Some(ref mut draft) = current_draft {
-                        if draft.pt == pt || draft.name.is_empty() {
+                    if let Some(ref mut draft) = current_draft
+                        && (draft.pt == pt || draft.name.is_empty()) {
                             draft.pt = pt;
                             draft.name = name.to_uppercase();
                             draft.clock_rate = rate;
@@ -779,31 +769,24 @@ fn parse_sdp_tracks_with_control(sdp: &str, content_base: &str, existing_tracks:
                                 draft.channels = Some(chan.unwrap_or(1));
                             }
                         }
-                    }
                 }
-            }
         } else if let Some(fmtp) = line.strip_prefix("a=fmtp:") {
-            if let Some((pt_str, params)) = fmtp.split_once(' ') {
-                if let Ok(pt) = pt_str.parse::<u8>() {
-                    if let Some(ref mut draft) = current_draft {
-                        if draft.pt == pt {
+            if let Some((pt_str, params)) = fmtp.split_once(' ')
+                && let Ok(pt) = pt_str.parse::<u8>()
+                    && let Some(ref mut draft) = current_draft
+                        && draft.pt == pt {
                             draft.fmtp = Some(params.trim().to_string());
                         }
-                    }
-                }
-            }
-        } else if let Some(ctrl) = line.strip_prefix("a=control:") {
-            if let Some(ref mut draft) = current_draft {
+        } else if let Some(ctrl) = line.strip_prefix("a=control:")
+            && let Some(ref mut draft) = current_draft {
                 draft.control = Some(ctrl.trim().to_string());
             }
-        }
     }
 
-    if let Some(draft) = current_draft.take() {
-        if !draft.is_sendonly {
+    if let Some(draft) = current_draft.take()
+        && !draft.is_sendonly {
             tracks.push(draft.to_track_info(content_base, existing_tracks));
         }
-    }
 
     tracks
 }

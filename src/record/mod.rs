@@ -59,12 +59,11 @@ impl SegmentRecorder {
         let _ = tokio::fs::create_dir_all(&self.output_dir).await;
 
         loop {
-            if let Some(ref rx) = stop_rx {
-                if *rx.borrow() {
+            if let Some(ref rx) = stop_rx
+                && *rx.borrow() {
                     info!(stream = %self.stream_name, "Stop signal active; terminating recorder");
                     return;
                 }
-            }
 
             // 1. Ensure producer is running
             if let Err(e) = self.stream.ensure_started(self.rtsp_port, &self.ffmpeg).await {
@@ -451,14 +450,12 @@ pub fn run_ffmpeg_shim(args: Vec<String>) -> ! {
     // 2. Identify camera / stream name from segment output pattern (e.g. /tmp/cache/<camera>@%Y%m%d%H%M%S%z.mp4)
     let mut camera_name = None;
     for arg in &args {
-        if arg.contains('@') && (arg.contains("/cache/") || arg.ends_with(".mp4") || arg.contains("%Y%m%d")) {
-            if let Some(filename) = std::path::Path::new(arg).file_name().and_then(|f| f.to_str()) {
-                if let Some((cam, _)) = filename.split_once('@') {
+        if arg.contains('@') && (arg.contains("/cache/") || arg.ends_with(".mp4") || arg.contains("%Y%m%d"))
+            && let Some(filename) = std::path::Path::new(arg).file_name().and_then(|f| f.to_str())
+                && let Some((cam, _)) = filename.split_once('@') {
                     camera_name = Some(cam.to_string());
                     break;
                 }
-            }
-        }
     }
 
     let camera = match camera_name {

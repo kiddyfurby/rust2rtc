@@ -172,8 +172,8 @@ impl SipCameraAccount {
 
         // If Home Assistant auto-provisioning is enabled and this is initial registration,
         // sync credentials and friendly display_name into Home Assistant voip_stack
-        if !self.registered.load(Ordering::Relaxed) {
-            if let Some(ha) = &self.config.ha_client {
+        if !self.registered.load(Ordering::Relaxed)
+            && let Some(ha) = &self.config.ha_client {
                 let current_ext = self.current_extension.lock().await.clone();
                 let reg_user = if !self.config.auth_user.is_empty() {
                     self.config.auth_user.clone()
@@ -194,7 +194,6 @@ impl SipCameraAccount {
                     *self.current_extension.lock().await = provisioned_ext;
                 }
             }
-        }
 
         match self.register_request(300).await {
             Ok(()) => {
@@ -321,11 +320,10 @@ impl SipCameraAccount {
                     bail!("SIP registration timeout");
                 }
             };
-            if let Some(code) = msg.status_code {
-                if code >= 200 {
+            if let Some(code) = msg.status_code
+                && code >= 200 {
                     break msg;
                 }
-            }
         };
 
         if resp.status_code == Some(200) {
@@ -511,11 +509,10 @@ impl SipCameraAccount {
                     bail!("SIP authenticated registration timeout");
                 }
             };
-            if let Some(code) = msg.status_code {
-                if code >= 200 {
+            if let Some(code) = msg.status_code
+                && code >= 200 {
                     break msg;
                 }
-            }
         };
 
         Ok(resp2)
@@ -654,17 +651,15 @@ impl SipCameraAccount {
         let mut sprop = None;
         if negotiated_video_codec == VideoCodecKind::H264 {
             let tracks = self.stream.get_tracks().await;
-            if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")) {
-                if let Some(ref fmtp) = vt.codec.fmtp {
-                    if let Some(pos) = fmtp.find("sprop-parameter-sets=") {
+            if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264"))
+                && let Some(ref fmtp) = vt.codec.fmtp
+                    && let Some(pos) = fmtp.find("sprop-parameter-sets=") {
                         let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
                         let val = after.split(';').next().unwrap_or("").trim();
                         if !val.is_empty() {
                             sprop = Some(val.to_string());
                         }
                     }
-                }
-            }
         }
 
         // 5. Send 200 OK with Answer SDP
