@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::backchannel::pcm::{
-    g711_8k_to_l16_16k, l16_16k_to_g711_8k, transcode_alaw_to_ulaw, transcode_ulaw_to_alaw,
+    g711_8k_to_l16_16k, l16_16k_to_g711_8k,
     G711Repacker,
 };
 use super::message::{AudioCodecKind, VideoCodecKind};
@@ -208,8 +208,7 @@ impl SipCallSession {
                 );
                 let track_is_pcma = audio_track.codec.payload_type == 8
                     || audio_track.codec.name.eq_ignore_ascii_case("PCMA");
-                let track_is_pcmu = audio_track.codec.payload_type == 0
-                    || audio_track.codec.name.eq_ignore_ascii_case("PCMU");
+                let mut audio_decoder = crate::audio::CameraAudioDecoder::new(&audio_track.codec).ok();
 
                 let mut sub = audio_track.subscribe();
                 while let Ok(packet) = sub.recv().await {
@@ -217,32 +216,26 @@ impl SipCallSession {
                     if payload.is_empty() {
                         continue;
                     }
-                    let mut chunk = payload.to_vec();
                     if audio_codec_kind == AudioCodecKind::L16_16k {
-                        let l16_bytes = g711_8k_to_l16_16k(&chunk, track_is_pcma);
+                        let l16_bytes = g711_8k_to_l16_16k(payload, track_is_pcma);
                         let mut q = pcm_queue_prod.lock().await;
                         if q.len() > 12800 {
                             let drop_len = q.len() - 6400;
                             q.drain(..drop_len);
                         }
                         q.extend(l16_bytes);
-                    } else {
-                        if track_is_pcma && negotiated_audio_pt == 0 {
-                            transcode_alaw_to_ulaw(&mut chunk);
-                        } else if track_is_pcmu && negotiated_audio_pt == 8 {
-                            transcode_ulaw_to_alaw(&mut chunk);
-                        } else if !track_is_pcma && !track_is_pcmu {
-                            // Non-G.711 track (e.g., AAC/Opus if not transcoded): skip raw payload
-                            continue;
+                    } else if let Some(decoder) = &mut audio_decoder {
+                        let target_is_pcmu = negotiated_audio_pt == 0;
+                        let g711_chunk = decoder.decode_to_g711(payload, target_is_pcmu);
+                        if !g711_chunk.is_empty() {
+                            let mut q = pcm_queue_prod.lock().await;
+                            // Cap queue at ~400ms (3200 bytes) to keep latency low
+                            if q.len() > 3200 {
+                                let drop_len = q.len() - 1600;
+                                q.drain(..drop_len);
+                            }
+                            q.extend(g711_chunk);
                         }
-
-                        let mut q = pcm_queue_prod.lock().await;
-                        // Cap queue at ~400ms (3200 bytes) to keep latency low
-                        if q.len() > 3200 {
-                            let drop_len = q.len() - 1600;
-                            q.drain(..drop_len);
-                        }
-                        q.extend(chunk);
                     }
                 }
             } else {

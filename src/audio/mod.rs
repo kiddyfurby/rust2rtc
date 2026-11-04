@@ -414,6 +414,128 @@ impl OpusToG711Decoder {
     }
 }
 
+/// Pure-Rust AAC to G.711 (PCMU or PCMA) decoder for SIP two-way talk
+pub struct AacToG711Decoder {
+    decoder: AacDecoder,
+    clock_rate: u32,
+    channels: usize,
+}
+
+impl AacToG711Decoder {
+    pub fn new(source_codec: &Codec) -> Result<Self> {
+        let clock_rate = source_codec.clock_rate;
+        let channels = source_codec.channels.unwrap_or(1) as usize;
+
+        let supported = AacDecoder::supported_codecs();
+        if supported.is_empty() {
+            bail!("No supported AAC codecs found in symphonia-codec-aac");
+        }
+
+        let mut params = AudioCodecParameters::new();
+        params.for_codec(supported[0].id);
+        params.with_sample_rate(clock_rate);
+
+        let extra_data = parse_aac_config(source_codec.fmtp.as_deref(), clock_rate, channels);
+        params.with_extra_data(extra_data.into_boxed_slice());
+
+        let decoder = match AacDecoder::try_new(&params, &AudioDecoderOptions::default()) {
+            Ok(dec) => dec,
+            Err(_) => {
+                let fallback = generate_asc(clock_rate, channels);
+                params.with_extra_data(fallback.into_boxed_slice());
+                AacDecoder::try_new(&params, &AudioDecoderOptions::default())
+                    .context("Failed to initialize pure-Rust AAC decoder with fallback config")?
+            }
+        };
+
+        Ok(Self {
+            decoder,
+            clock_rate,
+            channels,
+        })
+    }
+
+    /// Decode incoming AAC RTP packet and return G.711 (PCMU or PCMA) audio bytes at 8000 Hz.
+    pub fn decode_to_g711(&mut self, payload: &[u8], is_pcmu: bool) -> Bytes {
+        let f32_samples = decode_aac_payload(&mut self.decoder, payload, self.clock_rate);
+        if f32_samples.is_empty() {
+            return Bytes::new();
+        }
+
+        // 1. Downmix to mono if stereo
+        let mono_samples: Vec<f32> = if self.channels == 2 {
+            f32_samples.chunks_exact(2).map(|c| (c[0] + c[1]) * 0.5).collect()
+        } else {
+            f32_samples
+        };
+
+        // 2. Resample from self.clock_rate to 8000 Hz
+        let ratio = self.clock_rate as f64 / 8000.0;
+        let num_out = ((mono_samples.len() as f64) / ratio).floor() as usize;
+        let mut out = Vec::with_capacity(num_out);
+
+        let mut src_pos = 0.0f64;
+        while (src_pos as usize) < mono_samples.len() {
+            let sample = mono_samples[src_pos as usize];
+            let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+            if is_pcmu {
+                out.push(crate::backchannel::pcm::s16_to_ulaw(s16));
+            } else {
+                out.push(crate::backchannel::pcm::s16_to_alaw(s16));
+            }
+            src_pos += ratio;
+        }
+
+        Bytes::from(out)
+    }
+}
+
+/// Unified camera microphone audio decoder for SIP phone listeners.
+/// Automatically handles native PCMU/PCMA, Opus, or AAC (MPEG4-GENERIC).
+pub enum CameraAudioDecoder {
+    Direct { is_pcma: bool, is_pcmu: bool },
+    Opus(Box<OpusToG711Decoder>),
+    Aac(Box<AacToG711Decoder>),
+}
+
+impl CameraAudioDecoder {
+    pub fn new(codec: &Codec) -> Result<Self> {
+        let name_upper = codec.name.to_uppercase();
+        if name_upper.contains("MPEG4-GENERIC") || name_upper.contains("AAC") {
+            Ok(Self::Aac(Box::new(AacToG711Decoder::new(codec)?)))
+        } else if name_upper.contains("OPUS") {
+            Ok(Self::Opus(Box::new(OpusToG711Decoder::new()?)))
+        } else {
+            let is_pcma = codec.payload_type == 8 || name_upper == "PCMA";
+            let is_pcmu = codec.payload_type == 0 || name_upper == "PCMU";
+            Ok(Self::Direct { is_pcma, is_pcmu })
+        }
+    }
+
+    /// Decode or transcode incoming camera audio payload to 8000 Hz G.711 (PCMU or PCMA)
+    pub fn decode_to_g711(&mut self, payload: &[u8], target_is_pcmu: bool) -> Bytes {
+        match self {
+            Self::Direct { is_pcma, is_pcmu } => {
+                if *is_pcma && target_is_pcmu {
+                    let mut data = payload.to_vec();
+                    crate::backchannel::pcm::transcode_alaw_to_ulaw(&mut data);
+                    Bytes::from(data)
+                } else if *is_pcmu && !target_is_pcmu {
+                    let mut data = payload.to_vec();
+                    crate::backchannel::pcm::transcode_ulaw_to_alaw(&mut data);
+                    Bytes::from(data)
+                } else if *is_pcma || *is_pcmu {
+                    Bytes::copy_from_slice(payload)
+                } else {
+                    Bytes::new()
+                }
+            }
+            Self::Opus(dec) => dec.decode_to_g711(payload, target_is_pcmu).unwrap_or_default(),
+            Self::Aac(dec) => dec.decode_to_g711(payload, target_is_pcmu),
+        }
+    }
+}
+
 mod rand {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEED: AtomicU32 = AtomicU32::new(0x1337cafe);
@@ -476,5 +598,25 @@ mod tests {
         let mut dec = OpusToG711Decoder::new().expect("decoder init");
         let g711 = dec.decode_to_g711(opus_pkts[0].payload(), true).expect("decode");
         assert_eq!(g711.len(), 160); // 20ms at 8kHz is 160 samples
+    }
+
+    #[test]
+    fn test_camera_audio_decoder_matrix() {
+        // 1. PCMU / PCMA direct
+        let pcmu_codec = Codec::new_pcmu();
+        let mut pcmu_dec = CameraAudioDecoder::new(&pcmu_codec).expect("pcmu decoder");
+        let dummy = vec![0xFFu8; 160];
+        let out_pcmu = pcmu_dec.decode_to_g711(&dummy, true);
+        assert_eq!(out_pcmu.len(), 160);
+
+        // 2. AAC decoder
+        let aac_codec = Codec::new_aac();
+        let aac_dec = CameraAudioDecoder::new(&aac_codec);
+        assert!(aac_dec.is_ok());
+
+        // 3. Opus decoder
+        let opus_codec = Codec::new_opus();
+        let opus_dec = CameraAudioDecoder::new(&opus_codec);
+        assert!(opus_dec.is_ok());
     }
 }
