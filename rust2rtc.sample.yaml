@@ -9,37 +9,24 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. Streams Configuration
+# 1. Streams Configuration (Optional / Managed by Frigate)
 # ------------------------------------------------------------------------------
-# Format is identical to go2rtc: a map of stream names to one or more source URLs.
-# rust2rtc will automatically discover tracks, negotiate codecs, and handle failover.
-streams:
-  # Standard RTSP camera with 2-way audio (Live555 / Reolink / ONVIF backchannel)
-  front_door:
-    - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_main#backchannel=1"
-    # Pure-Rust Opus audio transcoder for seamless WebRTC two-way talk in browsers
-    - "ffmpeg:front_door#audio=opus"
-
-  # Low-resolution sub-stream used for Frigate detection
-  front_door_sub:
-    - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_sub"
-    - "ffmpeg:front_door_sub#audio=opus"
-
-  # 4K H.265 (HEVC) Camera
-  driveway:
-    - "rtsp://admin:password@192.168.1.51:554/stream1"
-    # Optional MJPEG snapshot or preview transcode for low-bandwidth dashboards
-    - "ffmpeg:driveway#video=mjpeg#raw=-r 10 -q:v 3 -vf scale=-2:480"
-
-  driveway_sub:
-    - "rtsp://admin:password@192.168.1.51:554/stream2"
-
-  # Tapo camera using proprietary encrypted control protocol or ONVIF
-  kitchen:
-    - "tapo://admin:MD5_HASHED_PASSWORD@192.168.1.52"
-
-  kitchen_sub:
-    - "rtsp://admin:password@192.168.1.52:554/stream2"
+# NOTE FOR FRIGATE USERS:
+# When used alongside Frigate NVR, Frigate automatically generates all camera
+# stream definitions from its config.yml and injects them via /dev/shm/go2rtc.yaml.
+# Therefore, you do NOT need a `streams:` section here—Frigate manages it completely!
+#
+# If running rust2rtc in standalone mode (without Frigate) or if you want to define
+# standalone auxiliary streams, uncomment and configure below:
+#
+# streams:
+#   # Standard RTSP camera with 2-way audio (Live555 / Reolink / ONVIF backchannel)
+#   front_door:
+#     - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_main#backchannel=1"
+#     - "ffmpeg:front_door#audio=opus"
+#   # 4K H.265 (HEVC) Camera
+#   driveway:
+#     - "rtsp://admin:password@192.168.1.51:554/stream1"
 
 # ------------------------------------------------------------------------------
 # 2. WebRTC Configuration

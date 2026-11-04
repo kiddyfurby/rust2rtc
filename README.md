@@ -206,23 +206,14 @@ just dist
 A minimal or full configuration can include any of the following sections:
 
 ```yaml
-# 1. Camera Streams & Ingestion
-streams:
-  # Direct RTSP camera feed with 2-way audio (backchannel=1)
-  doorbell:
-    - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_main#backchannel=1"
-    # Pure-Rust in-process Opus transcoding for WebRTC two-way talk in browsers
-    - "ffmpeg:doorbell#audio=opus"
-
-  # Low-resolution sub-stream used for Frigate object detection
-  doorbell_sub:
-    - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_sub"
-
-  # 4K H.265 / HEVC Camera
-  driveway:
-    - "rtsp://admin:password@192.168.1.51:554/stream1"
-    # Optional MJPEG preview transcode for low-bandwidth dashboards
-    - "ffmpeg:driveway#video=mjpeg#raw=-r 10 -q:v 3 -vf scale=-2:480"
+# 1. Camera Streams & Ingestion (Optional / Handled by Frigate)
+# NOTE: When running alongside Frigate NVR, Frigate automatically generates all camera
+# stream definitions from its config.yml. You can completely omit this section.
+# For standalone deployments, define your camera RTSP feeds below:
+# streams:
+#   doorbell:
+#     - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_main#backchannel=1"
+#     - "ffmpeg:doorbell#audio=opus"
 
 # 2. WebRTC ICE & STUN
 webrtc:
