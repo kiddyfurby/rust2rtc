@@ -96,11 +96,10 @@ impl SipMessage {
             _ => None,
         };
 
-        if let Some(target) = alias {
-            if let Some(val) = self.headers.get(target) {
+        if let Some(target) = alias
+            && let Some(val) = self.headers.get(target) {
                 return Some(val.as_str());
             }
-        }
         self.headers.get(&lower).map(|s| s.as_str())
     }
 
@@ -235,9 +234,8 @@ pub fn extract_param(header: &str, param_name: &str) -> Option<String> {
             let trimmed = rem.trim_start();
             if trimmed.starts_with('=') {
                 let val_part = trimmed[1..].trim_start();
-                if val_part.starts_with('"') {
+                if let Some(content) = val_part.strip_prefix('"') {
                     // Quoted string: extract until closing quote
-                    let content = &val_part[1..];
                     if let Some(end_quote) = content.find('"') {
                         return Some(content[..end_quote].to_string());
                     }
@@ -364,9 +362,7 @@ impl SdpMediaInfo {
 
     /// Pick the preferred video codec (H.264 or JPEG) and payload type based on SDP offer order
     pub fn preferred_video_codec(&self) -> Option<(VideoCodecKind, u8)> {
-        if self.video_port.is_none() {
-            return None;
-        }
+        self.video_port?;
 
         // Check peer's advertised preference order in m=video line
         for &pt in &self.video_payload_types {
@@ -420,11 +416,10 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
         } else if let Some(m) = line.strip_prefix("m=audio ") {
             let mut parts = m.split_whitespace();
             let port_str = parts.next().unwrap_or("0");
-            if let Ok(p) = port_str.parse::<u16>() {
-                if p > 0 {
+            if let Ok(p) = port_str.parse::<u16>()
+                && p > 0 {
                     info.audio_port = Some(p);
                 }
-            }
             // Skip transport (e.g., RTP/AVP)
             let _transport = parts.next();
             for pt_str in parts {
@@ -435,11 +430,10 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
         } else if let Some(m) = line.strip_prefix("m=video ") {
             let mut parts = m.split_whitespace();
             let port_str = parts.next().unwrap_or("0");
-            if let Ok(p) = port_str.parse::<u16>() {
-                if p > 0 {
+            if let Ok(p) = port_str.parse::<u16>()
+                && p > 0 {
                     info.video_port = Some(p);
                 }
-            }
             // Skip transport (e.g., RTP/AVP)
             let _transport = parts.next();
             for pt_str in parts {
@@ -450,9 +444,9 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             // e.g. a=rtpmap:103 H264/90000 or a=rtpmap:26 JPEG/90000
             let mut parts = rtpmap.split_whitespace();
-            if let Some(pt_str) = parts.next() {
-                if let Ok(pt) = pt_str.parse::<u8>() {
-                    if let Some(codec) = parts.next() {
+            if let Some(pt_str) = parts.next()
+                && let Ok(pt) = pt_str.parse::<u8>()
+                    && let Some(codec) = parts.next() {
                         let codec_upper = codec.to_ascii_uppercase();
                         if codec_upper.starts_with("H264/") && info.h264_payload_type.is_none() {
                             info.h264_payload_type = Some(pt);
@@ -464,8 +458,6 @@ pub fn parse_sdp_media(sdp: &str) -> SdpMediaInfo {
                             info.l16_payload_type = Some(pt);
                         }
                     }
-                }
-            }
         }
     }
 

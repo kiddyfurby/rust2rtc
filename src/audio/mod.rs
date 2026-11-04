@@ -180,7 +180,7 @@ fn decode_aac_payload(decoder: &mut AacDecoder, payload: &[u8], _sample_rate: u3
     // In RFC 3640 mode=AAC-hbr:
     // First 2 bytes is AU-headers-length in bits (big-endian)
     let au_headers_len_bits = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    let au_headers_len_bytes = (au_headers_len_bits + 7) / 8;
+    let au_headers_len_bytes = au_headers_len_bits.div_ceil(8);
 
     let aac_frame = if au_headers_len_bytes > 0 && payload.len() >= 2 + au_headers_len_bytes {
         let au_header = u16::from_be_bytes([payload[2], payload[3]]);
@@ -326,13 +326,11 @@ fn parse_aac_config(fmtp: Option<&str>, rate: u32, channels: usize) -> Vec<u8> {
     if let Some(f) = fmtp {
         for part in f.split(';') {
             let trimmed = part.trim();
-            if let Some(val) = trimmed.strip_prefix("config=") {
-                if let Ok(bytes) = hex::decode(val.trim()) {
-                    if !bytes.is_empty() {
+            if let Some(val) = trimmed.strip_prefix("config=")
+                && let Ok(bytes) = hex::decode(val.trim())
+                    && !bytes.is_empty() {
                         return bytes;
                     }
-                }
-            }
         }
     }
     generate_asc(rate, channels)

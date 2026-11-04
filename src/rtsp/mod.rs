@@ -122,7 +122,7 @@ impl RtspServer {
                 let packet_bytes = buffer.split_to(length).freeze();
 
                 // Channel % 2 == 0 is RTP (channel + 1 is RTCP)
-                if ch % 2 == 0 {
+                if ch.is_multiple_of(2) {
                     if let Some(track) = track_channels.get(&ch) {
                         if let Some(rtp) = RtpPacket::parse(packet_bytes) {
                             track.send(rtp);
@@ -598,14 +598,14 @@ fn parse_sdp_tracks(sdp: &str) -> Vec<Arc<Track>> {
         } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
             // e.g. a=rtpmap:96 H264/90000
             let parts: Vec<&str> = rtpmap.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(pt) = parts[0].parse::<u8>() {
+            if parts.len() >= 2
+                && let Ok(pt) = parts[0].parse::<u8>() {
                     let (name, rate_chan) = parts[1].split_once('/').unwrap_or((parts[1], "90000"));
                     let rate = rate_chan.split('/').next().unwrap_or("90000").parse::<u32>().unwrap_or(90000);
                     let chan = rate_chan.split('/').nth(1).and_then(|c| c.parse::<u8>().ok());
 
-                    if let Some(ref mut draft) = current_draft {
-                        if draft.pt == pt || draft.name.is_empty() {
+                    if let Some(ref mut draft) = current_draft
+                        && (draft.pt == pt || draft.name.is_empty()) {
                             draft.pt = pt;
                             draft.name = name.to_uppercase();
                             draft.clock_rate = rate;
@@ -613,20 +613,15 @@ fn parse_sdp_tracks(sdp: &str) -> Vec<Arc<Track>> {
                                 draft.channels = Some(chan.unwrap_or(1));
                             }
                         }
-                    }
                 }
-            }
         } else if let Some(fmtp) = line.strip_prefix("a=fmtp:") {
             // e.g. a=fmtp:96 sprop-vps=...; sprop-sps=...
-            if let Some((pt_str, params)) = fmtp.split_once(' ') {
-                if let Ok(pt) = pt_str.parse::<u8>() {
-                    if let Some(ref mut draft) = current_draft {
-                        if draft.pt == pt {
+            if let Some((pt_str, params)) = fmtp.split_once(' ')
+                && let Ok(pt) = pt_str.parse::<u8>()
+                    && let Some(ref mut draft) = current_draft
+                        && draft.pt == pt {
                             draft.fmtp = Some(params.trim().to_string());
                         }
-                    }
-                }
-            }
         }
     }
 

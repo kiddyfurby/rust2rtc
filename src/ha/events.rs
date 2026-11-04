@@ -191,19 +191,18 @@ async fn connect_and_listen(
                 if msg_type == "result" {
                     let id = v.get("id").and_then(|i| i.as_u64());
                     let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
-                    if let Some(id) = id {
-                        if let Some((stream, cfg)) = subscriptions.get(&id) {
+                    if let Some(id) = id
+                        && let Some((stream, cfg)) = subscriptions.get(&id) {
                             if success {
                                 debug!(stream = %stream, entity = %cfg.entity, sub_id = id, "HA subscription confirmed");
                             } else {
                                 warn!(stream = %stream, entity = %cfg.entity, sub_id = id, error = ?v.get("error"), "HA subscription returned failure");
                             }
                         }
-                    }
                 } else if msg_type == "event" {
                     let id = v.get("id").and_then(|i| i.as_u64());
-                    if let Some(id) = id {
-                        if let Some((stream_name, cfg)) = subscriptions.get(&id) {
+                    if let Some(id) = id
+                        && let Some((stream_name, cfg)) = subscriptions.get(&id) {
                             // Extract to_state if present
                             let new_state = v.pointer("/event/variables/trigger/to_state/state")
                                 .or_else(|| v.pointer("/event/trigger/to_state/state"))
@@ -233,8 +232,8 @@ async fn connect_and_listen(
                             let cooldown_dur = Duration::from_secs(cfg.cooldown_seconds);
                             {
                                 let mut last_map = last_triggers.lock().await;
-                                if let Some(last_time) = last_map.get(stream_name) {
-                                    if now.duration_since(*last_time) < cooldown_dur {
+                                if let Some(last_time) = last_map.get(stream_name)
+                                    && now.duration_since(*last_time) < cooldown_dur {
                                         info!(
                                             stream = %stream_name,
                                             entity = %cfg.entity,
@@ -243,7 +242,6 @@ async fn connect_and_listen(
                                         );
                                         continue;
                                     }
-                                }
                                 last_map.insert(stream_name.clone(), now);
                             }
 
@@ -264,7 +262,6 @@ async fn connect_and_listen(
                                 }
                             });
                         }
-                    }
                 }
             }
         }

@@ -120,11 +120,10 @@ impl HaVoipClient {
                 "extension": current_ext,
                 "replace": true,
             });
-            if let Some(dn) = display_name {
-                if !dn.is_empty() {
+            if let Some(dn) = display_name
+                && !dn.is_empty() {
                     payload["display_name"] = serde_json::Value::String(dn.to_string());
                 }
-            }
 
             let (status, body) = self.call_voip_service("create_account", &payload).await?;
             if (200..300).contains(&status) {

@@ -385,8 +385,8 @@ impl WebRtcManager {
                 let is_hevc = track.codec.name.to_uppercase().contains("265")
                     || track.codec.name.to_uppercase().contains("HEVC");
 
-                let is_high_51 = track.codec.fmtp.as_deref().map_or(false, |f| f.contains("640033"));
-                let is_high = track.codec.fmtp.as_deref().map_or(true, |f| f.contains("6400"));
+                let is_high_51 = track.codec.fmtp.as_deref().is_some_and(|f| f.contains("640033"));
+                let is_high = track.codec.fmtp.as_deref().is_none_or(|f| f.contains("6400"));
 
                 let (video_codec, default_pt) = if is_hevc {
                     (h265_codec.clone(), 100)
@@ -711,18 +711,15 @@ fn find_negotiated_video_pt(sdp: &str, is_hevc: bool, is_high: bool, default_pt:
     for line in sdp.lines() {
         let line = line.trim();
         if let Some(r) = line.strip_prefix("a=rtpmap:") {
-            if let Some((pt_str, rest)) = r.split_once(' ') {
-                if let Ok(pt) = pt_str.parse::<u8>() {
+            if let Some((pt_str, rest)) = r.split_once(' ')
+                && let Ok(pt) = pt_str.parse::<u8>() {
                     rtpmap.push((pt, rest.to_uppercase()));
                 }
-            }
-        } else if let Some(f) = line.strip_prefix("a=fmtp:") {
-            if let Some((pt_str, rest)) = f.split_once(' ') {
-                if let Ok(pt) = pt_str.parse::<u8>() {
+        } else if let Some(f) = line.strip_prefix("a=fmtp:")
+            && let Some((pt_str, rest)) = f.split_once(' ')
+                && let Ok(pt) = pt_str.parse::<u8>() {
                     fmtp.push((pt, rest.to_string()));
                 }
-            }
-        }
     }
 
     if is_hevc {
@@ -732,7 +729,7 @@ fn find_negotiated_video_pt(sdp: &str, is_hevc: bool, is_high: bool, default_pt:
                 let is_profile_1 = fmtp
                     .iter()
                     .find(|(fpt, _)| fpt == pt)
-                    .map_or(true, |(_, params)| params.contains("profile-id=1") || !params.contains("profile-id="));
+                    .is_none_or(|(_, params)| params.contains("profile-id=1") || !params.contains("profile-id="));
                 if is_profile_1 {
                     return *pt;
                 }
@@ -772,9 +769,9 @@ fn find_negotiated_video_pt(sdp: &str, is_hevc: bool, is_high: bool, default_pt:
 fn find_negotiated_audio_pt(sdp: &str, default_pt: u8) -> u8 {
     for line in sdp.lines() {
         let line = line.trim();
-        if let Some(r) = line.strip_prefix("a=rtpmap:") {
-            if let Some((pt_str, rest)) = r.split_once(' ') {
-                if let Ok(pt) = pt_str.parse::<u8>() {
+        if let Some(r) = line.strip_prefix("a=rtpmap:")
+            && let Some((pt_str, rest)) = r.split_once(' ')
+                && let Ok(pt) = pt_str.parse::<u8>() {
                     let upper = rest.to_uppercase();
                     if default_pt == 111 && upper.contains("OPUS") {
                         return pt;
@@ -784,8 +781,6 @@ fn find_negotiated_audio_pt(sdp: &str, default_pt: u8) -> u8 {
                         return pt;
                     }
                 }
-            }
-        }
     }
     default_pt
 }
@@ -793,13 +788,11 @@ fn find_negotiated_audio_pt(sdp: &str, default_pt: u8) -> u8 {
 fn is_audio_active(sdp: &str) -> bool {
     for line in sdp.lines() {
         let line = line.trim();
-        if let Some(r) = line.strip_prefix("m=audio ") {
-            if let Some((port_str, _)) = r.split_once(' ') {
-                if port_str != "0" {
+        if let Some(r) = line.strip_prefix("m=audio ")
+            && let Some((port_str, _)) = r.split_once(' ')
+                && port_str != "0" {
                     return true;
                 }
-            }
-        }
     }
     false
 }

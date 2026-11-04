@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct Config {
     #[serde(default)]
     pub streams: HashMap<String, StreamConfig>,
@@ -142,21 +143,6 @@ fn default_auto_answer() -> bool {
     true
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            streams: HashMap::new(),
-            api: ApiConfig::default(),
-            rtsp: RtspConfig::default(),
-            ffmpeg: FfmpegConfig::default(),
-            webrtc: None,
-            sip: None,
-            ha: None,
-            doorbells: HashMap::new(),
-            record: None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]

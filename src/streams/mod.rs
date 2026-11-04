@@ -289,11 +289,7 @@ impl Stream {
                     } else {
                         Some(fmtp.clone())
                     }
-                } else if let Some(sprop) = track.get_sprop() {
-                    Some(format!("packetization-mode=1;{}", sprop))
-                } else {
-                    None
-                };
+                } else { track.get_sprop().map(|sprop| format!("packetization-mode=1;{}", sprop)) };
 
                 if let Some(ref fmtp) = effective_fmtp {
                     sdp.push_str(&format!(

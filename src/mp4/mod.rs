@@ -235,7 +235,7 @@ pub fn write_audio_stsd(writer: &mut BoxWriter, codec: &AudioCodecConfig) {
             mp4a_hdr.extend_from_slice(&16u16.to_be_bytes()); // samplesize = 16
             mp4a_hdr.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
             mp4a_hdr.extend_from_slice(&0u16.to_be_bytes()); // reserved
-            mp4a_hdr.extend_from_slice(&((*sample_rate as u32) << 16).to_be_bytes()); // samplerate (16.16)
+            mp4a_hdr.extend_from_slice(&(*sample_rate << 16).to_be_bytes()); // samplerate (16.16)
             writer.buf.extend_from_slice(&mp4a_hdr);
 
             // 'esds' box
@@ -290,7 +290,7 @@ pub fn write_audio_stsd(writer: &mut BoxWriter, codec: &AudioCodecConfig) {
             alaw_hdr.extend_from_slice(&16u16.to_be_bytes());
             alaw_hdr.extend_from_slice(&0u16.to_be_bytes());
             alaw_hdr.extend_from_slice(&0u16.to_be_bytes());
-            alaw_hdr.extend_from_slice(&((*sample_rate as u32) << 16).to_be_bytes());
+            alaw_hdr.extend_from_slice(&(*sample_rate << 16).to_be_bytes());
             writer.buf.extend_from_slice(&alaw_hdr);
             writer.end_box(alaw_pos);
         }
@@ -307,7 +307,7 @@ pub fn write_audio_stsd(writer: &mut BoxWriter, codec: &AudioCodecConfig) {
             ulaw_hdr.extend_from_slice(&16u16.to_be_bytes());
             ulaw_hdr.extend_from_slice(&0u16.to_be_bytes());
             ulaw_hdr.extend_from_slice(&0u16.to_be_bytes());
-            ulaw_hdr.extend_from_slice(&((*sample_rate as u32) << 16).to_be_bytes());
+            ulaw_hdr.extend_from_slice(&(*sample_rate << 16).to_be_bytes());
             writer.buf.extend_from_slice(&ulaw_hdr);
             writer.end_box(ulaw_pos);
         }
@@ -471,12 +471,11 @@ pub fn build_standalone_mp4(
     // 'stts' (video duration entries)
     let mut v_stts_entries: Vec<(u32, u32)> = Vec::new();
     for s in samples {
-        if let Some(last) = v_stts_entries.last_mut() {
-            if last.1 == s.duration {
+        if let Some(last) = v_stts_entries.last_mut()
+            && last.1 == s.duration {
                 last.0 += 1;
                 continue;
             }
-        }
         v_stts_entries.push((1, s.duration));
     }
     let mut v_stts_payload = Vec::with_capacity(4 + v_stts_entries.len() * 8);
@@ -535,8 +534,8 @@ pub fn build_standalone_mp4(
 
     // ================= TRACK 2: AUDIO (OPTIONAL) =================
     let mut a_stco_pos = None;
-    if let Some((acfg, a_samples)) = audio {
-        if !a_samples.is_empty() {
+    if let Some((acfg, a_samples)) = audio
+        && !a_samples.is_empty() {
             let a_trak_pos = writer.start_box(b"trak");
 
             // 'tkhd' (audio: vol 1.0, width=0, height=0)
@@ -603,12 +602,11 @@ pub fn build_standalone_mp4(
             // 'stts' (audio duration entries)
             let mut a_stts_entries: Vec<(u32, u32)> = Vec::new();
             for s in a_samples.iter() {
-                if let Some(last) = a_stts_entries.last_mut() {
-                    if last.1 == s.duration {
+                if let Some(last) = a_stts_entries.last_mut()
+                    && last.1 == s.duration {
                         last.0 += 1;
                         continue;
                     }
-                }
                 a_stts_entries.push((1, s.duration));
             }
             let mut a_stts_payload = Vec::with_capacity(4 + a_stts_entries.len() * 8);
@@ -648,7 +646,6 @@ pub fn build_standalone_mp4(
             writer.end_box(a_mdia_pos);
             writer.end_box(a_trak_pos);
         }
-    }
 
     writer.end_box(moov_pos);
 
@@ -1047,7 +1044,7 @@ pub fn extract_aac_frame(payload: &[u8]) -> &[u8] {
         return payload;
     }
     let au_headers_len_bits = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-    let au_headers_len_bytes = (au_headers_len_bits + 7) / 8;
+    let au_headers_len_bytes = au_headers_len_bits.div_ceil(8);
     if au_headers_len_bytes > 0 && payload.len() >= 2 + au_headers_len_bytes {
         let au_header = u16::from_be_bytes([payload[2], payload[3]]);
         let au_size = (au_header >> 3) as usize;
@@ -1067,13 +1064,11 @@ pub fn parse_aac_config(fmtp: Option<&str>, rate: u32, channels: usize) -> Vec<u
     if let Some(f) = fmtp {
         for part in f.split(';') {
             let trimmed = part.trim();
-            if let Some(val) = trimmed.strip_prefix("config=") {
-                if let Ok(bytes) = hex::decode(val.trim()) {
-                    if !bytes.is_empty() {
+            if let Some(val) = trimmed.strip_prefix("config=")
+                && let Ok(bytes) = hex::decode(val.trim())
+                    && !bytes.is_empty() {
                         return bytes;
                     }
-                }
-            }
         }
     }
     generate_asc(rate, channels)
@@ -1246,7 +1241,7 @@ impl<'a> BitReader<'a> {
     fn read_se(&mut self) -> Option<i32> {
         let val = self.read_ue()?;
         let sign = if val & 1 == 1 { 1 } else { -1 };
-        Some(sign * ((val + 1) / 2) as i32)
+        Some(sign * val.div_ceil(2) as i32)
     }
 }
 
@@ -1284,13 +1279,12 @@ impl H264RtpDepacketizer {
         let mut completed_frame = None;
 
         // Check if timestamp changed (new frame boundary)
-        if let Some(last_ts) = self.last_timestamp {
-            if last_ts != packet.timestamp && !self.current_frame.is_empty() {
+        if let Some(last_ts) = self.last_timestamp
+            && last_ts != packet.timestamp && !self.current_frame.is_empty() {
                 let is_keyframe = self.current_frame.iter().any(|n| !n.is_empty() && (n[0] & 0x1F == 5));
                 let nalus = std::mem::take(&mut self.current_frame);
                 completed_frame = Some((is_keyframe, last_ts, nalus));
             }
-        }
         self.last_timestamp = Some(packet.timestamp);
 
         let nal_type = payload[0] & 0x1F;
@@ -1583,15 +1577,14 @@ impl H265RtpDepacketizer {
 
         let mut completed_frame = None;
 
-        if let Some(last_ts) = self.last_timestamp {
-            if last_ts != packet.timestamp && !self.current_frame.is_empty() {
+        if let Some(last_ts) = self.last_timestamp
+            && last_ts != packet.timestamp && !self.current_frame.is_empty() {
                 let is_keyframe = self.current_frame.iter().any(|n| {
                     !n.is_empty() && (19..=21).contains(&((n[0] >> 1) & 0x3F))
                 });
                 let nalus = std::mem::take(&mut self.current_frame);
                 completed_frame = Some((is_keyframe, last_ts, nalus));
             }
-        }
         self.last_timestamp = Some(packet.timestamp);
 
         let nal_type = (payload[0] >> 1) & 0x3F;
