@@ -50,6 +50,17 @@ fn normalize_args() -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let exe = raw_args.get(0).map(|s| s.as_str()).unwrap_or("");
+    if exe.ends_with("ffmpeg") || raw_args.get(1).map(|s| s.as_str()) == Some("ffmpeg-shim") {
+        let shim_args: Vec<String> = if raw_args.get(1).map(|s| s.as_str()) == Some("ffmpeg-shim") {
+            raw_args.into_iter().skip(2).collect()
+        } else {
+            raw_args.into_iter().skip(1).collect()
+        };
+        crate::record::run_ffmpeg_shim(shim_args);
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -324,29 +335,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Start in-process MP4 segment recording for Frigate cache if configured
-    if let Some(ref record_cfg) = config.record {
-        if record_cfg.enabled && !record_cfg.streams.is_empty() {
-            info!(
-                streams = ?record_cfg.streams,
-                dir = %record_cfg.dir,
-                duration = record_cfg.segment_duration,
-                "Starting in-process MP4 segment recording for Frigate cache"
-            );
-            record::start_recording(
-                record_cfg.clone(),
-                Arc::clone(&stream_manager),
-                rtsp_port,
-                Arc::clone(&ffmpeg_manager),
-            );
-        }
-    }
+    // Initialize in-process MP4 segment RecordManager for Frigate cache
+    let record_manager = record::RecordManager::new(
+        config.record.clone(),
+        Arc::clone(&stream_manager),
+        rtsp_port,
+        Arc::clone(&ffmpeg_manager),
+    );
 
     let app_state = api::AppState {
         streams: Arc::clone(&stream_manager),
         ffmpeg: Arc::clone(&ffmpeg_manager),
         webrtc: Arc::clone(&webrtc_manager),
         sip: Arc::clone(&sip_manager),
+        record: record_manager,
         rtsp_port,
     };
 
