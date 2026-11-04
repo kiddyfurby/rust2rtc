@@ -726,7 +726,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
     });
 
     let mut mse_handle: Option<tokio::task::JoinHandle<()>> = None;
-    let mut active_pc: Option<Arc<dyn webrtc::peer_connection::PeerConnection>> = None;
+    let mut active_pc: Option<crate::webrtc::ActivePeerConnection> = None;
 
     while let Some(msg_result) = ws_stream.next().await {
         let msg = match msg_result {
@@ -859,11 +859,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                         _ => String::new(),
                     };
                     if !cand_str.is_empty() {
-                        let init = webrtc::peer_connection::RTCIceCandidateInit {
-                            candidate: cand_str,
-                            ..Default::default()
-                        };
-                        if let Err(e) = pc.add_ice_candidate(init).await {
+                        if let Err(e) = pc.add_ice_candidate(&cand_str).await {
                             debug!("Failed to add ICE candidate: {}", e);
                         }
                     }
