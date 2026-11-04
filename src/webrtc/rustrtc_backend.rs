@@ -192,6 +192,98 @@ impl RustRtcSession {
         self.pc.add_ice_candidate(candidate)?;
         Ok(())
     }
+
+    /// Spawn background video and audio forwarding workers from stream tracks
+    pub fn start_forwarding(&self, stream: Arc<Stream>, is_hevc: bool) {
+        // 1. Video forwarder
+        if let Some(v_source) = self.video_source.clone() {
+            let s_clone = Arc::clone(&stream);
+            tokio::spawn(async move {
+                let tracks = s_clone.get_tracks().await;
+                let video_track = match tracks.iter().find(|t| t.kind == MediaKind::Video) {
+                    Some(t) => Arc::clone(t),
+                    None => return,
+                };
+
+                let mut rx = video_track.subscribe();
+                let mut sent_first_keyframe = false;
+
+                while let Ok(pkt) = rx.recv().await {
+                    let payload = pkt.payload();
+                    if payload.is_empty() {
+                        continue;
+                    }
+
+                    // Keyframe detection to ensure clean playback start
+                    if !sent_first_keyframe {
+                        let is_kf = if is_hevc {
+                            let nalu_type = (payload[0] >> 1) & 0x3F;
+                            (16..=21).contains(&nalu_type)
+                        } else {
+                            let nalu_type = payload[0] & 0x1F;
+                            nalu_type == 5
+                        };
+                        if !is_kf {
+                            continue;
+                        }
+                        sent_first_keyframe = true;
+                    }
+
+                    let v_frame = rustrtc::media::frame::VideoFrame {
+                        rtp_timestamp: pkt.timestamp,
+                        width: 0,
+                        height: 0,
+                        format: rustrtc::media::VideoPixelFormat::Unspecified,
+                        rotation_deg: 0,
+                        is_last_packet: pkt.marker,
+                        data: bytes::Bytes::copy_from_slice(payload),
+                        header_extension: None,
+                        csrcs: vec![],
+                        sequence_number: None,
+                        payload_type: None,
+                        source_addr: None,
+                        raw_packet: None,
+                    };
+
+                    if v_source.send_video(v_frame).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // 2. Audio forwarder
+        if let Some(a_source) = self.audio_source.clone() {
+            let s_clone = Arc::clone(&stream);
+            tokio::spawn(async move {
+                if let Some(opus_track) = s_clone.get_or_create_opus_track().await {
+                    let mut rx = opus_track.subscribe();
+                    while let Ok(pkt) = rx.recv().await {
+                        let payload = pkt.payload();
+                        if payload.is_empty() {
+                            continue;
+                        }
+
+                        let a_frame = rustrtc::media::frame::AudioFrame {
+                            rtp_timestamp: pkt.timestamp,
+                            clock_rate: 48000,
+                            data: bytes::Bytes::copy_from_slice(payload),
+                            sequence_number: None,
+                            payload_type: None,
+                            marker: pkt.marker,
+                            header_extension: None,
+                            source_addr: None,
+                            raw_packet: None,
+                        };
+
+                        if a_source.send_audio(a_frame).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
