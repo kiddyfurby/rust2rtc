@@ -1,0 +1,127 @@
+# ==============================================================================
+# rust2rtc Configuration Reference
+# ==============================================================================
+# High-Performance WebRTC & RTSP Media Gateway in Rust with Built-in:
+# - In-process MP4 progressive segment recording (Zero-copy Frigate recorder)
+# - Hardware-accelerated Rockchip RKMPP & FFmpeg transcoding
+# - SIP softphone / intercom gateway & Home Assistant doorbell integration
+# - Ultra-low-latency WebRTC streaming (H.264 & H.265/HEVC)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Streams Configuration
+# ------------------------------------------------------------------------------
+# Format is identical to go2rtc: a map of stream names to one or more source URLs.
+# rust2rtc will automatically discover tracks, negotiate codecs, and handle failover.
+streams:
+  # Standard RTSP camera with 2-way audio (Live555 / Reolink / ONVIF backchannel)
+  front_door:
+    - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_main#backchannel=1"
+    # Pure-Rust Opus audio transcoder for seamless WebRTC two-way talk in browsers
+    - "ffmpeg:front_door#audio=opus"
+
+  # Low-resolution sub-stream used for Frigate detection
+  front_door_sub:
+    - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_sub"
+    - "ffmpeg:front_door_sub#audio=opus"
+
+  # 4K H.265 (HEVC) Camera
+  driveway:
+    - "rtsp://admin:password@192.168.1.51:554/stream1"
+    # Optional MJPEG snapshot or preview transcode for low-bandwidth dashboards
+    - "ffmpeg:driveway#video=mjpeg#raw=-r 10 -q:v 3 -vf scale=-2:480"
+
+  driveway_sub:
+    - "rtsp://admin:password@192.168.1.51:554/stream2"
+
+  # Tapo camera using proprietary encrypted control protocol or ONVIF
+  kitchen:
+    - "tapo://admin:MD5_HASHED_PASSWORD@192.168.1.52"
+
+  kitchen_sub:
+    - "rtsp://admin:password@192.168.1.52:554/stream2"
+
+# ------------------------------------------------------------------------------
+# 2. WebRTC Configuration
+# ------------------------------------------------------------------------------
+webrtc:
+  # Public IP / DNS and port, or STUN server addresses for ICE candidate gathering
+  candidates:
+    - "192.168.1.4:8555"
+    - "stun:stun.l.google.com:19302"
+
+# ------------------------------------------------------------------------------
+# 3. Network Services (API & RTSP)
+# ------------------------------------------------------------------------------
+api:
+  listen: ":1984" # Web dashboard, REST API, and WebSocket signaling
+
+rtsp:
+  listen: ":8554" # Embedded RTSP server for Frigate, Home Assistant, and VLC
+
+# ------------------------------------------------------------------------------
+# 4. FFmpeg & Hardware Acceleration
+# ------------------------------------------------------------------------------
+ffmpeg:
+  bin: "ffmpeg"
+  # Hardware acceleration profile:
+  # - "rkmpp" : Rockchip RK3588 / RK3566 MPP hardware decoder/encoder (Orange Pi 5, etc.)
+  # - "vaapi" : Intel / AMD hardware acceleration on Linux
+  # - "cuda"  : NVIDIA NVDEC / NVENC
+  hardware: "rkmpp"
+
+# ------------------------------------------------------------------------------
+# 5. In-Process Recording for Frigate (Optional)
+# ------------------------------------------------------------------------------
+# NOTE: In-process progressive MP4 segment recording is ENABLED BY DEFAULT for
+# ALL streams when using the rust2rtc FFmpeg shim!
+# You do NOT need to define this section unless you wish to customize defaults.
+#
+# record:
+#   enabled: true             # Default: true. Set to false to disable in-process recording.
+#   dir: "/tmp/cache"         # Default: /tmp/cache (Frigate recording cache directory).
+#   segment_duration: 10      # Default: 10 seconds per MP4 progressive segment.
+#   # streams:                # Optional whitelist. If omitted or empty, ALL streams are recorded.
+#   #   - front_door
+#   #   - driveway
+
+# ------------------------------------------------------------------------------
+# 6. SIP Softphone & Intercom Server (Optional)
+# ------------------------------------------------------------------------------
+# rust2rtc includes a built-in SIP PBX/gateway that enables VoIP desk phones
+# and mobile SIP apps (Grandstream, Linphone, etc.) to view video and talk.
+sip:
+  server: "192.168.1.4:5060"
+  domain: "192.168.1.4"
+  ha_url: "http://192.168.1.4:8123"
+  ha_token: "YOUR_LONG_LIVED_HOME_ASSISTANT_ACCESS_TOKEN"
+  auto_register_streams: true # Automatically assign SIP extensions to camera streams
+  base_extension: 101         # Starting extension number (e.g. 101, 102, ...)
+  auto_password: "YourSecurePasswordHere"
+
+  # Friendly names shown on SIP phone screens during incoming calls
+  names:
+    front_door: "Front Doorbell"
+    driveway: "Driveway"
+    kitchen: "Kitchen"
+
+  # Custom extension accounts
+  accounts:
+    front_door:
+      extension: "101"
+      auth_user: "camera_front_door"
+      password: "YourSecurePasswordHere"
+      display_name: "Front Doorbell"
+      auto_answer: true
+
+# ------------------------------------------------------------------------------
+# 7. Doorbells & Call Automation (Optional)
+# ------------------------------------------------------------------------------
+# Listen to Home Assistant doorbell button events and trigger SIP calls to phones
+doorbells:
+  front_door:
+    entity: "binary_sensor.front_doorbell_visitor" # Home Assistant binary sensor
+    sip_targets:
+      - "192.168.1.100:5060" # Indoor SIP intercom tablet
+      - "192.168.1.101:5060" # Wall-mounted VoIP screen
+    cooldown_seconds: 15     # Debounce time between successive presses
