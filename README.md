@@ -199,77 +199,85 @@ just dist
 
 ## ⚙️ Configuration
 
-`rust2rtc` reads configuration from `rust2rtc.yaml` in the current working directory:
+`rust2rtc` reads configuration from `rust2rtc.yaml` in the current working directory. A fully documented reference template is included in the project root at [`rust2rtc.sample.yaml`](rust2rtc.sample.yaml).
+
+### Configuration Sections Walkthrough
+
+A minimal or full configuration can include any of the following sections:
 
 ```yaml
+# 1. Camera Streams & Ingestion
 streams:
-  # Direct RTSP camera stream
-  driveway:
-    - rtsp://admin:password@198.51.100.10:554/stream1
-
-  # Stream with FFmpeg audio transcoding to Opus for WebRTC
+  # Direct RTSP camera feed with 2-way audio (backchannel=1)
   doorbell:
-    - rtsp://admin:password@198.51.100.20/Preview_01_main
-    - ffmpeg:doorbell#audio=opus
+    - "rtsp://admin:password@198.51.100.50:554/h264Preview_01_main#backchannel=1"
+    # Pure-Rust in-process Opus transcoding for WebRTC two-way talk in browsers
+    - "ffmpeg:doorbell#audio=opus"
 
-  # Stream with custom FFmpeg video filters
-  garden:
-    - rtsp://admin:password@198.51.100.30:554/h264Preview_01_main
-    - ffmpeg:garden#video=mjpeg#raw=-r 15 -q:v 3 -vf scale=-2:480
+  # Low-resolution sub-stream used for Frigate object detection
+  doorbell_sub:
+    - "rtsp://admin:password@198.51.100.50:554/h264Preview_01_sub"
 
+  # 4K H.265 / HEVC Camera
+  driveway:
+    - "rtsp://admin:password@198.51.100.51:554/stream1"
+    # Optional MJPEG preview transcode for low-bandwidth dashboards
+    - "ffmpeg:driveway#video=mjpeg#raw=-r 10 -q:v 3 -vf scale=-2:480"
+
+# 2. WebRTC ICE & STUN
 webrtc:
   candidates:
-    - stun:stun.l.google.com:19302
-    # Add your public IP or local IP if behind NAT:
-    # - 198.51.100.50:8555
+    - "198.51.100.4:8555"
+    - "stun:stun.l.google.com:19302"
 
+# 3. Ports & Network Services
 api:
-  listen: ":1984"
+  listen: ":1984" # Web dashboard, REST API & WebSocket signaling
 
 rtsp:
-  listen: ":8554"
+  listen: ":8554" # Embedded RTSP server for Frigate, Home Assistant, VLC
 
+# 4. FFmpeg & Hardware Acceleration
 ffmpeg:
   bin: "ffmpeg"
-  # Hardware acceleration profile: rkmpp (Rockchip RK3588), vaapi (Intel/AMD), cuda/nvenc (Nvidia), videotoolbox (Apple Silicon)
+  # Hardware profile: "rkmpp" (Rockchip RK3588), "vaapi" (Intel/AMD), "cuda" (Nvidia)
   hardware: "rkmpp"
-  # Custom FFmpeg encoding templates (optional overrides)
-  h264: "-c:v h264_rkmpp -b:v 2M"
 
+# 5. In-Process MP4 Recording for Frigate (Optional)
+# NOTE: In-process progressive MP4 segment recording is ENABLED BY DEFAULT for
+# ALL streams when using the FFmpeg shim. You do NOT need to include this section
+# unless you want to customize the cache directory or restrict recording:
+# record:
+#   enabled: true             # Default: true (set to false to disable)
+#   dir: "/tmp/cache"         # Default: /tmp/cache (Frigate cache)
+#   segment_duration: 10      # Default: 10 seconds per segment
+#   # streams:                # Optional whitelist. If omitted, ALL streams are recorded!
+#   #   - doorbell
+
+# 6. Built-in SIP PBX / Intercom Server (Optional)
 sip:
-  server: "198.51.100.1:5060"
-  domain: "198.51.100.1"
-  # Optional Home Assistant auto-provisioning
-  ha_url: "http://198.51.100.1:8123"
+  server: "198.51.100.4:5060"
+  domain: "198.51.100.4"
+  ha_url: "http://198.51.100.4:8123"
   ha_token: "YOUR_HA_LONG_LIVED_ACCESS_TOKEN"
-  auto_register_streams: true
+  auto_register_streams: true # Automatically assigns SIP extensions to camera streams
   base_extension: 101
   auto_password: "YourSecurePasswordHere"
-  # Friendly display names for auto-registered RTSP cameras
   names:
     doorbell: "Front Door"
-    living2: "Living Room 2"
-    patio: "Back Patio"
-  accounts:
-    doorbell:
-      extension: "101"
-      auth_user: "camera_doorbell"
-      password: "YourSecurePasswordHere"
-      sip_name: "Front Doorbell"
-      auto_answer: true
+    driveway: "Driveway"
 
-# Automated Doorbell Ring Group & Conference Calling
+# 7. Automated Doorbell Calling (Optional)
 doorbells:
   doorbell:
-    # Home Assistant binary sensor for the doorbell button
-    entity: "binary_sensor.reolink_video_doorbell_wifi_visitor"
-    # Intercom displays to ring simultaneously (parallel SIP forking)
+    entity: "binary_sensor.front_doorbell_visitor" # Home Assistant binary sensor
     sip_targets:
-      - "192.0.2.42:5060"   # e.g. Living Room ESPHome Intercom (Guition ESP32-P4)
-      - "192.0.2.36:5060"   # e.g. Dining Room ESPHome Intercom (Waveshare ESP32-P4 Touch)
-    # Debounce cooldown in seconds to prevent duplicate ringing
+      - "198.51.100.100:5060" # Living Room ESPHome Intercom
+      - "198.51.100.101:5060" # Dining Room ESPHome Intercom
     cooldown_seconds: 15
 ```
+
+See [`rust2rtc.sample.yaml`](rust2rtc.sample.yaml) for full configuration comments and options.
 
 ---
 
@@ -305,6 +313,29 @@ docker restart frigate
 ```
 
 Frigate's s6-overlay runner detects `/config/go2rtc` and automatically runs it with multi-config loading (`-config=/config/go2rtc_homekit.yml -config=/dev/shm/go2rtc.yaml`), seamlessly handled by `rust2rtc`.
+
+##### 💾 Zero-FFmpeg Recording Setup (93% RAM Reduction per Camera)
+Frigate by default spawns an external FFmpeg instance for every camera assigned a `record` role, consuming ~25–38 MB RSS each. With `rust2rtc`, progressive MP4 segment recording runs directly in-process with zero extra processes.
+
+To enable in-process recording for **all cameras** with **100% stock, unpatched Frigate**:
+1. Create an FFmpeg shim directory inside `/config`:
+   ```bash
+   mkdir -p /path/to/frigate/config/ffmpeg/bin
+   ln -sf ../../go2rtc /path/to/frigate/config/ffmpeg/bin/ffmpeg
+   ln -sf /usr/lib/ffmpeg/6.0/bin/ffprobe /path/to/frigate/config/ffmpeg/bin/ffprobe
+   ```
+2. In Frigate's `config.yml`, set the custom ffmpeg path:
+   ```yaml
+   ffmpeg:
+     path: /config/ffmpeg
+   ```
+3. Restart Frigate.
+
+**How it works:**
+- When Frigate spawns a recording process (`-f segment ...`), the shim intercepts the call, asks `rust2rtc` to record in-process, and sits dormant at **~1.5 MB RSS and 0.0% CPU**.
+- When Frigate terminates or rotates the recording, the shim sends a stop signal to `rust2rtc` and exits cleanly.
+- For all non-recording operations (e.g. object detection, hardware RKMPP/VAAPI decoding, `ffprobe`), the shim immediately and transparently calls real FFmpeg.
+- **No `record:` block is required in `rust2rtc.yaml`**—all cameras defined in `rust2rtc` are recorded automatically!
 
 #### 2. Advanced Camera Card ([advanced-camera-card](https://card.camera/))
 `rust2rtc` is 100% compatible with AlexxIT's `video-rtc.js` dual-mode negotiation used by Advanced Camera Card:
