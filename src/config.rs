@@ -24,9 +24,9 @@ pub struct Config {
     pub record: Option<RecordConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_record_dir")]
     pub dir: String,
@@ -34,6 +34,21 @@ pub struct RecordConfig {
     pub segment_duration: u32,
     #[serde(default)]
     pub streams: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RecordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: default_record_dir(),
+            segment_duration: default_segment_duration(),
+            streams: Vec::new(),
+        }
+    }
 }
 
 fn default_record_dir() -> String {
@@ -317,5 +332,22 @@ ffmpeg:
 
         assert_eq!(cfg.ffmpeg.hardware.as_deref(), Some("rkmpp"));
         assert_eq!(cfg.ffmpeg.templates.get("h264").unwrap(), "-c:v h264_rkmpp -b:v 2M");
+    }
+
+    #[test]
+    fn test_record_config_defaults() {
+        // When completely omitted:
+        let yaml = "streams: {}\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.record.is_none());
+
+        // When record is provided with defaults:
+        let yaml_record = "record: {}\n";
+        let cfg2: Config = serde_yaml::from_str(yaml_record).unwrap();
+        let rec = cfg2.record.expect("record block present");
+        assert!(rec.enabled);
+        assert_eq!(rec.dir, "/tmp/cache");
+        assert_eq!(rec.segment_duration, 10);
+        assert!(rec.streams.is_empty());
     }
 }
