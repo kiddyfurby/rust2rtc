@@ -413,7 +413,7 @@ mod tests {
     fn test_parse_backchannel_sdp() {
         let sdp = "\
 v=0\r\n\
-o=- 12345 1 IN IP4 192.168.1.42\r\n\
+o=- 12345 1 IN IP4 192.0.2.42\r\n\
 s=RTSP Session\r\n\
 m=video 0 RTP/AVP 96\r\n\
 a=control:trackID=0\r\n\
@@ -427,10 +427,10 @@ a=control:trackID=2\r\n\
 a=rtpmap:0 PCMU/8000\r\n\
 a=sendonly\r\n";
 
-        let ctrl = parse_backchannel_control(sdp, "rtsp://192.168.1.42/Preview_01_main");
+        let ctrl = parse_backchannel_control(sdp, "rtsp://192.0.2.42/Preview_01_main");
         assert_eq!(
             ctrl,
-            Some("rtsp://192.168.1.42/Preview_01_main/trackID=2".to_string())
+            Some("rtsp://192.0.2.42/Preview_01_main/trackID=2".to_string())
         );
     }
 
@@ -460,7 +460,8 @@ a=control:track3\r\n";
     #[tokio::test]
     #[ignore]
     async fn test_live_living_connect() {
-        let mut client = OnvifBackchannelClient::new("rtsp://192.0.2.25/ch0_0.h264#backchannel=1").unwrap();
+        let url = std::env::var("TEST_LIVING_URL").unwrap_or_else(|_| "rtsp://192.0.2.25/ch0_0.h264#backchannel=1".to_string());
+        let mut client = OnvifBackchannelClient::new(&url).unwrap();
         let res = client.connect().await;
         println!("Connect result: {:?}", res);
         assert!(res.is_ok());
@@ -469,7 +470,8 @@ a=control:track3\r\n";
     #[tokio::test]
     #[ignore]
     async fn test_live_living_send_audio() {
-        let mut client = OnvifBackchannelClient::new("rtsp://192.0.2.25/ch0_0.h264#backchannel=1").unwrap();
+        let url = std::env::var("TEST_LIVING_URL").unwrap_or_else(|_| "rtsp://192.0.2.25/ch0_0.h264#backchannel=1".to_string());
+        let mut client = OnvifBackchannelClient::new(&url).unwrap();
         client.connect().await.unwrap();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<(bytes::Bytes, bool)>(32);
