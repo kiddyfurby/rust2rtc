@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::process::Child;
-use tokio::sync::{oneshot, Mutex, RwLock};
-use tracing::info;
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+use tracing::{debug, info};
 
 pub struct ActiveProducer {
     pub source: String,
@@ -27,6 +28,7 @@ pub struct Stream {
     pub packets_recv: AtomicU64,
     pub backchannel: Mutex<Option<Arc<crate::backchannel::BackchannelSession>>>,
     pub opus_track: Arc<Mutex<Option<Arc<Track>>>>,
+    pub mjpeg_broadcaster: Arc<Mutex<Option<broadcast::Sender<Bytes>>>>,
 }
 
 impl Stream {
@@ -40,6 +42,7 @@ impl Stream {
             packets_recv: AtomicU64::new(0),
             backchannel: Mutex::new(None),
             opus_track: Arc::new(Mutex::new(None)),
+            mjpeg_broadcaster: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -89,6 +92,8 @@ impl Stream {
         tracks.clear();
         let mut opus = self.opus_track.lock().await;
         *opus = None;
+        let mut mjpeg = self.mjpeg_broadcaster.lock().await;
+        *mjpeg = None;
     }
 
     pub async fn get_tracks(&self) -> Vec<Arc<Track>> {
@@ -180,6 +185,112 @@ impl Stream {
         Some(opus_track)
     }
 
+    /// Get or dynamically spawn a shared in-process FFmpeg MJPEG broadcaster
+    pub async fn get_or_create_mjpeg_broadcaster(
+        self: &Arc<Self>,
+        rtsp_port: u16,
+        ffmpeg: &FfmpegManager,
+    ) -> Option<broadcast::Sender<Bytes>> {
+        let mut guard = self.mjpeg_broadcaster.lock().await;
+        if let Some(ref sender) = *guard {
+            if sender.receiver_count() > 0 {
+                return Some(sender.clone());
+            }
+        }
+
+        let custom_pipeline = self.sources.iter().find(|s| s.contains("#video=mjpeg")).cloned();
+        let source = format!("rtsp://127.0.0.1:{}/{}", rtsp_port, self.name);
+        let args = ffmpeg.build_mjpeg_stream_args(&source, custom_pipeline.as_deref(), None, None, None, None);
+
+        let mut child = match ffmpeg.spawn_stdout_process(&args) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(stream = %self.name, "Failed to spawn shared FFmpeg MJPEG transcoder: {}", e);
+                return None;
+            }
+        };
+
+        let mut stdout = child.stdout.take()?;
+
+        let (tx, _rx) = broadcast::channel::<Bytes>(16);
+        let tx_clone = tx.clone();
+        *guard = Some(tx.clone());
+
+        let stream_name = self.name.clone();
+        let slot = Arc::clone(&self.mjpeg_broadcaster);
+
+        tokio::spawn(async move {
+            info!(stream = %stream_name, "Starting shared MJPEG broadcaster worker");
+            let mut stream_buf = Vec::with_capacity(65536);
+            let mut chunk = [0u8; 8192];
+            let mut idle_seconds = 0;
+
+            loop {
+                tokio::select! {
+                    read_res = stdout.read(&mut chunk) => {
+                        let n = match read_res {
+                            Ok(0) => {
+                                debug!(stream = %stream_name, "FFmpeg MJPEG stdout reached EOF");
+                                break;
+                            }
+                            Ok(n) => n,
+                            Err(e) => {
+                                debug!(stream = %stream_name, "Error reading from FFmpeg MJPEG stdout: {}", e);
+                                break;
+                            }
+                        };
+
+                        stream_buf.extend_from_slice(&chunk[..n]);
+
+                        while let Some(soi_pos) = crate::ffmpeg::find_marker(&stream_buf, &[0xFF, 0xD8]) {
+                            if soi_pos > 0 {
+                                stream_buf.drain(..soi_pos);
+                            }
+                            if stream_buf.len() < 4 {
+                                break;
+                            }
+                            if let Some(eoi_rel) = crate::ffmpeg::find_marker(&stream_buf[2..], &[0xFF, 0xD9]) {
+                                let eoi_pos = 2 + eoi_rel + 2;
+                                let jpeg = &stream_buf[..eoi_pos];
+                                let part_header = format!(
+                                    "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                                    jpeg.len()
+                                );
+                                let mut packet = Vec::with_capacity(part_header.len() + jpeg.len() + 2);
+                                packet.extend_from_slice(part_header.as_bytes());
+                                packet.extend_from_slice(jpeg);
+                                packet.extend_from_slice(b"\r\n");
+
+                                let _ = tx_clone.send(Bytes::from(packet));
+                                stream_buf.drain(..eoi_pos);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
+                        if tx_clone.receiver_count() == 0 {
+                            idle_seconds += 1;
+                            if idle_seconds >= 8 {
+                                info!(stream = %stream_name, "No active consumers on shared MJPEG stream for 8s, terminating worker");
+                                break;
+                            }
+                        } else {
+                            idle_seconds = 0;
+                        }
+                    }
+                }
+            }
+
+            let _ = child.kill().await;
+            let mut guard = slot.lock().await;
+            *guard = None;
+            info!(stream = %stream_name, "Shared MJPEG broadcaster worker terminated and slot cleared");
+        });
+
+        Some(tx)
+    }
+
     /// Ensure that a producer is actively running for this stream
     pub async fn ensure_started(self: &Arc<Self>, rtsp_port: u16, ffmpeg: &FfmpegManager) -> Result<()> {
         let mut producer_guard = self.producer.lock().await;
@@ -246,6 +357,8 @@ impl Stream {
                 let _ = child.kill().await;
             }
         }
+        let mut mjpeg = self.mjpeg_broadcaster.lock().await;
+        *mjpeg = None;
     }
 
     /// Generate SDP string for RTSP DESCRIBE
@@ -335,7 +448,13 @@ impl Stream {
             });
         }
 
-        let is_active = self.producer.lock().await.is_some();
+        let mjpeg_consumers = {
+            let guard = self.mjpeg_broadcaster.lock().await;
+            guard.as_ref().map(|s| s.receiver_count()).unwrap_or(0)
+        };
+        total_consumers += mjpeg_consumers;
+
+        let is_active = self.producer.lock().await.is_some() || mjpeg_consumers > 0;
 
         StreamInfo {
             name: self.name.clone(),
@@ -366,7 +485,13 @@ impl Stream {
             ));
         }
 
-        let is_active = self.producer.lock().await.is_some() || !tracks.is_empty();
+        let mjpeg_consumers = {
+            let guard = self.mjpeg_broadcaster.lock().await;
+            guard.as_ref().map(|s| s.receiver_count()).unwrap_or(0)
+        };
+        total_consumers += mjpeg_consumers;
+
+        let is_active = self.producer.lock().await.is_some() || !tracks.is_empty() || mjpeg_consumers > 0;
         let source_url = self.sources.first().cloned().unwrap_or_else(|| "unknown".to_string());
 
         let mut producers = Vec::new();
@@ -400,6 +525,16 @@ impl Stream {
                 remote_addr: None,
                 medias,
                 send: Some(total_bytes),
+            });
+        }
+
+        if mjpeg_consumers > 0 {
+            consumers.push(Go2rtcConsumer {
+                id: Some(3),
+                consumer_type: "HTTP MJPEG client".to_string(),
+                remote_addr: None,
+                medias: vec!["Video, sendonly, JPEG/90000".to_string()],
+                send: None,
             });
         }
 
@@ -545,5 +680,29 @@ mod tests {
         let producers = json_val.get("producers").unwrap().as_array().unwrap();
         assert_eq!(producers.len(), 1);
         assert_eq!(producers[0].get("url").unwrap(), "rtsp://198.51.100.10/stream");
+    }
+
+    #[tokio::test]
+    async fn test_mjpeg_consumer_reporting() {
+        let stream = Stream::new("garden".to_string(), vec!["rtsp://198.51.100.20/stream".to_string()]);
+        let (tx, rx) = broadcast::channel(16);
+        drop(rx); // Drop initial receiver so receiver_count is 0
+        {
+            let mut guard = stream.mjpeg_broadcaster.lock().await;
+            *guard = Some(tx.clone());
+        }
+
+        // Before any subscriber
+        let info = stream.to_info().await;
+        assert_eq!(info.consumers, 0);
+
+        // Subscribe an active consumer
+        let _sub = tx.subscribe();
+        let info_with_consumer = stream.to_info().await;
+        assert_eq!(info_with_consumer.consumers, 1);
+        assert!(info_with_consumer.active);
+
+        let go2rtc_stream = stream.to_go2rtc().await;
+        assert!(go2rtc_stream.consumers.iter().any(|c| c.consumer_type == "HTTP MJPEG client"));
     }
 }

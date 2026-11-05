@@ -8,6 +8,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
@@ -28,6 +29,21 @@ pub struct AppState {
 #[derive(Debug, Deserialize)]
 pub struct FrameQuery {
     pub src: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MjpegQuery {
+    pub src: Option<String>,
+    pub name: Option<String>,
+    pub val: Option<String>,
+    pub width: Option<u32>,
+    pub w: Option<u32>,
+    pub height: Option<u32>,
+    pub h: Option<u32>,
+    pub fps: Option<u32>,
+    pub r: Option<u32>,
+    pub q: Option<u32>,
+    pub quality: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +98,9 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/ffmpeg", get(api_ffmpeg_handler))
         .route("/api/frame.jpeg", get(api_frame_handler))
+        .route("/api/stream.mjpeg", get(api_stream_mjpeg_handler))
+        .route("/api/frame.mjpeg", get(api_stream_mjpeg_handler))
+        .route("/stream.mjpeg", get(api_stream_mjpeg_handler))
         .route("/api/webrtc", post(api_webrtc_handler))
         .route("/api/ws", get(api_ws_handler))
         .route("/api/sip/call", post(api_sip_call_handler))
@@ -386,6 +405,7 @@ async fn index_handler() -> Html<&'static str> {
                             </div>
                             <div class="links">
                                 <button class="btn btn-primary" onclick="playWebRtc('${s.name}', document.getElementById('preview-${s.name}'))">▶ WebRTC Live</button>
+                                <a class="btn" href="/api/stream.mjpeg?src=${encodeURIComponent(s.name)}" target="_blank">MJPEG</a>
                                 <a class="btn" href="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" target="_blank">Snapshot</a>
                                 <a class="btn" href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP</a>
                             </div>
@@ -439,6 +459,8 @@ async fn api_schemes_handler() -> Response {
         "isapi",
         "ivideon",
         "kasa",
+        "mjpeg",
+        "mpjpeg",
         "multitrans",
         "nest",
         "onvif",
@@ -631,6 +653,146 @@ async fn api_frame_handler(
                 .into_response()
         }
     }
+}
+
+async fn api_stream_mjpeg_handler(
+    State(state): State<AppState>,
+    Query(query): Query<MjpegQuery>,
+) -> Response {
+    let stream_name = match query.src.or(query.name).or(query.val) {
+        Some(s) if !s.is_empty() => s,
+        _ => return (StatusCode::BAD_REQUEST, "Missing stream parameter (src/name)").into_response(),
+    };
+
+    let width = query.width.or(query.w);
+    let height = query.height.or(query.h);
+    let fps = query.fps.or(query.r);
+    let quality = query.quality.or(query.q);
+    let is_custom = width.is_some() || height.is_some() || fps.is_some() || quality.is_some();
+
+    if let Some(stream) = state.streams.get(&stream_name).await {
+        let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
+        // Wait up to 3 seconds for tracks to be populated if just starting
+        for _ in 0..30 {
+            if !stream.get_tracks().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        if !is_custom {
+            if let Some(broadcaster) = stream.get_or_create_mjpeg_broadcaster(state.rtsp_port, &state.ffmpeg).await {
+                let rx = broadcaster.subscribe();
+                let stream_body = futures_util::stream::unfold(rx, |mut rx| async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(chunk) => return Some((Ok::<Bytes, std::convert::Infallible>(chunk), rx)),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        }
+                    }
+                });
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
+                    .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+                    .header(header::PRAGMA, "no-cache")
+                    .header(header::EXPIRES, "0")
+                    .header(header::CONNECTION, "close")
+                    .body(axum::body::Body::from_stream(stream_body))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+        } else {
+            // Dedicated transcode process with custom width/height/fps/quality options
+            let custom_pipeline = stream.sources.iter().find(|s| s.contains("#video=mjpeg")).cloned();
+            let source = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, stream.name);
+            if let Some(resp) = create_dedicated_mjpeg_response(&source, custom_pipeline.as_deref(), width, height, fps, quality, &state.ffmpeg) {
+                return resp;
+            }
+        }
+    } else {
+        // Direct source URL (e.g. rtsp://... or external HTTP stream)
+        if let Some(resp) = create_dedicated_mjpeg_response(&stream_name, None, width, height, fps, quality, &state.ffmpeg) {
+            return resp;
+        }
+    }
+
+    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start MJPEG stream").into_response()
+}
+
+fn create_dedicated_mjpeg_response(
+    source: &str,
+    custom_pipeline: Option<&str>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
+    quality: Option<u32>,
+    ffmpeg: &FfmpegManager,
+) -> Option<Response> {
+    let args = ffmpeg.build_mjpeg_stream_args(source, custom_pipeline, width, height, fps, quality);
+    let mut child = ffmpeg.spawn_stdout_process(&args).ok()?;
+    let mut stdout = child.stdout.take()?;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+
+    tokio::spawn(async move {
+        let mut stream_buf = Vec::with_capacity(65536);
+        let mut chunk = [0u8; 8192];
+
+        loop {
+            let n = match stdout.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            stream_buf.extend_from_slice(&chunk[..n]);
+
+            while let Some(soi_pos) = crate::ffmpeg::find_marker(&stream_buf, &[0xFF, 0xD8]) {
+                if soi_pos > 0 {
+                    stream_buf.drain(..soi_pos);
+                }
+                if stream_buf.len() < 4 {
+                    break;
+                }
+                if let Some(eoi_rel) = crate::ffmpeg::find_marker(&stream_buf[2..], &[0xFF, 0xD9]) {
+                    let eoi_pos = 2 + eoi_rel + 2;
+                    let jpeg = &stream_buf[..eoi_pos];
+                    let part_header = format!(
+                        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                        jpeg.len()
+                    );
+                    let mut packet = Vec::with_capacity(part_header.len() + jpeg.len() + 2);
+                    packet.extend_from_slice(part_header.as_bytes());
+                    packet.extend_from_slice(jpeg);
+                    packet.extend_from_slice(b"\r\n");
+
+                    if tx.send(Bytes::from(packet)).await.is_err() {
+                        // Consumer disconnected
+                        let _ = child.kill().await;
+                        return;
+                    }
+                    stream_buf.drain(..eoi_pos);
+                } else {
+                    break;
+                }
+            }
+        }
+        let _ = child.kill().await;
+    });
+
+    let stream_body = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (Ok::<Bytes, std::convert::Infallible>(chunk), rx))
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "multipart/x-mixed-replace; boundary=frame")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header(header::PRAGMA, "no-cache")
+        .header(header::EXPIRES, "0")
+        .header(header::CONNECTION, "close")
+        .body(axum::body::Body::from_stream(stream_body))
+        .ok()
 }
 
 async fn api_webrtc_handler(
@@ -1381,6 +1543,37 @@ mod tests {
         let encoded = serde_json::to_string(&answer).expect("encode answer");
         assert!(encoded.contains(r#""type":"webrtc/answer""#));
         assert!(encoded.contains(r#""value":"v=0\r\no=rust2rtc...""#));
+    }
+
+    #[test]
+    fn test_mjpeg_query_deserialization() {
+        let json = serde_json::json!({
+            "src": "doorbell",
+            "fps": 10,
+            "w": 640,
+            "h": 480,
+            "q": 3
+        });
+        let query: MjpegQuery = serde_json::from_value(json).expect("deserialize mjpeg query");
+        assert_eq!(query.src.as_deref(), Some("doorbell"));
+        assert_eq!(query.fps, Some(10));
+        assert_eq!(query.w, Some(640));
+        assert_eq!(query.h, Some(480));
+        assert_eq!(query.q, Some(3));
+
+        let json_alt = serde_json::json!({
+            "name": "driveway",
+            "r": 15,
+            "width": 1280,
+            "height": 720,
+            "quality": 5
+        });
+        let query_alt: MjpegQuery = serde_json::from_value(json_alt).expect("deserialize alt query");
+        assert_eq!(query_alt.name.as_deref(), Some("driveway"));
+        assert_eq!(query_alt.r, Some(15));
+        assert_eq!(query_alt.width, Some(1280));
+        assert_eq!(query_alt.height, Some(720));
+        assert_eq!(query_alt.quality, Some(5));
     }
 }
 
