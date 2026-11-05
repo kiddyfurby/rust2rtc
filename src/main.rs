@@ -183,7 +183,7 @@ async fn main() -> Result<()> {
         .webrtc
         .as_ref()
         .and_then(|w| w.engine.clone())
-        .unwrap_or_else(|| "webrtc-rs".to_string());
+        .unwrap_or_else(|| "rustrtc".to_string());
 
     info!(engine = %webrtc_engine, "WebRTC engine selected");
 

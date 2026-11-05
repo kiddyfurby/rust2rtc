@@ -2,7 +2,7 @@
 
 > **High-performance, drop-in [go2rtc](https://github.com/AlexxIT/go2rtc) media streaming gateway in pure Rust.**
 
-`rust2rtc` is a modern, memory-safe, ultra-lightweight streaming gateway built from the ground up in Rust using [Tokio](https://tokio.rs/), [Axum](https://github.com/tokio-rs/axum), and [webrtc-rs](https://github.com/webrtc-rs/webrtc).
+`rust2rtc` is a modern, memory-safe, ultra-lightweight streaming gateway built from the ground up in Rust using [Tokio](https://tokio.rs/), [Axum](https://github.com/tokio-rs/axum), and [rustrtc](https://github.com/restsend/rustrtc).
 
 It serves as a **drop-in binary replacement for `go2rtc`** across the smart home ecosystem — working out of the box with **[Frigate NVR](https://frigate.video/)**, **[Advanced Camera Card](https://card.camera/)**, **Home Assistant**, and WebRTC client libraries like `video-rtc.js`.
 
@@ -34,12 +34,12 @@ In addition, `rust2rtc` functions as a **high-performance bidirectional SIP brid
   - Automatically cuts segments on IDR keyframes matching Frigate's naming convention (`<stream>@%Y%m%d%H%M%S%z.mp4`) with atomic temporary file renaming.
   - Native multiplexing for both **H.264** (`avc1`) and **H.265 / HEVC** (`hvc1`), with AAC audio track multiplexing (`mp4a` + `esds`).
   - Built-in transparent `ffmpeg-shim` stands in for Frigate's recording subprocesses, slashing recording subprocess RSS from ~25–38 MB down to **~1.5–2.0 MB per camera (-93% memory savings)** with 0% CPU overhead. Frigate's `RecordingMaintainer` indexes and archives segments seamlessly to disk/NFS.
-- **🌐 Real-Time WebRTC Streaming & Dual-Engine Selection**:
-  - **Dual WebRTC Engine**: Runtime selection between the lightweight, pure-Rust **`rustrtc`** engine (reduces process RSS down to **~14 MB**, -76% memory footprint) and the standard **`webrtc-rs`** engine via `webrtc.engine: "rustrtc"` in `rust2rtc.yaml`.
-  - **🎙️ Full-Duplex WebRTC Two-Way Audio (Talkback)**: Built-in pure-Rust **`OpusToG711Decoder`** captures incoming microphone Opus audio from browsers, Frigate WebUI, and Home Assistant cards (`a=sendrecv`), decodes directly to 8kHz PCM, and relays it into the camera's RTSP backchannel speaker in real time.
+- **🌐 Real-Time WebRTC Streaming (`rustrtc`)**:
+  - **Lightweight Pure-Rust Engine**: Powered by the pure-Rust **`rustrtc`** engine, keeping process RSS down to **~20–50 MB** across 7 active camera streams.
+  - **🎙️ Full-Duplex WebRTC Two-Way Audio (Talkback)**: Built-in pure-Rust **`OpusToG711Decoder`** (plus zero-transcode G.711 PCMA/PCMU handling) captures incoming microphone audio from browsers, Frigate WebUI, and Home Assistant cards (`a=sendrecv`) and relays it into the camera's RTSP backchannel speaker in real time.
   - **Low-Latency Browser Playback**: Standard WHEP (`/api/webrtc`) and native **`go2rtc` WebSocket Signaling (`/api/ws?src=<stream>`)** supporting `webrtc/offer`, `webrtc/answer`, and trickle ICE for **`advanced-camera-card`**, **Frigate**, and Home Assistant.
-  - **Codec Support**: Automatic negotiation supporting **H.264** (Baseline, Constrained Baseline, High Profile up to Level 5.1) and **H.265 / HEVC** (in supported browsers like Safari).
-  - **Audio Passthrough & Transcoding**: In-process Opus, PCMA (G.711a), and PCMU (G.711u).
+  - **Codec Support**: Automatic negotiation supporting **H.264** (Baseline, Constrained Baseline, High Profile up to Level 5.1) and **H.265 / HEVC** (in supported browsers like Safari and Chrome).
+  - **Audio Passthrough & On-Demand Transcoding**: Zero-copy native passthrough for `PCMA` (G.711a), `PCMU` (G.711u), and `Opus`, with automatic in-process AAC → Opus transcoding only for AAC camera streams.
   - In-band parameter sets (SPS / PPS / VPS) caching and IDR keyframe gating for instant decode.
 - **🔄 go2rtc-Compatible REST API**:
   - `GET /api/streams` returning standard go2rtc `{ "stream": { "producers": [...], "consumers": [...] } }` schema.
