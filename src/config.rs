@@ -255,7 +255,14 @@ impl Config {
         }
         if let Some(webrtc) = other.webrtc {
             if let Some(ref mut our_webrtc) = self.webrtc {
-                our_webrtc.candidates.extend(webrtc.candidates);
+                for cand in webrtc.candidates {
+                    if !our_webrtc.candidates.contains(&cand) {
+                        our_webrtc.candidates.push(cand);
+                    }
+                }
+                if webrtc.engine.is_some() {
+                    our_webrtc.engine = webrtc.engine;
+                }
             } else {
                 self.webrtc = Some(webrtc);
             }
