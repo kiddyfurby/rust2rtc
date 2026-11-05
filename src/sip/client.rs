@@ -834,10 +834,11 @@ impl SipCameraAccount {
 
         let mut active = self.active_call.lock().await;
         if let Some(current) = active.as_ref()
-            && (current.call_id == call_id || call_id == "unknown") {
-                let mut session = active.take().unwrap();
-                session.stop().await;
-            }
+            && (current.call_id == call_id || call_id == "unknown")
+            && let Some(mut session) = active.take()
+        {
+            session.stop().await;
+        }
 
         let ok_resp = self.create_reply(&req, 200, "OK");
         self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
@@ -852,10 +853,11 @@ impl SipCameraAccount {
         let call_id = req.get_header("call-id").unwrap_or("unknown");
         let mut active = self.active_call.lock().await;
         if let Some(current) = active.as_ref()
-            && (current.call_id == call_id || call_id == "unknown") {
-                let mut session = active.take().unwrap();
-                session.stop().await;
-            }
+            && (current.call_id == call_id || call_id == "unknown")
+            && let Some(mut session) = active.take()
+        {
+            session.stop().await;
+        }
         Ok(())
     }
 
@@ -965,9 +967,8 @@ impl SipCameraAccount {
                 continue;
             }
 
-            let (target_user, target_domain, target_addr) = if target_trimmed.contains('@') {
-                let clean = target_trimmed.strip_prefix("sip:").unwrap_or(target_trimmed);
-                let (u, host_part) = clean.split_once('@').unwrap();
+            let (target_user, target_domain, target_addr) = if let Some((raw_u, host_part)) = target_trimmed.split_once('@') {
+                let u = raw_u.strip_prefix("sip:").unwrap_or(raw_u);
                 let addr = match tokio::net::lookup_host(host_part).await {
                     Ok(mut addrs) => addrs.next().unwrap_or(server_default),
                     Err(_) => server_default,

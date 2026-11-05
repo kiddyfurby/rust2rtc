@@ -83,13 +83,10 @@ async fn main() -> Result<()> {
         vec![PathBuf::from("rust2rtc.yaml")]
     };
 
-    // Auto-detect companion rust2rtc.yaml configs (e.g. in /config/rust2rtc.yaml inside Docker,
-    // or alongside any explicit config path, or in current dir)
-    let supplemental = [
-        PathBuf::from("/config/rust2rtc.yaml"),
-        PathBuf::from("rust2rtc.yaml"),
-    ];
-    for supp in supplemental {
+    // Auto-detect companion rust2rtc.yaml configs only when no explicit --config was passed
+    // or when running inside a Frigate container with /config/rust2rtc.yaml
+    if config_paths.iter().any(|p| p.to_string_lossy().contains("/dev/shm/")) {
+        let supp = PathBuf::from("/config/rust2rtc.yaml");
         if supp.exists() && !config_paths.contains(&supp) {
             info!("Found supplemental config file: {:?}", supp);
             config_paths.push(supp);
@@ -356,6 +353,14 @@ async fn main() -> Result<()> {
         Arc::clone(&ffmpeg_manager),
     );
 
+    let api_auth = match (&config.api.username, &config.api.password) {
+        (Some(u), Some(p)) if !u.is_empty() => {
+            info!("HTTP Basic authentication enabled on API (:1984)");
+            Some((u.clone(), p.clone()))
+        }
+        _ => None,
+    };
+
     let app_state = api::AppState {
         streams: Arc::clone(&stream_manager),
         ffmpeg: Arc::clone(&ffmpeg_manager),
@@ -363,6 +368,7 @@ async fn main() -> Result<()> {
         sip: Arc::clone(&sip_manager),
         record: record_manager,
         rtsp_port,
+        api_auth,
     };
 
     let app = api::create_router(app_state);

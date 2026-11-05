@@ -42,6 +42,9 @@ webrtc:
 # ------------------------------------------------------------------------------
 api:
   listen: ":1984" # Web dashboard, REST API, and WebSocket signaling
+  # Optional HTTP Basic Authentication (leave commented out for unauthenticated Frigate/HA LAN access):
+  # username: "admin"
+  # password: "YourStrongApiPassword"
 
 rtsp:
   listen: ":8554" # Embedded RTSP server for Frigate, Home Assistant, and VLC

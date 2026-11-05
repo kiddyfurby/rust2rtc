@@ -543,11 +543,14 @@ impl RtspClient {
                     }
 
                     if let Some(len_str) = headers.get("content-length") {
-                        content_length = len_str.parse::<usize>().unwrap_or(0);
+                        content_length = len_str.parse::<usize>().unwrap_or(0).min(256 * 1024);
                     }
                     break;
                 }
 
+            if buffer.len() > 512 * 1024 {
+                bail!("RTSP response header buffer exceeded 512 KB limit");
+            }
             let n = tcp.read_buf(buffer).await.context("Failed reading RTSP response headers")?;
             if n == 0 {
                 bail!("Premature EOF while reading RTSP response headers");

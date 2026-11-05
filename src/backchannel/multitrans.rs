@@ -339,6 +339,7 @@ async fn read_rtsp_response(
 ) -> Result<(u16, std::collections::HashMap<String, String>, String)> {
     let mut buf = Vec::new();
     let mut header_end = None;
+    const MAX_RTSP_HEADER_BYTES: usize = 64 * 1024;
 
     while header_end.is_none() {
         let mut chunk = [0u8; 1024];
@@ -350,10 +351,12 @@ async fn read_rtsp_response(
 
         if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
             header_end = Some(pos);
+        } else if buf.len() > MAX_RTSP_HEADER_BYTES {
+            bail!("RTSP response header exceeded maximum size ({} bytes)", MAX_RTSP_HEADER_BYTES);
         }
     }
 
-    let end = header_end.unwrap();
+    let end = header_end.context("Missing RTSP header delimiter")?;
     let header_bytes = &buf[..end];
     let header_str = String::from_utf8_lossy(header_bytes);
 
@@ -376,7 +379,8 @@ async fn read_rtsp_response(
     let content_len: usize = headers
         .get("content-length")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(64 * 1024);
 
     while buf.len() < body_start + content_len {
         let mut chunk = [0u8; 1024];
@@ -387,8 +391,9 @@ async fn read_rtsp_response(
         buf.extend_from_slice(&chunk[..n]);
     }
 
-    let body = if buf.len() >= body_start {
-        String::from_utf8_lossy(&buf[body_start..body_start + content_len]).to_string()
+    let body = if buf.len() > body_start {
+        let available = (buf.len() - body_start).min(content_len);
+        String::from_utf8_lossy(&buf[body_start..body_start + available]).to_string()
     } else {
         String::new()
     };

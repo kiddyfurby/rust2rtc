@@ -1,481 +1,184 @@
 # 🦀 rust2rtc
 
-> **High-performance, drop-in [go2rtc](https://github.com/AlexxIT/go2rtc) media streaming gateway in pure Rust.**
+> **High-performance, drop-in [go2rtc](https://github.com/AlexxIT/go2rtc) media streaming gateway in Rust — zero-FFmpeg for the common path, with built-in Frigate segment recording and a bidirectional SIP intercom bridge.**
 
-`rust2rtc` is a modern, memory-safe, ultra-lightweight streaming gateway built from the ground up in Rust using [Tokio](https://tokio.rs/), [Axum](https://github.com/tokio-rs/axum), and [rustrtc](https://github.com/restsend/rustrtc).
+`rust2rtc` is a memory-safe, lightweight streaming gateway built in Rust using [Tokio](https://tokio.rs/), [Axum](https://github.com/tokio-rs/axum), and [`rustrtc`](https://github.com/restsend/rustrtc).
 
 It serves as a **drop-in binary replacement for `go2rtc`** across the smart home ecosystem — working out of the box with **[Frigate NVR](https://frigate.video/)**, **[Advanced Camera Card](https://card.camera/)**, **Home Assistant**, and WebRTC client libraries like `video-rtc.js`.
 
-In addition, `rust2rtc` functions as a **high-performance bidirectional SIP bridge**, bridging standard RTSP Wi-Fi / IP cameras (such as Reolink, Tapo, TP-Link, Yi) to SIP endpoints. This allows you to **see live video and talk directly with your cameras** from VoIP phones, SIP softphones, smart panels, and hardware intercom devices like **[ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/)**.
+In addition, `rust2rtc` functions as a **bidirectional SIP bridge**, bridging standard RTSP IP cameras (Reolink, Tapo, TP-Link, Yi) to SIP endpoints so you can **see live video and talk directly with your cameras** from VoIP phones, SIP softphones, and hardware intercom screens like **[ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/)**.
 
 > [!NOTE]
-> **Project Notice**: `rust2rtc` is an active, high-performance rewrite of `go2rtc`. The core RTSP relay, WebRTC (WHEP + WebSocket), in-process AAC/G.711 to Opus transcoding, native fMP4 (MSE), SIP intercom/backchannel, and snapshot pipelines are fully working and verified in production environments. Contributions, issues, and PRs are warmly welcomed!
+> **AI-Assisted Origin & Production Status**: `rust2rtc` was developed as an AI-assisted Rust re-implementation of `go2rtc`'s core workflows, iteratively tested and hardened against real cameras and 24/7 NVR hardware (Orange Pi 5 Plus RK3588 running Frigate + Home Assistant). See **[What's Tested vs. What's Rough](#-whats-tested-vs-whats-rough)** below for an honest breakdown of hardware validation and current limitations.
+
+---
+
+## 📚 Documentation
+
+Detailed setup and reference guides are organized in [`docs/`](docs/) and [`bench/`](bench/):
+- **[Frigate NVR Setup & Zero-FFmpeg Recording Shim](docs/frigate-setup.md)**
+- **[Bidirectional SIP Intercom & Doorbell Guide](docs/sip-intercom.md)**
+- **[Configuration & Security Reference](docs/configuration.md)**
+- **[Benchmarks & API Compatibility Test Suite](bench/README.md)**
 
 ---
 
 ## 🌟 Key Features
 
-- **⚡ Zero-Cost Asynchronous Architecture**: Built on Tokio with multi-producer, multi-consumer lock-free broadcast pipelines.
-- **📹 Native In-Process RTSP Client (Zero-FFmpeg Camera Ingestion)**:
-  - Connects directly to IP cameras and NVRs over TCP in pure Rust.
-  - Full support for standard RTSP handshakes (`OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, `TEARDOWN`, `GET_PARAMETER` keepalive).
-  - Handles Digest and Basic authentication natively with zero external dependencies.
-  - Ingests and depacketizes interleaved binary RTP frames directly into stream tracks in-process, completely eliminating the need for `ffmpeg -c copy` ingestion subprocesses.
-- **🔊 Pure-Rust In-Process Audio Transcoder (Zero-FFmpeg WebRTC Audio)**:
-  - **In-process decoding**: Native decoding of AAC-hbr (RFC 3640 via `symphonia`) and G.711 $\mu$-law/A-law without spawning FFmpeg child subprocesses.
-  - **In-process Opus encoding**: High-fidelity 48kHz stereo encoding via `opus-pure`.
-  - **Deduplicated shared broadcast tracks**: Multiple concurrent WebRTC viewers share a single background transcoder worker per stream, slashing CPU and memory.
-  - **Camera-clock A/V lip-sync**: Outgoing Opus RTP timestamps synchronize directly with the camera's reference clock, eliminating browser NetEq jitter-buffer stalls and `media_unavailable` timeouts in Chromium, Safari, and Firefox.
-- **🎞️ Pure-Rust Fragmented MP4 (fMP4) Muxer for MSE**:
-  - Native ISO BMFF engine generates `ftyp` + `moov` init headers and `moof` + `mdat` video fragments in-process.
-  - Fully supports `video-rtc.js` dual-mode negotiation (MSE instant preview + WebRTC swap) used by **Advanced Camera Card**.
-- **💾 In-Process MP4 Segment Recorder for Frigate Cache (Zero-FFmpeg Recording)**:
-  - Generates standalone progressive ISO BMFF `.mp4` segment files directly in `/tmp/cache/` in pure Rust.
-  - Automatically cuts segments on IDR keyframes matching Frigate's naming convention (`<stream>@%Y%m%d%H%M%S%z.mp4`) with atomic temporary file renaming.
-  - Native multiplexing for both **H.264** (`avc1`) and **H.265 / HEVC** (`hvc1`), with AAC audio track multiplexing (`mp4a` + `esds`).
-  - Built-in transparent `ffmpeg-shim` stands in for Frigate's recording subprocesses, slashing recording subprocess RSS from ~25–38 MB down to **~1.5–2.0 MB per camera (-93% memory savings)** with 0% CPU overhead. Frigate's `RecordingMaintainer` indexes and archives segments seamlessly to disk/NFS.
-- **🌐 Real-Time WebRTC Streaming (`rustrtc`)**:
-  - **Lightweight Pure-Rust Engine**: Powered by the pure-Rust **`rustrtc`** engine, keeping process RSS down to **~20–50 MB** across 7 active camera streams.
-  - **🎙️ Full-Duplex WebRTC Two-Way Audio (Talkback)**: Built-in pure-Rust **`OpusToG711Decoder`** (plus zero-transcode G.711 PCMA/PCMU handling) captures incoming microphone audio from browsers, Frigate WebUI, and Home Assistant cards (`a=sendrecv`) and relays it into the camera's RTSP backchannel speaker in real time.
-  - **Low-Latency Browser Playback**: Standard WHEP (`/api/webrtc`) and native **`go2rtc` WebSocket Signaling (`/api/ws?src=<stream>`)** supporting `webrtc/offer`, `webrtc/answer`, and trickle ICE for **`advanced-camera-card`**, **Frigate**, and Home Assistant.
-  - **Codec Support**: Automatic negotiation supporting **H.264** (Baseline, Constrained Baseline, High Profile up to Level 5.1) and **H.265 / HEVC** (in supported browsers like Safari and Chrome).
-  - **Audio Passthrough & On-Demand Transcoding**: Zero-copy native passthrough for `PCMA` (G.711a), `PCMU` (G.711u), and `Opus`, with automatic in-process AAC → Opus transcoding only for AAC camera streams.
-  - In-band parameter sets (SPS / PPS / VPS) caching and IDR keyframe gating for instant decode.
-- **🔄 go2rtc-Compatible REST API**:
-  - `GET /api/streams` returning standard go2rtc `{ "stream": { "producers": [...], "consumers": [...] } }` schema.
-  - Dynamic stream management via `PUT / POST / DELETE /api/streams` for Home Assistant and Frigate automated provisioning.
-- **📹 RTSP Gateway**:
-  - Built-in RTSP server on port `:8554` supporting TCP interleaved media transport.
-  - Native RTSP relay from IP cameras, NVRs, and video encoders.
-- **🎞️ External FFmpeg Integration (When needed)**:
-  - Remuxes and transcodes on-demand without overhead when idle.
-  - Custom pipeline syntax compatible with go2rtc (e.g. `ffmpeg:stream#video=mjpeg#raw=-r 15 -q:v 3`).
-- **🎞️ On-Demand HTTP Motion JPEG (MJPEG)**:
-  - Standard `multipart/x-mixed-replace` live streaming via `/api/stream.mjpeg?src=<stream>` (and `/api/frame.mjpeg` / `/stream.mjpeg`) for HTML `<img>` elements, legacy browsers, and Home Assistant generic MJPEG cameras.
-  - **Shared Broadcaster Deduplication**: Concurrent viewers watching the same stream share a single transcode worker, saving massive CPU and RAM compared to spawning per-client transcoders.
-  - **Zero Idle Overhead**: Automatically starts on-demand when clients connect and terminates when all viewers disconnect.
-  - **Dynamic Scaling & Pacing**: Supports runtime overrides via query parameters (`fps`, `width`, `height`, `quality`) and honors custom `ffmpeg:...#video=mjpeg` pipelines.
-- **📸 High-Speed Snapshots**:
-  - Instant JPEG frame capture via `/api/frame.jpeg?src=<stream>` for both H.264 and H.265 (HEVC) streams.
-  - Optimized pipeline with low-delay decoding and track readiness polling.
-- **📞 Bidirectional SIP Bridge & Intercom Gateway**:
-  - **Bridge RTSP Cameras to SIP**: Exposes ordinary RTSP Wi-Fi / IP cameras as interactive SIP intercom extensions that can be dialed, viewed, and spoken to from VoIP phones or smart screens.
-  - **Hardware Intercom Support**: Seamlessly stream live video and two-way audio to [**ESPHome Intercom**](https://github.com/n-IA-hane/esphome-intercom/), Grandstream, Akuvox, and low-power ESP32 panels.
-  - Asynchronous SIP protocol engine supporting standard Digest MD5 authentication, auto-registration, Keep-Alive `OPTIONS` pings, and graceful unregistration (`REGISTER Expires: 0`) on shutdown.
-  - Inbound call handling with symmetric RTP and Call-ID response routing.
-  - Auto-configuration of Home Assistant SIP integration via REST API with dynamic account provisioning.
-- **🔊 Two-Way Audio (Backchannel)**:
-  - Full-duplex backchannel for Reolink and ONVIF-compatible smart doorbells and intercom cameras (`backchannel=1`).
-  - High-fidelity PCM / G.711a (PCMA) / G.711u (PCMU) transcoding and repacking into standard 20ms audio frames (160 samples @ 8kHz).
-- **📺 Video over SIP (H.264 & RFC 2435 JPEG RTP)**:
-  - **H.264 Video Relay**: SSRC normalization, dynamic payload type rewriting, and SPS/PPS parameter set injection for SIP video phones.
-  - **RFC 2435 JPEG RTP Streaming**: Hardware-friendly MJPEG RTP streaming for low-power smart panels and intercom screens (e.g. Waveshare ESP32-P4 Touch panels running [**ESPHome Intercom**](https://github.com/n-IA-hane/esphome-intercom/), Grandstream, Akuvox).
-  - Real-time 15 fps frame pacing and backlog-dropping pipeline to ensure zero lag and prevent socket buffer bloat.
-- **🖥️ Built-in Web Dashboard**:
-  - Web UI on port `:1984` featuring auto-refreshing snapshot tiles, stream statistics (packets, bytes, active consumers), and instant WebRTC live preview.
+### Zero-FFmpeg for the Common Path
+For the primary 24/7 NVR and live-viewing workflows, `rust2rtc` operates **100% in-process in pure Rust without spawning FFmpeg**:
+- **📹 Native In-Process RTSP Client**: Connects directly to IP cameras over TCP (`OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, `TEARDOWN`, `GET_PARAMETER`), handles Digest/Basic authentication natively, and depacketizes interleaved RTP frames directly in-process (no `ffmpeg -c copy` ingestion subprocesses).
+- **🔊 Pure-Rust In-Process Audio Transcoding**: Decodes camera AAC-hbr (via `symphonia`) and G.711 PCMA/PCMU in-process and encodes 48 kHz stereo Opus (via `opus-pure`) on a single shared broadcast track per camera, synchronized to the camera's RTP clock.
+- **🌐 Pure-Rust WebRTC Streaming (`rustrtc`)**: Supports WHEP (`POST /api/webrtc`) and `go2rtc` WebSocket signaling (`/api/ws?src=<stream>`) with H.264, H.265/HEVC, zero-copy PCMA/PCMU/Opus passthrough, and **full-duplex two-way microphone talkback** (`OpusToG711Decoder` → RTSP/ONVIF/Tapo backchannel).
+- **🎞️ Pure-Rust Fragmented MP4 (fMP4 / MSE)**: Native ISO BMFF muxer generates `ftyp`+`moov` init segments and `moof`+`mdat` fragments in-process for instant preview in `video-rtc.js` and Advanced Camera Card.
+- **💾 Pure-Rust MP4 Segment Recorder for Frigate Cache**: Cuts standalone progressive `.mp4` segments (`avc1` H.264, `hvc1` H.265, `mp4a` AAC) on IDR keyframes directly into `/tmp/cache/`. Includes a lightweight `ffmpeg-shim` (`~1.5–1.9 MB` RSS) so unpatched Frigate can record without spawning `~25–38 MB` FFmpeg recording processes per camera.
+
+### When External FFmpeg Is Used (On-Demand Only)
+`ffmpeg` is **not required to compile** `rust2rtc` and is **never spawned at idle or during normal RTSP/WebRTC/MSE/recording playback**. An external `ffmpeg` binary in `PATH` is only invoked on-demand for:
+- **JPEG Snapshots** (`/api/frame.jpeg`) — single-frame keyframe extraction (`-vframes 1`).
+- **HTTP Motion JPEG** (`/api/stream.mjpeg`) & **SIP RFC 2435 JPEG RTP** — when transcoding H.264/H.265 video to MJPEG for legacy browsers or ESP32 smart panels (deduplicated across viewers).
+- **Custom `ffmpeg:` Sources & Hardware Transcoding** — explicit `ffmpeg:...` stream definitions or Frigate non-recording detection/hardware-decode jobs (`rkmpp`, `vaapi`, `cuda`) passed through the shim.
+
+### Bidirectional SIP Bridge & Intercom Gateway
+- **Dialable Camera Extensions**: Auto-registers camera streams as SIP extensions with Digest MD5 authentication (`qop=auth`), symmetric RTP, and automatic Home Assistant `voip_stack` provisioning.
+- **Parallel Forking Ring Groups**: Subscribes to Home Assistant doorbell button events over WebSocket and rings multiple SIP screens simultaneously (first to answer wins; remaining legs receive `CANCEL`).
+- **Video & Two-Way Audio over SIP**: Streams H.264 (RFC 6184) or hardware-friendly MJPEG (RFC 2435 PT 26 at 15 fps) alongside bidirectional G.711a/u or 16 kHz L16 audio.
 
 ---
 
-## ⚡ Resource Efficiency (RAM & CPU Savings)
+## ⚡ Resource Efficiency & Reproducible Benchmarks
 
-Rewriting in Rust eliminates garbage collection runtime overhead, goroutine stack allocations, and child subprocess spawning.
+All figures below were measured on an **Orange Pi 5 Plus (Rockchip RK3588, `aarch64-unknown-linux-musl`)** and **Apple Silicon M-series (`aarch64-apple-darwin`)** with 7 cameras (14 RTSP streams: 7 main + 7 sub).
 
-| Metric | `go2rtc` (Go Runtime) | `rust2rtc` (Native Rust) | Improvement |
-| :--- | :---: | :---: | :---: |
-| **Idle Memory (RSS)** | ~40 MB – 80 MB | **~4.5 MB** | **~85% – 90% less RAM** |
-| **Frigate Segment Recording** | External FFmpeg per camera (~25–38 MB each) | **In-Process MP4 Builder + 1.5 MB Shim** | **-93% RAM (~187 MB saved across 7 cameras)** |
-| **Idle CPU Usage** | ~0.5% – 2.0% (GC / scheduler) | **0.0%** | **Near-zero idle CPU** |
-| **Garbage Collection Pauses** | Periodic GC cycles | **None (Zero GC)** | Deterministic latency |
-| **WebRTC Audio Transcoding** | Spawns FFmpeg subprocess + UDP sockets | **Zero subprocesses (Pure Rust in-process)** | **0 extra OS processes / ports** |
-| **Transcoder Deduplication** | Independent transcode per viewer | **Shared broadcast Opus track** | **$N \times$ CPU savings across viewers** |
-| **Memory Management** | Go GC heap & runtime allocator | Manual / RAII stack + zero-copy `Bytes` | Flat, non-fragmenting footprint |
-| **On-Demand Processing** | Persistent or background remux | Workers spawned strictly on-demand | 0 MB / 0% CPU for idle streams |
+See **[`bench/README.md`](bench/README.md)** for full methodology and run `./bench/measure_rss.sh` or `./bench/compat_test.sh` to reproduce on your own system.
 
-*Measured on macOS (Darwin arm64) and Linux (aarch64) with 14 active camera configurations loaded in `rust2rtc.yaml`.*
+| Workload Profile | `go2rtc` (v1.9.14) | `rust2rtc` (v0.5.0) | Notes |
+| :--- | :---: | :---: | :--- |
+| **1. Cold / Idle RSS** (0 active streams) | ~15 – 25 MB | **~4.5 MB** | Gateway process RSS at startup with 14 configured streams before any client connects. |
+| **2. Active Gateway RSS** (7 cameras ingested) | ~35 – 65 MB *(+ external FFmpeg if transcoding audio)* | **~13.6 MB** *(Linux ARM64 `musl`)*<br>**~20 – 35 MB** *(with active WebRTC Opus transcode)* | In v0.5.0, replacing `webrtc-rs` (57.7 MB) with pure-Rust `rustrtc` reduced 7-camera active RSS on Linux ARM64 to **13.6 MB**. |
+| **3. Frigate 7-Camera Segment Recording** | ~180 – 250 MB *(7 × ~25–38 MB `ffmpeg -f segment` procs)* | **~13.2 MB total** *(7 × ~1.8 MB `ffmpeg-shim` procs)* | Muxing runs in-process inside `rust2rtc`; saves **~170–200 MB RAM (~93% reduction)** across 7 recorded cameras. |
+| **WebRTC Audio Transcoding** | Spawns `ffmpeg` child process per stream | **0 subprocesses** (in-process `symphonia` + `opus-pure`) | Shared broadcast Opus track across all concurrent viewers. |
 
 ---
 
-## 🧪 Tested Environment & Implemented Features
+## 🔍 What's Tested vs. What's Rough
 
-The following features have been implemented and verified in live testing:
+Because camera gateways run 24/7, here is an upfront summary of what has been tested on real hardware versus what is still experimental or unimplemented:
 
-| Feature | Protocol / Codec | Server Environment | Client / Browser | Test Result & Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **H.264 WebRTC Live** | H.264 (Baseline, High Profile) | macOS / Linux (ARM64/x86_64) | Chrome / Safari / Edge | ✅ **Verified** – Low latency, instant playout clock & rendering |
-| **H.265 WebRTC Live** | H.265 (HEVC) | macOS / Linux (ARM64/x86_64) | Safari / HEVC-enabled Chrome | ✅ **Verified** – Negotiated via WebRTC when browser supports HEVC |
-| **Pure-Rust Opus Transcoding** | AAC / G.711a / G.711u -> Opus | macOS / Linux (ARM64/x86_64) | Chrome / Safari / Firefox | ✅ **Verified** – 100% in-process transcoding with camera-clock A/V sync |
-| **Pure-Rust MSE / fMP4** | ISO BMFF fMP4 (`video/mp4`) | macOS / Linux (ARM64/x86_64) | `video-rtc.js` / ACC | ✅ **Verified** – Instant fMP4 preview fallback before WebRTC swap |
-| **H.264 Snapshots** | H.264 (`/api/frame.jpeg`) | macOS / Linux (ARM64/x86_64) | HTTP Client / Browser | ✅ **Verified** – Low-delay instant capture (`-flags low_delay`) |
-| **H.265 Snapshots** | H.265 (`/api/frame.jpeg`) | macOS / Linux (ARM64/x86_64) | HTTP Client / Browser | ✅ **Verified** – Keyframe extraction without grey artifacts (`-skip_frame nokey`) |
-| **RTSP TCP Relay** | RTSP Interleaved TCP (`:8554`) | macOS / Linux (ARM64/x86_64) | FFmpeg / RTSP Clients | ✅ **Verified** – Interleaved channel demuxing & broadcast |
-| **Multi-Source (`multitrans`)**| `multitrans://` & fallback lists | macOS / Linux (ARM64/x86_64) | Internal Engine | ✅ **Verified** – Source fallback and candidate selection |
-| **SIP Audio & Backchannel** | SIP / G.711a / G.711u | macOS / Linux (ARM64/x86_64) | Home Assistant / FreePBX | ✅ **Verified** – Symmetric RTP, 20ms audio repacking & Reolink backchannel |
-| **SIP Video (H.264)** | SIP / RFC 6184 H.264 RTP | macOS / Linux (ARM64/x86_64) | SIP Video Phone / Softphone | ✅ **Verified** – Live video forwarder with dynamic PT & SSRC normalization |
-| **SIP Video (RFC 2435 JPEG)**| SIP / RFC 2435 JPEG RTP | macOS / Linux (ARM64/x86_64) | Waveshare ESP32-P4 Touch Panel | ✅ **Verified** – Hardware-decoded MJPEG with 15fps pacing & backlog drop |
-| **SIP Registration & Exit** | SIP Digest MD5 | macOS / Linux (ARM64/x86_64) | Asterisk / FreePBX | ✅ **Verified** – Auto-registration, keep-alive OPTIONS, graceful unregister |
-| **Web Dashboard** | HTTP / HTML5 / JS (`:1984`) | macOS / Linux (ARM64/x86_64) | Chrome / Safari / Firefox | ✅ **Verified** – Live stream cards, bitrates, snapshot previews |
+### ✅ Tested 24/7 on Real Hardware
+- **Host Platforms**: Rockchip RK3588 (Orange Pi 5 Plus, Debian/Armbian ARM64 in Docker with Frigate) and Apple Silicon macOS (M1–M4).
+- **Cameras**:
+  - **Reolink Video Doorbell (PoE & WiFi)**: 5MP H.264 High Profile Level 5.1, in-process AAC → Opus audio, ONVIF two-way backchannel talkback over WebRTC and SIP.
+  - **TP-Link Tapo (C110, C200, C210, C310)**: RTSP TCP ingest, Digest auth, and Tapo HTTP `streamd` (`:8800`) two-way audio talkback.
+  - **TP-Link AIPC / Chinese Regional PTZ**: Dual-lens H.264/H.265 RTSP TCP ingest, `multitrans://` backchannel, interleaved `$` stream resynchronization.
+  - **Yi / Kami (`yi-hack-allwinner-v2` / `v4` / `v5`)**: RTSP TCP ingest and `rRTSPServer` backchannel.
+- **Intercom Panels**: Waveshare ESP32-P4 Touch & Guition ESP32-P4 running [ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/) (RFC 2435 JPEG RTP video + L16/G.711 audio), FreePBX/Asterisk, and Home Assistant VoIP.
+
+### ⚠️ Known Limitations & Rough Edges
+- **TCP-Only RTSP Transport**: Both the RTSP client and RTSP server (`:8554`) currently implement TCP interleaved transport only (`RTP/AVP/TCP`). UDP unicast/multicast RTSP requests return `461 Unsupported Transport` so clients automatically fall back to TCP.
+- **No Built-in TLS / HTTPS**: Like `go2rtc`, `rust2rtc` expects to run on a trusted LAN or behind a reverse proxy (Caddy, Nginx, Traefik) for TLS termination.
+- **Authentication Defaults**: By default, the HTTP API (`:1984`) and RTSP server (`:8554`) run unauthenticated for zero-config Frigate/Home Assistant drop-in compatibility. Optional HTTP Basic Auth (`api.username` / `api.password`) is supported and recommended if port `:1984` is exposed outside a container network.
+- **Subset of `go2rtc` Sources**: `rust2rtc` focuses on RTSP, ONVIF, Tapo, `ffmpeg:`, `exec:`, MSE/fMP4, WebRTC, and SIP. It does not yet implement HomeKit, RTMP, WebTorrent, or USB V4L2 device capture.
 
 ---
 
-## 📋 General Status & Roadmap
+## 📋 Feature & Roadmap Matrix
 
 | Feature | `go2rtc` | `rust2rtc` | Status |
 | :--- | :---: | :---: | :---: |
-| **RTSP Server & Client (TCP)** | ✅ | ✅ | Working |
-| **WebRTC Gateway (WHEP)** | ✅ | ✅ | Working (H.264 & H.265) |
-| **go2rtc WS Signaling (`/api/ws`)** | ✅ | ✅ | Working (`advanced-camera-card` / Frigate) |
-| **go2rtc Streams API (`/api/streams`)** | ✅ | ✅ | Working (GET/PUT/POST/DELETE) |
-| **Pure-Rust In-Process Opus Transcoding**| ❌ (FFmpeg) | ✅ (Native) | Working (AAC/G.711 -> Opus, zero-FFmpeg) |
-| **MSE / fMP4 Streaming** | ✅ | ✅ | Working (Pure-Rust ISO BMFF muxer) |
-| **External FFmpeg Remux / Transcode** | ✅ | ✅ | Working (On-demand fallback) |
-| **JPEG Snapshots API** | ✅ | ✅ | Working (H.264 & H.265) |
-| **SIP Gateway & Intercom** | ⚠️ | ✅ | Working (Audio, H.264 & RFC 2435 JPEG) |
-| **Two-Way Audio (Backchannel)** | ✅ | ✅ | Working (Reolink & SIP G.711) |
-| **Web UI Dashboard** | ✅ | ✅ | Working |
-| **RTSP UDP / Multicast** | ✅ | 🚧 | Planned |
-| **HomeKit Integration** | ✅ | ⏳ | Planned |
-| **Native ONVIF Discovery** | ✅ | ⏳ | Planned |
+| **RTSP Server & Client (TCP Interleaved)** | ✅ | ✅ | Working |
+| **WebRTC Gateway (WHEP & `/api/ws`)** | ✅ | ✅ | Working (`rustrtc`, H.264 & H.265) |
+| **go2rtc Streams API (`/api/streams`)** | ✅ | ✅ | Working (GET/PUT/POST/DELETE, contract-tested) |
+| **Pure-Rust In-Process Opus Transcoding** | ❌ (FFmpeg) | ✅ (Native) | Working (AAC/G.711 ↔ Opus, zero-FFmpeg) |
+| **Pure-Rust MSE / fMP4 Streaming** | ✅ | ✅ | Working (In-process ISO BMFF muxer) |
+| **In-Process Frigate MP4 Segment Recorder** | ❌ | ✅ | Working (`ffmpeg-shim` + `/tmp/cache` muxer) |
+| **JPEG Snapshots & HTTP MJPEG** | ✅ | ✅ | Working (Uses on-demand `ffmpeg`) |
+| **SIP Gateway & Intercom (H.264 & RFC 2435 JPEG)**| ⚠️ | ✅ | Working (Parallel ring groups, Digest auth) |
+| **Two-Way Audio (Backchannel)** | ✅ | ✅ | Working (ONVIF, Reolink, Tapo, `multitrans://`) |
+| **Optional HTTP Basic Auth (`:1984`)** | ✅ | ✅ | Working (`api.username` / `api.password`) |
+| **RTSP UDP / Multicast Transport** | ✅ | 🚧 | Planned (`good first issue`) |
+| **Native ONVIF WS-Discovery** | ✅ | ⏳ | Planned (`good first issue`) |
+| **HomeKit Camera Integration** | ✅ | ⏳ | Planned |
 
 ---
 
-## 📥 Downloads & Pre-Compiled Binaries
-
-Pre-compiled, standalone, statically linked binaries are provided for all 3 supported production platforms on the [**GitHub Releases**](https://github.com/kiddyfurby/rust2rtc/releases/latest) page:
-
-| Platform / Architecture | Recommended Hardware | Standalone Binary | Archive |
-| :--- | :--- | :---: | :---: |
-| **Linux ARM64** (`aarch64`) | Rockchip RK3588 (Orange Pi 5 Plus), Raspberry Pi 4 / 5, Home Assistant OS | [**`rust2rtc_linux_arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_arm64) | — |
-| **Linux x86_64** (`amd64`) | Intel & AMD 64-bit servers, mini PCs, Frigate Docker containers | [**`rust2rtc_linux_amd64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_amd64) | — |
-| **macOS Apple Silicon** (`arm64`) | Apple M1 / M2 / M3 / M4 MacBook, Mac mini, Mac Studio (macOS 12+) | [**`rust2rtc_mac_arm64`**](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_mac_arm64) | [`.zip`](https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_mac_arm64.zip) |
-
-> [!TIP]
-> **Zero Dependencies**: Linux binaries are fully statically linked against `musl` (`*-unknown-linux-musl`), requiring zero system dependencies or shared C libraries.
-
-### Quick One-Liner Download
-
-#### Linux ARM64 (RK3588 / Orange Pi 5 Plus / Raspberry Pi)
-```bash
-curl -L -o rust2rtc https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_arm64
-chmod +x rust2rtc
-./rust2rtc
-```
-
-#### Linux x86_64 (Intel / AMD Server)
-```bash
-curl -L -o rust2rtc https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_linux_amd64
-chmod +x rust2rtc
-./rust2rtc
-```
-
-#### macOS Apple Silicon (MacBook / Mac mini)
-```bash
-curl -L -o rust2rtc https://github.com/kiddyfurby/rust2rtc/releases/latest/download/rust2rtc_mac_arm64
-chmod +x rust2rtc
-./rust2rtc
-```
-
----
-
-## 🚀 Building from Source
+## 🚀 Building & Running
 
 ### Prerequisites
+- **Rust** (stable toolchain 1.85+ supporting Edition 2024)
+- **FFmpeg** *(Optional at runtime; not needed to compile)* — only required if you use `/api/frame.jpeg` snapshots, `/api/stream.mjpeg`, RFC 2435 SIP JPEG transcoding, or custom `ffmpeg:` sources.
 
-- **Rust** (stable toolchain 1.80+ or nightly)
-- **FFmpeg** installed and accessible in your system `PATH`
-
-### Installation & Build
+### Build from Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/kiddyfurby/rust2rtc.git
 cd rust2rtc
 
-# Build macOS release binary
-just mac          # or: cargo build --release
+# Build native release binary
+cargo build --release   # or: just mac
 
-# Cross-compile for Linux (statically-linked musl ELF binaries):
-just linux-amd64  # for x86_64 Linux servers / NVRs
-just linux-arm64  # for Raspberry Pi / ARM64 Home Assistant OS
+# Run unit, parser fuzz/robustness, and API contract tests
+cargo test
 
-# Build and package all targets into ./dist/:
-just dist
+# Cross-compile statically linked musl binaries for Linux (requires cargo-zigbuild):
+just linux-amd64        # x86_64-unknown-linux-musl
+just linux-arm64        # aarch64-unknown-linux-musl
 ```
+
+> [!TIP]
+> **Pre-Compiled Binaries**: Automated CI builds for `rust2rtc_linux_arm64`, `rust2rtc_linux_amd64`, and `rust2rtc_mac_arm64` are configured in [`.github/workflows/release.yml`](.github/workflows/release.yml) and published to the [**GitHub Releases**](https://github.com/kiddyfurby/rust2rtc/releases) page when version tags (`v*`) are pushed. If no release binary is published for your target yet, build from source with `cargo build --release`.
 
 ---
 
-## ⚙️ Configuration
+## ⚙️ Quick Start & Configuration
 
-`rust2rtc` reads configuration from `rust2rtc.yaml` in the current working directory. A fully documented reference template is included in the project root at [`rust2rtc.sample.yaml`](rust2rtc.sample.yaml).
-
-### Configuration Sections Walkthrough
-
-A minimal or full configuration can include any of the following sections:
-
-```yaml
-# 1. Camera Streams & Ingestion (Optional / Handled by Frigate)
-# NOTE: When running alongside Frigate NVR, Frigate automatically generates all camera
-# stream definitions from its config.yml. You can completely omit this section.
-# For standalone deployments, define your camera RTSP feeds below:
-# streams:
-#   doorbell:
-#     - "rtsp://admin:password@192.168.1.50:554/h264Preview_01_main#backchannel=1"
-#     - "ffmpeg:doorbell#audio=opus"
-
-# 2. WebRTC ICE & STUN
-webrtc:
-  candidates:
-    - "192.168.1.4:8555"
-    - "stun:stun.l.google.com:19302"
-
-# 3. Ports & Network Services
-api:
-  listen: ":1984" # Web dashboard, REST API & WebSocket signaling
-
-rtsp:
-  listen: ":8554" # Embedded RTSP server for Frigate, Home Assistant, VLC
-
-# 4. FFmpeg & Hardware Acceleration
-ffmpeg:
-  bin: "ffmpeg"
-  # Hardware profile: "rkmpp" (Rockchip RK3588), "vaapi" (Intel/AMD), "cuda" (Nvidia)
-  hardware: "rkmpp"
-
-# 5. In-Process MP4 Recording for Frigate (Optional)
-# NOTE: In-process progressive MP4 segment recording is ENABLED BY DEFAULT for
-# ALL streams when using the FFmpeg shim. You do NOT need to include this section
-# unless you want to customize the cache directory or restrict recording:
-# record:
-#   enabled: true             # Default: true (set to false to disable)
-#   dir: "/tmp/cache"         # Default: /tmp/cache (Frigate cache)
-#   segment_duration: 10      # Default: 10 seconds per segment
-#   # streams:                # Optional whitelist. If omitted, ALL streams are recorded!
-#   #   - doorbell
-
-# 6. Built-in SIP PBX / Intercom Server (Optional)
-sip:
-  server: "192.168.1.4:5060"
-  domain: "192.168.1.4"
-  ha_url: "http://192.168.1.4:8123"
-  ha_token: "YOUR_HA_LONG_LIVED_ACCESS_TOKEN"
-  auto_register_streams: true # Automatically assigns SIP extensions to camera streams
-  base_extension: 101
-  auto_password: "MySecretPassword123"
-  names:
-    doorbell: "Front Door"
-    driveway: "Driveway"
-
-# 7. Automated Doorbell Calling (Optional)
-doorbells:
-  doorbell:
-    entity: "binary_sensor.front_doorbell_visitor" # Home Assistant binary sensor
-    sip_targets:
-      - "192.168.1.100:5060" # Living Room ESPHome Intercom
-      - "192.168.1.101:5060" # Dining Room ESPHome Intercom
-    cooldown_seconds: 15
-```
-
-See [`rust2rtc.sample.yaml`](rust2rtc.sample.yaml) for full configuration comments and options.
-
----
-
-## 🖥️ Usage
-
-Run `rust2rtc`:
-
-```bash
-./target/release/rust2rtc
-```
-
-- **Web Dashboard**: Open [http://localhost:1984](http://localhost:1984) in your browser.
-- **WebSocket Signaling**: `ws://localhost:1984/api/ws?src=<stream_name>` (WebRTC offer/answer/candidate)
-- **Snapshot API**: `GET http://localhost:1984/api/frame.jpeg?src=<stream_name>`
-- **WebRTC WHEP**: `POST http://localhost:1984/api/webrtc?src=<stream_name>` (Body: Offer SDP, returns Answer SDP)
-- **Streams API**: `GET / PUT / DELETE http://localhost:1984/api/streams`
-- **RTSP Relay**: `rtsp://localhost:8554/<stream_name>`
-
-### 🏠 Drop-in `go2rtc` Replacement & Integrations
-
-`rust2rtc` is built to be a direct, drop-in replacement for `go2rtc` across the smart home and NVR ecosystem.
-
-#### 1. Frigate NVR
-Frigate natively supports custom `go2rtc` binaries mounted in the container. Simply compile or copy `rust2rtc` into your Frigate config directory:
-
-```bash
-# Copy rust2rtc binary into Frigate's mounted config directory:
-cp dist/rust2rtc-linux-arm64 /path/to/frigate/config/go2rtc
-chmod +x /path/to/frigate/config/go2rtc
-
-# Restart Frigate container
-docker restart frigate
-```
-
-Frigate's s6-overlay runner detects `/config/go2rtc` and automatically runs it with multi-config loading (`-config=/config/go2rtc_homekit.yml -config=/dev/shm/go2rtc.yaml`), seamlessly handled by `rust2rtc`.
-
-##### 💾 Zero-FFmpeg Recording Setup (93% RAM Reduction per Camera)
-Frigate by default spawns an external FFmpeg instance for every camera assigned a `record` role, consuming ~25–38 MB RSS each. With `rust2rtc`, progressive MP4 segment recording runs directly in-process with zero extra processes.
-
-To enable in-process recording for **all cameras** with **100% stock, unpatched Frigate**:
-1. Create an FFmpeg shim directory inside `/config`:
+1. Copy the sample configuration and edit it with your camera URLs (note: `rust2rtc.yaml` is gitignored so your credentials are never committed):
    ```bash
-   mkdir -p /path/to/frigate/config/ffmpeg/bin
-   ln -sf ../../go2rtc /path/to/frigate/config/ffmpeg/bin/ffmpeg
-   ln -sf /usr/lib/ffmpeg/6.0/bin/ffprobe /path/to/frigate/config/ffmpeg/bin/ffprobe
+   cp rust2rtc.sample.yaml rust2rtc.yaml
    ```
-2. In Frigate's `config.yml`, set the custom ffmpeg path:
-   ```yaml
-   ffmpeg:
-     path: /config/ffmpeg
+2. Start `rust2rtc`:
+   ```bash
+   ./target/release/rust2rtc
    ```
-3. Restart Frigate.
+3. Open the Web Dashboard at **[http://localhost:1984](http://localhost:1984)**.
 
-**How it works:**
-- When Frigate spawns a recording process (`-f segment ...`), the shim intercepts the call, asks `rust2rtc` to record in-process, and sits dormant at **~1.5 MB RSS and 0.0% CPU**.
-- When Frigate terminates or rotates the recording, the shim sends a stop signal to `rust2rtc` and exits cleanly.
-- For all non-recording operations (e.g. object detection, hardware RKMPP/VAAPI decoding, `ffprobe`), the shim immediately and transparently calls real FFmpeg.
-- **No `record:` block is required in `rust2rtc.yaml`**—all cameras defined in `rust2rtc` are recorded automatically!
+### Key Endpoints
+- **Web Dashboard**: `http://localhost:1984/`
+- **WebSocket Signaling**: `ws://localhost:1984/api/ws?src=<stream>`
+- **WebRTC WHEP**: `POST http://localhost:1984/api/webrtc?src=<stream>`
+- **Snapshot API**: `GET http://localhost:1984/api/frame.jpeg?src=<stream>`
+- **MJPEG Stream**: `GET http://localhost:1984/api/stream.mjpeg?src=<stream>`
+- **Streams REST API**: `GET / PUT / POST / DELETE http://localhost:1984/api/streams`
+- **RTSP TCP Relay**: `rtsp://localhost:8554/<stream>`
 
-#### 2. Advanced Camera Card ([advanced-camera-card](https://card.camera/))
-`rust2rtc` is 100% compatible with AlexxIT's `video-rtc.js` dual-mode negotiation used by Advanced Camera Card:
-- **Instant fMP4 preview**: Plays immediately via pure-Rust MSE muxer while WebRTC negotiates.
-- **WebRTC handoff**: Instantly swaps to WebRTC without stalls or jitter buffer timeouts thanks to camera-clock RTP audio synchronization.
-- **Two-way audio**: Full talkback support for Reolink and ONVIF smart doorbells.
-
-```yaml
-type: custom:advanced-camera-card
-cameras:
-  - camera_entity: camera.doorbell
-    live_provider: go2rtc
-    go2rtc:
-      url: http://192.168.1.4:1984   # Your rust2rtc IP and port
-      stream: doorbell               # Stream name in rust2rtc.yaml
-```
-
-#### 3. Home Assistant & Dashboard Cards
-Works out-of-the-box with:
-- Standard Home Assistant WebRTC Cards (`type: custom:webrtc-card`)
-- Native snapshot capture (`GET /api/frame.jpeg?src=<stream>`)
-- WebRTC WHEP endpoint (`POST /api/webrtc?src=<stream>`)
-- Dynamic stream provisioning (`POST / PUT / DELETE /api/streams`)
-
-#### 4. Bidirectional SIP Intercom Bridge ([ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/))
-`rust2rtc` acts as a full-duplex SIP-to-RTSP media bridge, enabling any SIP endpoint, VoIP handset, softphone, or smart wall panel to interact directly with standard RTSP Wi-Fi / IP cameras:
-- **See & Talk with Wi-Fi Cameras**: Exposes RTSP camera feeds (such as Reolink, Tapo, TP-Link, Yi) as dialable SIP extensions (e.g., ext `101`, `102`). Calling a camera extension instantly starts real-time video streaming and bidirectional talkback.
-- **Hardware Intercom Support ([ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/))**: Fully tested with ESP32-based intercom screens and wall panels (e.g. Waveshare ESP32-P4 Touch, ESP32-S3). Displays low-latency RFC 2435 JPEG RTP or H.264 video while providing synchronized two-way audio.
-- **Automated PBX Registration**: Configure the `sip:` section with your SIP PBX (FreePBX, Asterisk, or Home Assistant VoIP Integration) with `auto_register_streams: true` to automatically assign and register extensions for all streams with zero manual SIP config.
-
-```yaml
-sip:
-  server: "192.168.1.5:5060"     # IP of your SIP PBX or Home Assistant VoIP
-  auto_register_streams: true    # Automatically registers extensions 101, 102...
-  base_extension: 101
-  auto_password: "IntercomPassword123"
-```
+For Frigate NVR integration, `ffmpeg-shim` setup, SIP intercom configuration, and security settings, see:
+- **[`docs/frigate-setup.md`](docs/frigate-setup.md)**
+- **[`docs/sip-intercom.md`](docs/sip-intercom.md)**
+- **[`docs/configuration.md`](docs/configuration.md)**
 
 ---
 
-## 🧪 Tested Devices & Hardware Compatibility
+## 🤝 Contributing & Good First Issues
 
-`rust2rtc` is actively validated in real-world 24/7 smart home and surveillance deployments across a wide variety of host hardware, operating systems, and camera vendors:
-
-### 🖥️ Host Systems & Architectures
-| Hardware / Platform | Architecture | Operating System | Role & Notes |
-| :--- | :---: | :---: | :--- |
-| **Apple Silicon MacBook** | `aarch64` / `arm64` | macOS Sonoma / Sequoia | Primary development, unit testing, Safari WebRTC (HEVC/H.264) & MSE evaluation |
-| **Rockchip RK3588 (Orange Pi 5 Plus)** | `aarch64-unknown-linux-musl` | Debian / Armbian Linux | 24/7 production node running Frigate NVR, Home Assistant, and multi-camera RTSP/WebRTC ingest |
-| **x86_64 Server / PC** | `x86_64-unknown-linux-musl` | Linux / Docker | Containerized NVR workloads and CI automated verification |
-
-### 📹 Cameras, Doorbells & Encoders
-| Device / Model | Firmware / Platform | Protocols & Features Tested |
-| :--- | :--- | :--- |
-| **Reolink Video Doorbell** (PoE & WiFi) | Official v3.0.0+ | • 5MP H.264 High Profile Level 5.1 (`profile-level-id=640033`, 2560×1920 @ 20fps)<br>• Native pure-Rust in-process AAC-to-Opus audio transcoding<br>• Full-duplex two-way audio (backchannel) over WebRTC & SIP |
-| **TP-Link AIPC / Chinese PTZ**<br>(e.g. `TL-AIPC657-ZOOM-DUAL`) | Chinese Regional Firmware | • Dual-lens main & sub RTSP TCP streams<br>• In-process interleaved stream recovery & `OPTIONS` keepalive<br>• ONVIF port 2020 integration for Frigate detection |
-| **TP-Link Tapo Series**<br>(Tapo C200, C210, C310, C110) | Official Tapo Firmware | • Standard RTSP over TCP with Digest MD5 authentication<br>• Low-latency H.264 video with PCMA audio |
-| **Yi / Kami Cameras** | `yi-hack-allwinner-v2` / `yi-hack-v4/v5` | • Allwinner v2 platform RTSP stream ingestion<br>• In-process H.264 depacketization & sub-second JPEG snapshot capture |
-| **SIP Panels & Intercom Screens**<br>(Grandstream, Akuvox, ESP32-P4 Touch) | FreePBX / Asterisk / SIP2.0 | • Bi-directional SIP audio (PCMA/PCMU 20ms)<br>• Video over SIP via RFC 2435 JPEG RTP (15 fps paced) and H.264 |
+Contributions, bug reports, and pull requests are warmly welcomed! If you're looking for a self-contained place to start:
+- **🟢 Good First Issue — RTSP UDP Transport**: Add UDP unicast RTP/RTCP socket pairs in `src/rtsp/mod.rs` and `src/rtsp/client.rs` alongside the existing interleaved TCP handler.
+- **🟢 Good First Issue — Native ONVIF Discovery & `GetStreamUri`**: Implement WS-Discovery UDP multicast probe and SOAP `GetStreamUri` lookup so `onvif://` URLs with non-standard paths resolve automatically without custom path hints.
+- **🟢 Good First Issue — `cargo-fuzz` Targets**: Expand the malformed-input parser tests in `src/core/mod.rs`, `src/rtsp/mod.rs`, and `src/sip/message.rs` into standalone `cargo-fuzz` / `libfuzzer` targets.
+- **🟢 Good First Issue — Prometheus Metrics (`/api/metrics`)**: Expose stream packet/byte counters and active consumer counts in Prometheus text format.
 
 ---
 
-## 📝 Changelog & Release History
+## 📝 Changelog Summary
 
-### v0.5.0 (Current)
-- **🎙️ WebRTC Full-Duplex Two-Way Talkback**:
-  - Pure-Rust in-process `OpusToG711Decoder` automatically decodes incoming Opus audio from browser microphones / Home Assistant cards (`a=sendrecv`) down to 8kHz G.711 $\mu$-law/A-law.
-  - Relays audio directly into camera RTSP backchannel sessions in real time across both `webrtc-rs` and `rustrtc` engines.
-- **💾 In-Process MP4 Segment Recorder for Frigate Cache (Zero-FFmpeg Recording)**:
-  - Generates standalone progressive ISO BMFF `.mp4` segment files directly in `/tmp/cache/` in pure Rust.
-  - Automatically cuts segments on IDR keyframes matching Frigate's naming convention (`<stream>@%Y%m%d%H%M%S%z.mp4`) with atomic temporary file renaming.
-  - Native multiplexing for both H.264 (`avc1`) and H.265 / HEVC (`hvc1`), with AAC audio track multiplexing (`mp4a` + `esds`).
-  - Transparent `ffmpeg-shim` replaces Frigate's recording subprocesses, slashing subprocess RSS from ~200 MB down to **13.2 MB total** across 7 cameras (**-93.4% memory reduction**).
-- **⚡ Dual WebRTC Engine (`rustrtc` + `webrtc-rs`)**:
-  - Added runtime engine toggle via `webrtc.engine: "rustrtc"` in `rust2rtc.yaml`.
-  - Integrates lightweight, pure-Rust `rustrtc` crate with automatic sample packetization and PLI feedback loops.
-  - Slashes gateway process RSS from **57.7 MB down to 13.6 MB (-76.4% memory footprint)** on embedded Linux (ARM64 RK3588).
-- **Home Assistant WebSocket Event Subscriber**:
-  - Direct WebSocket client connection to Home Assistant (`ws://.../api/websocket`) with automatic authentication and connection health monitoring.
-  - Subscribes natively to doorbell visitor button events (e.g. `binary_sensor.reolink_video_doorbell_wifi_visitor`).
-  - Configurable debounce cooldown timer to prevent duplicated calls while ringing or active.
-- **Parallel Forking Conference Call & Ring Groups**:
-  - Implements RFC 3261 parallel forking to ring multiple SIP intercom screens simultaneously (e.g. [ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom/) devices).
-  - "First to answer wins" race resolution: the first screen to answer (`200 OK`) is connected to live camera video + bidirectional audio, and all other ringing legs are immediately cancelled with `CANCEL`.
-  - Full client transaction lifecycle support with automated non-2xx `ACK`ing, preventing server transaction lockups.
-- **L16 16kHz & ESPHome VoIP Stack Support**:
-  - Supports uncompressed linear PCM `L16/16000/1` audio alongside G.711 PCMA/PCMU.
-  - Real-time pure-Rust conversion between 16kHz L16 audio from ESPHome smart panels and 8kHz G.711 camera talkback channels.
-
-### v0.4.0
-- **RTSP Interleaved Stream Resynchronization**:
-  - Implemented automatic binary packet delimiter (`$`) scanner to recover instantly from corrupted or desynchronized interleaved TCP streams.
-  - Added full response body draining based on `Content-Length` to prevent parser lockups from RTSP responses that include trailing payload bytes.
-  - Replaced periodic keepalive with universal bodyless `OPTIONS`, eliminating keepalive rejection on cameras with strict parameter requirements.
-- **Dynamic H.264 Profile & Level Negotiation for 5MP/4K Cameras**:
-  - Dynamically extracts exact `profile-level-id` (e.g. `640033` for 5MP Reolink Doorbell vs `640029` for 1080p) from SDP `fmtp` and SPS NAL units.
-  - Prevents Chromium and Safari `SourceBuffer` decode rejections caused by Level 4.1 frame macroblock limits.
-  - Supports both JSON string and array formats (`["avc1", "hvc1"]`) in client codec negotiation messages.
-- **WebRTC Codec Registration & WAN Connectivity**:
-  - Added H.264 High Profile Level 5.1 (`profile-level-id=640033`) SDP codec registration.
-  - Extended STUN ICE candidate gathering window to 500 ms to reliably obtain server-reflexive candidates for external WAN and cellular IPv6 clients.
-
-### v0.3.0
-- **Pure-Rust In-Process RTSP Client**:
-  - High-performance TCP interleaved RTSP ingest engine completely eliminating `ffmpeg -c copy` background processes.
-  - Native Digest MD5 and Basic authentication without external tools.
-  - Dynamic parameter set (SPS/PPS/VPS) extraction from SDP and inline bitstreams.
-- **Home Assistant go2rtc API Compatibility**:
-  - Implemented `/api` returning compatible `1.9.14` version and dynamic `rust2rtc` revision string.
-  - Added `/api/schemes` and `/api/preload` endpoints to allow Home Assistant to validate `rust2rtc` as an external go2rtc instance without spawning its bundled binaries.
-
-### v0.2.0
-- **Pure-Rust In-Process Audio Transcoding**:
-  - Native decoding of AAC-hbr (RFC 3640) and G.711 to 48kHz Opus via `symphonia` and `opus-pure`.
-  - Camera-clock lip-sync and deduplicated shared broadcast tracks across concurrent viewers.
-- **SIP Intercom & Backchannel**:
-  - Full-duplex backchannel for Reolink and ONVIF smart doorbells.
-  - High-fidelity G.711a/u 20ms audio repacking and RFC 2435 JPEG RTP video streaming for hardware intercom screens.
-
-### v0.1.0
-- Initial release: Tokio/Axum asynchronous core, WebRTC WHEP gateway, RTSP TCP server (`:8554`), and fast JPEG snapshots.
-
----
-
-## 🤝 Contributing
-
-Contributions are very welcome! Whether you are interested in:
-- Adding support for more protocols (HLS, MSE, RTMP, HomeKit)
-- Enhancing WebRTC ICE/STUN/TURN handling
-- Writing unit and integration tests
-- Optimizing zero-copy packet forwarding and memory utilization
-
-Please feel free to open an issue or submit a pull request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+- **v0.5.0**: Migrated exclusively to the pure-Rust `rustrtc` WebRTC engine (cutting active 7-camera Linux ARM64 RSS from 57.7 MB to 13.6 MB); added full-duplex WebRTC two-way talkback (`OpusToG711Decoder`), in-process Frigate MP4 segment recording (`ffmpeg-shim`), on-demand HTTP MJPEG streaming with broadcaster deduplication, Home Assistant WebSocket doorbell subscriber with parallel SIP ring groups, call duration watchdog + `/api/sip/hangup`, and optional HTTP Basic Auth.
+- **v0.4.0**: RTSP interleaved `$` stream resynchronization, dynamic H.264 `profile-level-id` extraction for 5MP/4K cameras, and H.264 High Profile Level 5.1 WebRTC negotiation.
+- **v0.3.0**: Pure-Rust in-process TCP RTSP client and Home Assistant `go2rtc` API compatibility (`/api`, `/api/schemes`, `/api/preload`).
+- **v0.2.0**: Pure-Rust in-process AAC/G.711 → Opus audio transcoding (`symphonia` + `opus-pure`) and bidirectional SIP intercom bridge with RFC 2435 JPEG RTP.
+- **v0.1.0**: Initial Tokio/Axum core, WebRTC WHEP gateway, RTSP TCP server (`:8554`), and JPEG snapshots.
 
 ---
 
 ## 📜 License & Acknowledgments
 
-- Inspired by the brilliant work of [AlexxIT](https://github.com/AlexxIT) and the [`go2rtc`](https://github.com/AlexxIT/go2rtc) project.
+- Inspired by the work of [AlexxIT](https://github.com/AlexxIT) and the [`go2rtc`](https://github.com/AlexxIT/go2rtc) project.
 - Licensed under the [MIT License](LICENSE).

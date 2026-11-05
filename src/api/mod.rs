@@ -24,6 +24,7 @@ pub struct AppState {
     pub sip: Arc<crate::sip::SipManager>,
     pub record: Arc<crate::record::RecordManager>,
     pub rtsp_port: u16,
+    pub api_auth: Option<(String, String)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +77,7 @@ pub struct WsMessage {
 }
 
 pub fn create_router(state: AppState) -> Router {
+    let auth_state = state.clone();
     Router::new()
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
@@ -107,8 +109,36 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/sip/hangup", post(api_sip_hangup_handler).get(api_sip_hangup_handler))
         .route("/api/sip/accounts", get(api_sip_accounts_handler))
         .route("/api/record", get(api_record_handler))
+        .layer(axum::middleware::from_fn_with_state(auth_state, basic_auth_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn basic_auth_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some((ref user, ref pass)) = state.api_auth {
+        use base64::Engine;
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass))
+        );
+        let auth_hdr = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        if auth_hdr != Some(expected.as_str()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"rust2rtc\"")],
+                "Unauthorized",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn index_handler() -> Html<&'static str> {
@@ -1158,9 +1188,10 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                     let tx_mse = tx.clone();
                     let stream_name = src_name.clone();
 
-                    if use_native_fmp4 {
+                    if use_native_fmp4
+                        && let Some(vtrack) = video_track
+                    {
                         // Pure-Rust in-process fMP4 multiplexer (Zero FFmpeg subprocess)
-                        let vtrack = video_track.unwrap();
                         info!(stream = %stream_name, is_hevc = has_h265, "Starting pure-Rust in-process MSE fMP4 stream (no FFmpeg)");
 
                         mse_handle = Some(tokio::spawn(async move {
@@ -1610,6 +1641,119 @@ mod tests {
         });
         let query: SipHangupQuery = serde_json::from_value(json).expect("deserialize hangup query");
         assert_eq!(query.stream, "doorbell");
+    }
+
+    #[tokio::test]
+    async fn test_go2rtc_api_contract_and_optional_auth() {
+        let streams = Arc::new(StreamManager::new());
+        streams
+            .add_configured_stream(
+                "doorbell".to_string(),
+                vec!["rtsp://192.0.2.10:554/stream1".to_string()],
+            )
+            .await;
+        let ffmpeg = Arc::new(FfmpegManager::new(
+            "ffmpeg".to_string(),
+            "-hide_banner".to_string(),
+            None,
+            std::collections::HashMap::new(),
+        ));
+        let webrtc = Arc::new(WebRtcManager::new(vec![], 8554, "ffmpeg".to_string(), "rustrtc".to_string()));
+        let sip = Arc::new(crate::sip::SipManager::new(
+            Arc::clone(&streams),
+            Arc::clone(&ffmpeg),
+            8554,
+        ));
+        let record = crate::record::RecordManager::new(
+            None,
+            Arc::clone(&streams),
+            8554,
+            Arc::clone(&ffmpeg),
+        );
+
+        // 1. Unauthenticated router (default go2rtc behavior)
+        let state = AppState {
+            streams: Arc::clone(&streams),
+            ffmpeg: Arc::clone(&ffmpeg),
+            webrtc: Arc::clone(&webrtc),
+            sip: Arc::clone(&sip),
+            record: Arc::clone(&record),
+            rtsp_port: 8554,
+            api_auth: None,
+        };
+        let app = create_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        async fn http_req(port: u16, method: &str, path: &str, auth: Option<&str>) -> (u16, String) {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let auth_hdr = auth.map(|a| format!("Authorization: {}\r\n", a)).unwrap_or_default();
+            let req = format!(
+                "{} {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Connection: close\r\nContent-Length: 0\r\n\r\n",
+                method, path, auth_hdr
+            );
+            tcp.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = String::new();
+            tcp.read_to_string(&mut buf).await.unwrap();
+            let (hdrs, body) = buf.split_once("\r\n\r\n").unwrap_or((&buf, ""));
+            let code = hdrs
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .unwrap_or(0);
+            (code, body.to_string())
+        }
+
+        // GET /api
+        let (code, body) = http_req(port, "GET", "/api", None).await;
+        assert_eq!(code, 200);
+        let info_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info_json["version"], "1.9.14");
+
+        // GET /api/streams
+        let (code, body) = http_req(port, "GET", "/api/streams", None).await;
+        assert_eq!(code, 200);
+        let streams_json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(streams_json["doorbell"]["producers"].is_array());
+        assert!(streams_json["doorbell"]["consumers"].is_array());
+
+        // PUT /api/streams?name=cam2&src=rtsp://192.0.2.20/main
+        let (code, _) = http_req(port, "PUT", "/api/streams?name=cam2&src=rtsp://192.0.2.20/main", None).await;
+        assert_eq!(code, 200);
+
+        // DELETE /api/streams?src=cam2
+        let (code, _) = http_req(port, "DELETE", "/api/streams?src=cam2", None).await;
+        assert_eq!(code, 200);
+
+        // 2. Authenticated router
+        let auth_state = AppState {
+            streams,
+            ffmpeg,
+            webrtc,
+            sip,
+            record,
+            rtsp_port: 8554,
+            api_auth: Some(("admin".to_string(), "secret123".to_string())),
+        };
+        let auth_app = create_router(auth_state);
+        let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth_port = auth_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(auth_listener, auth_app).await;
+        });
+
+        // Request without credentials -> 401
+        let (code_unauth, _) = http_req(auth_port, "GET", "/api/streams", None).await;
+        assert_eq!(code_unauth, 401);
+
+        // Request with valid Basic credentials -> 200
+        let (code_ok, _) = http_req(auth_port, "GET", "/api/streams", Some("Basic YWRtaW46c2VjcmV0MTIz")).await;
+        assert_eq!(code_ok, 200);
     }
 }
 

@@ -671,4 +671,27 @@ a=sendrecv\r\n";
         assert_eq!(parsed.get_header("Expires"), Some("0"));
         assert!(parsed.get_header("Contact").unwrap().contains("expires=0"));
     }
+
+    #[test]
+    fn test_sip_parser_malformed_inputs_never_panic() {
+        let malformed_cases = [
+            "",
+            "\r\n\r\n",
+            "SIP/2.0",
+            "SIP/2.0 not_a_code OK\r\n\r\n",
+            "INVITE\r\n",
+            "GARBAGE_NO_SPACES\r\nHeaderWithoutColon\r\n:EmptyKey\r\nKey:\r\n\r\nBody",
+            "INVITE sip:100@example.com SIP/2.0\r\nCSeq: invalid_num INVITE\r\nVia: SIP/2.0/UDP 127.0.0.1;branch=\"unclosed_quote\r\n\r\n",
+        ];
+        for raw in malformed_cases {
+            if let Ok(msg) = SipMessage::parse(raw) {
+                let _ = msg.get_cseq();
+                let _ = msg.get_branch();
+                let _ = msg.get_tag("from");
+                let _ = msg.serialize();
+            }
+        }
+        let sdp_garbage = "v=0\r\nm=audio not_a_port RTP/AVP 999 -1\r\nc=IN IP4\r\na=rtpmap:bad\r\n";
+        let _ = parse_sdp_media(sdp_garbage);
+    }
 }

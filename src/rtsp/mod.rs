@@ -88,6 +88,8 @@ impl RtspServer {
         _remote_addr: SocketAddr,
     ) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(8192);
+        const MAX_RTSP_BUFFER: usize = 256 * 1024;
+        const MAX_RTSP_BODY: usize = 64 * 1024;
         let session_id = "12345678";
         let mut _active_stream_id: Option<String> = None;
         let mut _is_publisher = false;
@@ -144,7 +146,8 @@ impl RtspServer {
                 let content_length = headers
                     .get("content-length")
                     .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .min(MAX_RTSP_BODY);
 
                 while buffer.len() < content_length {
                     let n = stream.read_buf(&mut buffer).await?;
@@ -398,7 +401,8 @@ impl RtspServer {
                                         let content_len = hdrs
                                             .get("content-length")
                                             .and_then(|v| v.parse::<usize>().ok())
-                                            .unwrap_or(0);
+                                            .unwrap_or(0)
+                                            .min(MAX_RTSP_BODY);
                                         while read_buf.len() < content_len {
                                             if reader.read_buf(&mut read_buf).await.unwrap_or(0) == 0 {
                                                 return Ok(());
@@ -433,6 +437,9 @@ impl RtspServer {
                                         }
                                     }
                                 } else {
+                                    if read_buf.len() > MAX_RTSP_BUFFER {
+                                        bail!("RTSP client read buffer exceeded limit");
+                                    }
                                     let n = reader.read_buf(&mut read_buf).await?;
                                     if n == 0 {
                                         break;
@@ -457,6 +464,9 @@ impl RtspServer {
                     }
                 }
             } else {
+                if buffer.len() > MAX_RTSP_BUFFER {
+                    bail!("RTSP request header exceeded maximum buffer size");
+                }
                 let n = stream.read_buf(&mut buffer).await?;
                 if n == 0 {
                     break;
@@ -635,4 +645,24 @@ fn parse_sdp_tracks(sdp: &str) -> Vec<Arc<Track>> {
     }
 
     tracks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_rtsp_headers_malformed_inputs_never_panic() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"\r\n\r\n",
+            b"OPTIONS\r\n\r\n",
+            b"\xFF\xFE\xFD\r\n\r\n",
+            b"DESCRIBE rtsp://[::1]:8554/stream RTSP/1.0\r\nContent-Length: 999999999999999999999\r\nMalformedHeader\r\n\r\n",
+        ];
+        for &raw in cases {
+            let _ = parse_rtsp_headers(raw);
+        }
+        let _ = parse_sdp_tracks("m=video\r\na=rtpmap:bad\r\na=fmtp:96\r\n");
+    }
 }

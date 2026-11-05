@@ -594,4 +594,33 @@ mod tests {
         let sprop = track.get_sprop().expect("sprop should exist from fmtp");
         assert!(sprop.contains("Z0IAKeNQDwBE/LgLcBAQFA=="));
     }
+
+    #[test]
+    fn test_rtp_packet_malformed_inputs_never_panic() {
+        // Empty and truncated headers
+        for len in 0..12 {
+            assert!(RtpPacket::parse(Bytes::from(vec![0x80; len])).is_none());
+        }
+        // Wrong RTP version (V=0, 1, 3)
+        assert!(RtpPacket::parse(Bytes::from(vec![0x00; 16])).is_none());
+        assert!(RtpPacket::parse(Bytes::from(vec![0x40; 16])).is_none());
+        assert!(RtpPacket::parse(Bytes::from(vec![0xC0; 16])).is_none());
+        // High CSRC count (CC=15 -> requires 12 + 60 = 72 bytes) with short buffer
+        let mut high_cc = vec![0x8F; 20];
+        high_cc[1] = 96;
+        assert!(RtpPacket::parse(Bytes::from(high_cc)).is_none());
+        // Extension bit set with truncated extension header or oversized extension length
+        let mut ext_short = vec![0x90; 14];
+        ext_short[1] = 96;
+        assert!(RtpPacket::parse(Bytes::from(ext_short)).is_none());
+        let mut ext_huge = vec![0x90; 20];
+        ext_huge[14] = 0xFF;
+        ext_huge[15] = 0xFF;
+        assert!(RtpPacket::parse(Bytes::from(ext_huge)).is_none());
+        // Padding bit set with padding length larger than payload
+        let mut bad_pad = vec![0xA0; 16];
+        bad_pad[15] = 250; // padding_len > payload_len
+        let pkt = RtpPacket::parse(Bytes::from(bad_pad)).expect("valid header with oversized pad");
+        assert_eq!(pkt.payload().len(), 4);
+    }
 }

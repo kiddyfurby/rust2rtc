@@ -4,3 +4,5 @@
 *.log
 .DS_Store
 deploy.sh
+deploy2.sh
+rust2rtc.yaml

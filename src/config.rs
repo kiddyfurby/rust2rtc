@@ -170,6 +170,12 @@ pub struct ApiConfig {
     pub listen: String,
     #[serde(default)]
     pub origin: Option<String>,
+    /// Optional HTTP Basic Auth username for the API & Web Dashboard
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional HTTP Basic Auth password for the API & Web Dashboard
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -177,6 +183,8 @@ impl Default for ApiConfig {
         Self {
             listen: default_api_listen(),
             origin: None,
+            username: None,
+            password: None,
         }
     }
 }
@@ -248,7 +256,11 @@ impl Config {
         for (name, stream) in other.streams {
             self.streams.insert(name, stream);
         }
-        if other.api.listen != default_api_listen() {
+        if other.api.listen != default_api_listen()
+            || other.api.username.is_some()
+            || other.api.password.is_some()
+            || other.api.origin.is_some()
+        {
             self.api = other.api;
         }
         if other.rtsp.listen != default_rtsp_listen() {
