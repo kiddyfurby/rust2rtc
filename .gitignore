@@ -3,3 +3,4 @@
 /reference
 *.log
 .DS_Store
+deploy.sh
