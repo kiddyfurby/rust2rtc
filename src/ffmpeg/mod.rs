@@ -602,13 +602,43 @@ pub fn resolve_source(source: &str, rtsp_port: u16) -> String {
             let host = url.host_str().unwrap_or("127.0.0.1");
             let user = url.username();
             let pass = url.password().unwrap_or("");
-            return format!("rtsp://{}:{}@{}/Preview_01_main", user, pass, host);
+            let userinfo = if !user.is_empty() || !pass.is_empty() {
+                format!("{}:{}@", user, pass)
+            } else {
+                String::new()
+            };
+            let port_part = match url.port() {
+                Some(8000) | Some(80) | None => String::new(),
+                Some(p) => format!(":{}", p),
+            };
+            let path = if url.path().is_empty() || url.path() == "/" {
+                "/Preview_01_main"
+            } else {
+                url.path()
+            };
+            return format!("rtsp://{}{}{}{}", userinfo, host, port_part, path);
         }
 
     if clean_source.starts_with("tapo://")
         && let Ok(url) = url::Url::parse(clean_source) {
             let host = url.host_str().unwrap_or("127.0.0.1");
-            return format!("rtsp://frigate:password@{}/stream1", host);
+            let user = url.username();
+            let pass = url.password().unwrap_or("");
+            let userinfo = if !user.is_empty() || !pass.is_empty() {
+                format!("{}:{}@", user, pass)
+            } else {
+                String::new()
+            };
+            let port_part = match url.port() {
+                Some(554) | None => String::new(),
+                Some(p) => format!(":{}", p),
+            };
+            let path = if url.path().is_empty() || url.path() == "/" {
+                "/stream1"
+            } else {
+                url.path()
+            };
+            return format!("rtsp://{}{}{}{}", userinfo, host, port_part, path);
         }
 
     if !clean_source.contains("://") && !clean_source.starts_with("exec:") && !clean_source.starts_with("ffmpeg:") {
@@ -700,5 +730,29 @@ mod tests {
         assert!(args.contains(&"10".to_string()));
         assert!(args.contains(&"-q:v".to_string()));
         assert!(args.contains(&"3".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_source() {
+        assert_eq!(
+            resolve_source("tapo://admin:cloudpass@192.0.2.27", 8554),
+            "rtsp://admin:cloudpass@192.0.2.27/stream1"
+        );
+        assert_eq!(
+            resolve_source("tapo://admin:cloudpass@192.0.2.27:8554/stream2", 8554),
+            "rtsp://admin:cloudpass@192.0.2.27:8554/stream2"
+        );
+        assert_eq!(
+            resolve_source("onvif://admin:pass@192.0.2.42:8000/live/ch0", 8554),
+            "rtsp://admin:pass@192.0.2.42/live/ch0"
+        );
+        assert_eq!(
+            resolve_source("onvif://admin:pass@192.0.2.42:8000", 8554),
+            "rtsp://admin:pass@192.0.2.42/Preview_01_main"
+        );
+        assert_eq!(
+            resolve_source("doorbell", 8554),
+            "rtsp://127.0.0.1:8554/doorbell"
+        );
     }
 }

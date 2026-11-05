@@ -423,9 +423,9 @@ mod tests {
 
     #[test]
     fn test_tapo_url_parsing() {
-        let client = MultitransClient::new("tapo://admin:mypass@198.51.100.100").unwrap();
+        let client = MultitransClient::new("tapo://admin:mypass@192.0.2.100").unwrap();
         assert!(client.is_http_tapo);
-        assert_eq!(client.url.host_str(), Some("198.51.100.100"));
+        assert_eq!(client.url.host_str(), Some("192.0.2.100"));
         assert_eq!(client.url.username(), "admin");
         assert_eq!(client.url.password(), Some("mypass"));
     }

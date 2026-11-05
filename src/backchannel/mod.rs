@@ -121,21 +121,21 @@ mod tests {
     #[test]
     fn test_detect_backchannel() {
         let s1 = vec![
-            "rtsp://admin:pass@198.51.100.10/main".to_string(),
-            "multitrans://admin:pass@198.51.100.10:554/".to_string(),
+            "rtsp://admin:pass@192.0.2.10/main".to_string(),
+            "multitrans://admin:pass@192.0.2.10:554/".to_string(),
         ];
         assert_eq!(
             detect_backchannel(&s1),
-            Some(BackchannelKind::Multitrans("multitrans://admin:pass@198.51.100.10:554/".to_string()))
+            Some(BackchannelKind::Multitrans("multitrans://admin:pass@192.0.2.10:554/".to_string()))
         );
 
         let s2 = vec![
-            "onvif://admin:pass@198.51.100.42:8000".to_string(),
+            "onvif://admin:pass@192.0.2.42:8000".to_string(),
             "ffmpeg:doorbell#audio=opus".to_string(),
         ];
         assert_eq!(
             detect_backchannel(&s2),
-            Some(BackchannelKind::Onvif("onvif://admin:pass@198.51.100.42:8000".to_string()))
+            Some(BackchannelKind::Onvif("onvif://admin:pass@192.0.2.42:8000".to_string()))
         );
 
         let s_living = vec!["rtsp://192.0.2.25/ch0_0.h264#backchannel=1".to_string()];
@@ -145,7 +145,7 @@ mod tests {
         );
 
         let s_tapo = vec![
-            "rtsp://frigate:pass@192.0.2.27/stream1".to_string(),
+            "rtsp://admin:pass@192.0.2.27/stream1".to_string(),
             "tapo://admin:cloudpass@192.0.2.27".to_string(),
         ];
         assert_eq!(
@@ -153,7 +153,7 @@ mod tests {
             Some(BackchannelKind::Multitrans("tapo://admin:cloudpass@192.0.2.27".to_string()))
         );
 
-        let s3 = vec!["rtsp://198.51.100.50/cam".to_string()];
+        let s3 = vec!["rtsp://192.0.2.50/cam".to_string()];
         assert_eq!(detect_backchannel(&s3), None);
     }
 }
