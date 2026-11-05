@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Hashing & Utilities
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 md-5 = "0.10"
+sha2 = "0.10"
 hex = "0.4"
 anyhow = "1.0"
 thiserror = "2.0"
@@ -36,8 +37,6 @@ async-trait = "0.1"
 base64 = "0.22"
 
 # WebRTC
-webrtc = "0.21.1"
-rtc = "0.21.1"
 rustrtc = "0.6.0"
 uuid = { version = "1.28.0", features = ["v4"] }
 

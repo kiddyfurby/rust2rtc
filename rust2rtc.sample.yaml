@@ -32,8 +32,6 @@
 # 2. WebRTC Configuration
 # ------------------------------------------------------------------------------
 webrtc:
-  # WebRTC engine backend: "rustrtc" (lightweight, pure Rust, recommended) or "webrtc-rs" (default)
-  engine: "rustrtc"
   # Public IP / DNS and port, or STUN server addresses for ICE candidate gathering
   candidates:
     - "198.51.100.4:8555"
