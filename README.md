@@ -50,6 +50,11 @@ In addition, `rust2rtc` functions as a **high-performance bidirectional SIP brid
 - **🎞️ External FFmpeg Integration (When needed)**:
   - Remuxes and transcodes on-demand without overhead when idle.
   - Custom pipeline syntax compatible with go2rtc (e.g. `ffmpeg:stream#video=mjpeg#raw=-r 15 -q:v 3`).
+- **🎞️ On-Demand HTTP Motion JPEG (MJPEG)**:
+  - Standard `multipart/x-mixed-replace` live streaming via `/api/stream.mjpeg?src=<stream>` (and `/api/frame.mjpeg` / `/stream.mjpeg`) for HTML `<img>` elements, legacy browsers, and Home Assistant generic MJPEG cameras.
+  - **Shared Broadcaster Deduplication**: Concurrent viewers watching the same stream share a single transcode worker, saving massive CPU and RAM compared to spawning per-client transcoders.
+  - **Zero Idle Overhead**: Automatically starts on-demand when clients connect and terminates when all viewers disconnect.
+  - **Dynamic Scaling & Pacing**: Supports runtime overrides via query parameters (`fps`, `width`, `height`, `quality`) and honors custom `ffmpeg:...#video=mjpeg` pipelines.
 - **📸 High-Speed Snapshots**:
   - Instant JPEG frame capture via `/api/frame.jpeg?src=<stream>` for both H.264 and H.265 (HEVC) streams.
   - Optimized pipeline with low-delay decoding and track readiness polling.

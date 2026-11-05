@@ -472,6 +472,122 @@ impl FfmpegManager {
 
         Ok(Bytes::from(buffer))
     }
+
+    /// Build FFmpeg arguments for low-latency live MJPEG stdout streaming
+    pub fn build_mjpeg_stream_args(
+        &self,
+        source: &str,
+        custom_pipeline: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+        fps: Option<u32>,
+        quality: Option<u32>,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "-hide_banner".to_string(),
+            "-v".to_string(),
+            "warning".to_string(),
+            "-fflags".to_string(),
+            "nobuffer".to_string(),
+            "-flags".to_string(),
+            "low_delay".to_string(),
+        ];
+
+        if source.starts_with("rtsp://") {
+            args.extend([
+                "-rtsp_transport".to_string(),
+                "tcp".to_string(),
+            ]);
+        }
+
+        args.extend(["-i".to_string(), source.to_string()]);
+        args.extend(["-an".to_string()]);
+
+        if self.hardware.as_deref() == Some("rkmpp") {
+            args.extend(["-c:v".to_string(), "mjpeg_rkmpp".to_string()]);
+        } else {
+            args.extend(["-c:v".to_string(), "mjpeg".to_string()]);
+        }
+
+        let mut custom_vf = None;
+        let mut custom_r = None;
+        let mut custom_q = None;
+        let mut custom_raw = Vec::new();
+
+        if let Some(pipeline) = custom_pipeline {
+            if let Some((_, params)) = pipeline.split_once('#') {
+                for param in params.split('#') {
+                    if let Some((k, v)) = param.split_once('=') {
+                        match k {
+                            "height" => {
+                                custom_vf = Some(format!("scale=-2:{}", v));
+                            }
+                            "vf" => {
+                                custom_vf = Some(v.to_string());
+                            }
+                            "fps" | "r" => {
+                                custom_r = Some(v.to_string());
+                            }
+                            "q" | "q:v" => {
+                                custom_q = Some(v.to_string());
+                            }
+                            "raw" => {
+                                custom_raw.extend(shell_words(v));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_q = quality
+            .map(|q| q.to_string())
+            .or(custom_q)
+            .unwrap_or_else(|| "5".to_string());
+        args.extend(["-q:v".to_string(), final_q]);
+
+        let final_r = fps
+            .map(|f| f.to_string())
+            .or(custom_r)
+            .unwrap_or_else(|| "15".to_string());
+        args.extend(["-r".to_string(), final_r]);
+
+        let final_vf = if let (Some(w), Some(h)) = (width, height) {
+            Some(format!("scale={}:{}", w, h))
+        } else if let Some(w) = width {
+            Some(format!("scale={}:-2", w))
+        } else if let Some(h) = height {
+            Some(format!("scale=-2:{}", h))
+        } else {
+            custom_vf
+        };
+
+        if let Some(vf) = final_vf {
+            args.extend(["-vf".to_string(), vf]);
+        }
+
+        if !custom_raw.is_empty() {
+            args.extend(custom_raw);
+        }
+
+        args.extend([
+            "-pix_fmt".to_string(),
+            "yuvj420p".to_string(),
+            "-huffman".to_string(),
+            "default".to_string(),
+            "-f".to_string(),
+            "mjpeg".to_string(),
+            "pipe:1".to_string(),
+        ]);
+
+        args
+    }
+}
+
+/// Locate a two-byte marker in a buffer
+pub fn find_marker(buf: &[u8], marker: &[u8; 2]) -> Option<usize> {
+    buf.windows(2).position(|w| w == marker)
 }
 
 pub fn resolve_source(source: &str, rtsp_port: u16) -> String {
@@ -543,4 +659,46 @@ fn shell_words(s: &str) -> Vec<String> {
     }
 
     words
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_marker() {
+        let buf = [0x00, 0x12, 0xFF, 0xD8, 0xAA, 0xBB, 0xFF, 0xD9, 0x00];
+        assert_eq!(find_marker(&buf, &[0xFF, 0xD8]), Some(2));
+        assert_eq!(find_marker(&buf[4..], &[0xFF, 0xD9]), Some(2));
+        assert_eq!(find_marker(&buf, &[0xAA, 0x00]), None);
+    }
+
+    #[test]
+    fn test_build_mjpeg_stream_args_default() {
+        let ffmpeg = FfmpegManager::new("ffmpeg".to_string(), String::new(), None, HashMap::new());
+        let args = ffmpeg.build_mjpeg_stream_args("rtsp://127.0.0.1:8554/doorbell", None, None, None, None, None);
+
+        assert!(args.contains(&"-c:v".to_string()));
+        assert!(args.contains(&"mjpeg".to_string()));
+        assert!(args.contains(&"-f".to_string()));
+        assert!(args.contains(&"pipe:1".to_string()));
+        assert!(args.contains(&"-r".to_string()));
+        assert!(args.contains(&"15".to_string()));
+        assert!(args.contains(&"-q:v".to_string()));
+        assert!(args.contains(&"5".to_string()));
+    }
+
+    #[test]
+    fn test_build_mjpeg_stream_args_with_custom_pipeline() {
+        let ffmpeg = FfmpegManager::new("ffmpeg".to_string(), String::new(), None, HashMap::new());
+        let pipeline = "ffmpeg:doorbell#video=mjpeg#height=480#raw=-r 10 -q:v 3";
+        let args = ffmpeg.build_mjpeg_stream_args("rtsp://127.0.0.1:8554/doorbell", Some(pipeline), None, None, None, None);
+
+        assert!(args.contains(&"-vf".to_string()));
+        assert!(args.contains(&"scale=-2:480".to_string()));
+        assert!(args.contains(&"-r".to_string()));
+        assert!(args.contains(&"10".to_string()));
+        assert!(args.contains(&"-q:v".to_string()));
+        assert!(args.contains(&"3".to_string()));
+    }
 }
