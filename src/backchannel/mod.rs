@@ -53,7 +53,7 @@ impl Drop for BackchannelSession {
 /// Detect backchannel configuration from stream sources
 pub fn detect_backchannel(sources: &[String]) -> Option<BackchannelKind> {
     for source in sources {
-        if source.starts_with("multitrans://") {
+        if source.starts_with("multitrans://") || source.starts_with("tapo://") {
             return Some(BackchannelKind::Multitrans(source.clone()));
         }
         if source.starts_with("onvif://")
@@ -142,6 +142,15 @@ mod tests {
         assert_eq!(
             detect_backchannel(&s_living),
             Some(BackchannelKind::Onvif("rtsp://192.0.2.25/ch0_0.h264#backchannel=1".to_string()))
+        );
+
+        let s_tapo = vec![
+            "rtsp://frigate:pass@192.0.2.27/stream1".to_string(),
+            "tapo://admin:cloudpass@192.0.2.27".to_string(),
+        ];
+        assert_eq!(
+            detect_backchannel(&s_tapo),
+            Some(BackchannelKind::Multitrans("tapo://admin:cloudpass@192.0.2.27".to_string()))
         );
 
         let s3 = vec!["rtsp://198.51.100.50/cam".to_string()];

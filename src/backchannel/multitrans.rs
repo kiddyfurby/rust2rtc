@@ -12,21 +12,31 @@ use url::Url;
 
 use super::pcm::{transcode_ulaw_to_alaw, G711Repacker};
 
-/// TP-Link / Tapo MULTITRANS Backchannel Client
+/// TP-Link / Tapo MULTITRANS Backchannel Client (supports both RTSP:554 and HTTP Streamd:8800)
 pub struct MultitransClient {
     url: Url,
     uuid: String,
+    is_http_tapo: bool,
     stream: Option<TcpStream>,
     session_id: Option<String>,
 }
 
 impl MultitransClient {
     pub fn new(raw_url: &str) -> Result<Self> {
-        let url = Url::parse(raw_url).context("Failed to parse multitrans URL")?;
+        let is_tapo = raw_url.starts_with("tapo://");
+        let mut clean_url = raw_url.to_string();
+        if is_tapo {
+            clean_url = clean_url.replacen("tapo://", "http://", 1);
+        } else if clean_url.starts_with("multitrans://") {
+            clean_url = clean_url.replacen("multitrans://", "rtsp://", 1);
+        }
+        let url = Url::parse(&clean_url).context("Failed to parse multitrans/tapo URL")?;
+        let is_http_tapo = is_tapo || url.port() == Some(8800);
         let uuid = uuid::Uuid::new_v4().to_string();
         Ok(Self {
             url,
             uuid,
+            is_http_tapo,
             stream: None,
             session_id: None,
         })
@@ -34,7 +44,121 @@ impl MultitransClient {
 
     /// Perform handshake with camera over TCP
     pub async fn connect(&mut self) -> Result<()> {
-        let host = self.url.host_str().context("Missing host in multitrans URL")?;
+        let host = self.url.host_str().context("Missing host in URL")?;
+
+        if self.is_http_tapo {
+            let port = self.url.port().unwrap_or(8800);
+            let addr = format!("{}:{}", host, port);
+
+            debug!(addr = %addr, "Connecting to Tapo camera for HTTP Streamd backchannel");
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr))
+                .await
+                .context("Connection timed out")?
+                .with_context(|| format!("Failed to connect to {}", addr))?;
+
+            // 1. Challenge request
+            let challenge_req = format!(
+                "POST /stream HTTP/1.1\r\n\
+                Host: {addr}\r\n\
+                Content-Type: multipart/mixed; boundary=----client-stream-boundary--\r\n\
+                Connection: keep-alive\r\n\
+                Content-Length: 0\r\n\r\n"
+            );
+            stream.write_all(challenge_req.as_bytes()).await?;
+
+            let (status0, headers0, _) = read_rtsp_response(&mut stream).await?;
+            if status0 != 401 {
+                bail!("Expected 401 Digest challenge from Tapo camera, got {}", status0);
+            }
+
+            let auth_hdr = headers0
+                .get("www-authenticate")
+                .cloned()
+                .context("Missing WWW-Authenticate header")?;
+
+            let realm = extract_param(&auth_hdr, "realm=").unwrap_or_else(|| "TP-Link IP-Camera".to_string());
+            let nonce = extract_param(&auth_hdr, "nonce=").context("Missing nonce in auth header")?;
+            let opaque = extract_param(&auth_hdr, "opaque=");
+            let encrypt_type = extract_param(&auth_hdr, "encrypt_type=").unwrap_or_default();
+            let qop = extract_param(&auth_hdr, "qop=");
+
+            let user = self.url.username();
+            let pass = self.url.password().unwrap_or("");
+
+            // When encrypt_type="3", the password must be formatted as 64-character uppercase SHA256 hex
+            let effective_pass = if encrypt_type == "3" {
+                use sha2::{Digest as Sha2Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(pass.as_bytes());
+                hex::encode(hasher.finalize()).to_uppercase()
+            } else {
+                pass.to_string()
+            };
+
+            let ha1 = hex_md5(&format!("{}:{}:{}", user, realm, effective_pass));
+            let ha2 = hex_md5("POST:/stream");
+            let uri = "/stream";
+
+            let auth_val = if let Some(ref qop_val) = qop {
+                let cnonce = hex::encode(rand_seed().to_be_bytes());
+                let nc = "00000001";
+                let resp = hex_md5(&format!("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, qop_val, ha2));
+                let mut val = format!(
+                    r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}", qop={}, nc={}, cnonce="{}""#,
+                    user, realm, nonce, uri, resp, qop_val, nc, cnonce
+                );
+                if let Some(op) = &opaque {
+                    val.push_str(&format!(r#", opaque="{}""#, op));
+                }
+                val
+            } else {
+                let resp = hex_md5(&format!("{}:{}:{}", ha1, nonce, ha2));
+                let mut val = format!(
+                    r#"Digest username="{}", realm="{}", nonce="{}", uri="{}", response="{}""#,
+                    user, realm, nonce, uri, resp
+                );
+                if let Some(op) = &opaque {
+                    val.push_str(&format!(r#", opaque="{}""#, op));
+                }
+                val
+            };
+
+            // 2. Authenticated handshake with multipart JSON
+            let boundary = "----client-stream-boundary--";
+            let json_body = r#"{"params":{"talk":{"mode":"aec"},"method":"get"}}"#;
+            let multipart_data = format!(
+                "--{boundary}\r\nContent-Type: application/json\r\n\r\n{json_body}\r\n--{boundary}--\r\n"
+            );
+
+            let req = format!(
+                "POST /stream HTTP/1.1\r\n\
+                Host: {addr}\r\n\
+                Authorization: {auth_val}\r\n\
+                Content-Type: multipart/mixed; boundary={boundary}\r\n\
+                Connection: keep-alive\r\n\
+                Content-Length: {}\r\n\r\n\
+                {}",
+                multipart_data.len(),
+                multipart_data
+            );
+            stream.write_all(req.as_bytes()).await?;
+
+            let (status, resp_headers, body) = read_rtsp_response(&mut stream).await?;
+            if status != 200 {
+                bail!("Tapo HTTP Streamd authentication failed with status {}", status);
+            }
+
+            let session = extract_session_id(&body)
+                .or_else(|| resp_headers.get("session").cloned())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            info!(host = %host, session = %session, "Tapo HTTP Streamd backchannel ready");
+            self.stream = Some(stream);
+            self.session_id = Some(session);
+            return Ok(());
+        }
+
+        // Standard RTSP MULTITRANS (port 554)
         let port = self.url.port().unwrap_or(554);
         let addr = format!("{}:{}", host, port);
 
@@ -126,31 +250,62 @@ impl MultitransClient {
     }
 
     /// Run the backchannel audio loop. Accepts incoming audio payload chunks (PCMA or PCMU),
-    /// repacks them into framed RTP packets, encapsulates them in RTSP interleaved frames ($ \x01 ...),
-    /// and writes them to the camera connection.
+    /// repacks them and writes them to the camera connection.
     pub async fn run_sender(
         mut self,
         mut rx: mpsc::Receiver<(Bytes, bool)>, // (payload, is_pcmu)
     ) -> Result<()> {
         let mut stream = self.stream.take().context("Not connected")?;
-        let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes (80ms PCMA/8000)
 
-        while let Some((payload, is_pcmu)) = rx.recv().await {
-            let mut data = payload.to_vec();
-            if is_pcmu {
-                transcode_ulaw_to_alaw(&mut data);
+        if self.is_http_tapo {
+            let boundary = "----client-stream-boundary--";
+            let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes PCMA
+
+            while let Some((payload, is_pcmu)) = rx.recv().await {
+                let mut data = payload.to_vec();
+                if is_pcmu {
+                    transcode_ulaw_to_alaw(&mut data);
+                }
+
+                let chunks = repacker.push_payload(&data);
+                for chunk in chunks {
+                    let mut block = Vec::with_capacity(chunk.len() + 128);
+                    block.extend_from_slice(
+                        format!(
+                            "--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                            chunk.len()
+                        )
+                        .as_bytes(),
+                    );
+                    block.extend_from_slice(&chunk);
+                    block.extend_from_slice(b"\r\n");
+
+                    if let Err(e) = stream.write_all(&block).await {
+                        error!("Error sending Tapo HTTP audio frame: {}", e);
+                        return Err(e.into());
+                    }
+                }
             }
+        } else {
+            let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes (80ms PCMA/8000)
 
-            let rtp_packets = repacker.push_payload(&data);
-            for rtp in rtp_packets {
-                let size = rtp.len();
-                let mut frame = BytesMut::with_capacity(4 + size);
-                frame.extend_from_slice(&[b'$', 1, (size >> 8) as u8, (size & 0xff) as u8]);
-                frame.extend_from_slice(&rtp);
+            while let Some((payload, is_pcmu)) = rx.recv().await {
+                let mut data = payload.to_vec();
+                if is_pcmu {
+                    transcode_ulaw_to_alaw(&mut data);
+                }
 
-                if let Err(e) = stream.write_all(&frame).await {
-                    error!("Error sending MULTITRANS audio frame: {}", e);
-                    return Err(e.into());
+                let rtp_packets = repacker.push_payload(&data);
+                for rtp in rtp_packets {
+                    let size = rtp.len();
+                    let mut frame = BytesMut::with_capacity(4 + size);
+                    frame.extend_from_slice(&[b'$', 1, (size >> 8) as u8, (size & 0xff) as u8]);
+                    frame.extend_from_slice(&rtp);
+
+                    if let Err(e) = stream.write_all(&frame).await {
+                        error!("Error sending MULTITRANS audio frame: {}", e);
+                        return Err(e.into());
+                    }
                 }
             }
         }
@@ -243,4 +398,41 @@ async fn read_rtsp_response(
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn extract_session_id(body: &str) -> Option<String> {
+    if let Some(pos) = body.find(r#""session_id""#) {
+        let after = &body[pos + 12..];
+        let trimmed = after.trim_start_matches(|c| c == ':' || c == ' ' || c == '"');
+        if let Some(end) = trimmed.find('"') {
+            return Some(trimmed[..end].to_string());
+        }
+    }
+    None
+}
+
+fn rand_seed() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEED: AtomicU32 = AtomicU32::new(0x42424242);
+    SEED.fetch_add(0x9e3779b9, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tapo_url_parsing() {
+        let client = MultitransClient::new("tapo://admin:mypass@198.51.100.100").unwrap();
+        assert!(client.is_http_tapo);
+        assert_eq!(client.url.host_str(), Some("198.51.100.100"));
+        assert_eq!(client.url.username(), "admin");
+        assert_eq!(client.url.password(), Some("mypass"));
+    }
+
+    #[test]
+    fn test_extract_session_id() {
+        let body = r#"{"result":{"session_id":"abc-123-session","status":0}}"#;
+        assert_eq!(extract_session_id(body), Some("abc-123-session".to_string()));
+    }
 }
