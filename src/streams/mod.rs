@@ -98,11 +98,14 @@ impl Stream {
 
     /// Get or dynamically spawn a shared in-process Opus transcoding track
     pub async fn get_or_create_opus_track(&self) -> Option<Arc<Track>> {
-        // 1. If this stream already has a native OPUS track, return it directly
+        // 1. If this stream already has a native WebRTC audio track (OPUS, PCMA, PCMU), return it directly without transcoding
         let tracks = self.tracks.read().await;
         for t in tracks.iter() {
-            if t.kind == MediaKind::Audio && t.codec.name.eq_ignore_ascii_case("OPUS") {
-                return Some(Arc::clone(t));
+            if t.kind == MediaKind::Audio {
+                let name = t.codec.name.to_uppercase();
+                if name.contains("OPUS") || name.contains("PCMA") || name.contains("PCMU") {
+                    return Some(Arc::clone(t));
+                }
             }
         }
 
@@ -112,12 +115,12 @@ impl Stream {
             return Some(Arc::clone(track));
         }
 
-        // 3. Find an audio track (AAC, PCMU, PCMA) to transcode from
+        // 3. Find an audio track (e.g. AAC / MPEG4-GENERIC) to transcode from
         let source_audio_track = tracks.iter().find(|t| t.kind == MediaKind::Audio)?.clone();
         drop(tracks);
 
         // 4. Create shared Opus track
-        let opus_track = Arc::new(Track::new(crate::core::Codec::new_opus(), MediaKind::Audio, 50));
+        let opus_track = Arc::new(Track::new(crate::core::Codec::new_opus(), MediaKind::Audio, 256));
         *guard = Some(Arc::clone(&opus_track));
 
         // 5. Spawn background in-process audio transcode worker
