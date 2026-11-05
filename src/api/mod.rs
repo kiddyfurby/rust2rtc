@@ -104,6 +104,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/webrtc", post(api_webrtc_handler))
         .route("/api/ws", get(api_ws_handler))
         .route("/api/sip/call", post(api_sip_call_handler))
+        .route("/api/sip/hangup", post(api_sip_hangup_handler).get(api_sip_hangup_handler))
         .route("/api/sip/accounts", get(api_sip_accounts_handler))
         .route("/api/record", get(api_record_handler))
         .layer(CorsLayer::permissive())
@@ -1452,6 +1453,32 @@ async fn api_sip_accounts_handler(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SipHangupQuery {
+    pub stream: String,
+}
+
+async fn api_sip_hangup_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SipHangupQuery>,
+) -> impl IntoResponse {
+    match state.sip.hangup(&query.stream).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "hung_up",
+                "stream": query.stream,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.to_string(),
+            })),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RecordQuery {
     pub stream: String,
     pub action: Option<String>,
@@ -1574,6 +1601,15 @@ mod tests {
         assert_eq!(query_alt.width, Some(1280));
         assert_eq!(query_alt.height, Some(720));
         assert_eq!(query_alt.quality, Some(5));
+    }
+
+    #[test]
+    fn test_sip_hangup_query_deserialization() {
+        let json = serde_json::json!({
+            "stream": "doorbell"
+        });
+        let query: SipHangupQuery = serde_json::from_value(json).expect("deserialize hangup query");
+        assert_eq!(query.stream, "doorbell");
     }
 }
 
