@@ -21,11 +21,24 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+/// Active SIP Dialog information needed to terminate or control the call
+#[derive(Debug, Clone)]
+pub struct SipDialog {
+    pub call_id: String,
+    pub peer_addr: SocketAddr,
+    pub request_uri: String,
+    pub local_uri: String,
+    pub remote_uri: String,
+    pub local_tag: String,
+    pub remote_tag: Option<String>,
+}
+
 /// Active SIP Media Bridge Session for a Call
 pub struct SipCallSession {
     pub call_id: String,
     pub local_audio_port: u16,
     pub local_video_port: Option<u16>,
+    pub dialog: Option<SipDialog>,
     tasks: Vec<JoinHandle<()>>,
     transcode_child: Arc<Mutex<Option<Child>>>,
     stream: Arc<Stream>,
@@ -764,10 +777,16 @@ impl SipCallSession {
             call_id,
             local_audio_port,
             local_video_port,
+            dialog: None,
             tasks,
             transcode_child,
             stream,
         })
+    }
+
+    /// Set dialog metadata for outbound BYE signaling
+    pub fn set_dialog(&mut self, dialog: SipDialog) {
+        self.dialog = Some(dialog);
     }
 
     /// Stop the call session and release backchannel resources

@@ -5,7 +5,7 @@ use super::message::{
     build_sdp, compute_digest_response, compute_digest_response_qop, extract_param,
     parse_sdp_media, SipMessage, SipMethod, VideoCodecKind,
 };
-use super::session::SipCallSession;
+use super::session::{SipCallSession, SipDialog};
 use crate::core::MediaKind;
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::Stream;
@@ -20,6 +20,31 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
+/// Helper to extract SIP URI and optional tag from headers like `<sip:user@host>;tag=xxx`
+pub fn extract_uri_and_tag(header: &str) -> (String, Option<String>) {
+    let uri = if let Some(start) = header.find('<')
+        && let Some(end) = header[start + 1..].find('>')
+    {
+        header[start + 1..start + 1 + end].trim().to_string()
+    } else {
+        header.split(';').next().unwrap_or(header).trim().to_string()
+    };
+
+    let tag = if let Some(pos) = header.find("tag=") {
+        let after = &header[pos + 4..];
+        let val = after.split(';').next().unwrap_or("").trim();
+        if !val.is_empty() {
+            Some(val.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (uri, tag)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SipAccountStatus {
     pub stream: String,
@@ -27,6 +52,7 @@ pub struct SipAccountStatus {
     pub auth_user: String,
     pub display_name: String,
     pub registered: bool,
+    pub in_call: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +68,7 @@ pub struct SipAccountConfig {
     pub auto_answer: bool,
     pub local_ip: String,
     pub ha_client: Option<HaVoipClient>,
+    pub max_call_duration_secs: Option<u64>,
 }
 
 pub struct SipCameraAccount {
@@ -102,12 +129,14 @@ impl SipCameraAccount {
 
     pub async fn status(&self) -> SipAccountStatus {
         let ext = self.current_extension.lock().await.clone();
+        let in_call = self.active_call.lock().await.is_some();
         SipAccountStatus {
             stream: self.config.stream_name.clone(),
             extension: ext,
             auth_user: self.config.auth_user.clone(),
             display_name: self.config.display_name.clone(),
             registered: self.registered.load(Ordering::Relaxed),
+            in_call,
         }
     }
 
@@ -254,18 +283,59 @@ impl SipCameraAccount {
             return Ok(());
         }
 
-        // Terminate any active media session first
-        {
-            let mut active = self.active_call.lock().await;
-            if let Some(mut session) = active.take() {
-                session.stop().await;
-            }
-        }
+        // Terminate any active media session first with BYE
+        let _ = self.hangup().await;
 
         info!(stream = %self.config.stream_name, "Unregistering SIP account (expires=0)");
         let res = self.register_request(0).await;
         self.registered.store(false, Ordering::SeqCst);
         res
+    }
+
+    /// Send SIP BYE request to terminate an active dialog
+    pub async fn send_bye(&self, dialog: &SipDialog) -> Result<()> {
+        let mut bye = SipMessage::new_request(SipMethod::Bye, &dialog.request_uri);
+        let branch = format!("z9hG4bK-{}", uuid::Uuid::new_v4());
+        let local_port = self.socket.local_addr()?.port();
+        bye.set_header(
+            "Via",
+            &format!("SIP/2.0/UDP {}:{};branch={};rport", self.config.local_ip, local_port, branch),
+        );
+        let from_header = format!(r#""{}" <{}>;tag={}"#, self.config.display_name, dialog.local_uri, dialog.local_tag);
+        bye.set_header("From", &from_header);
+        let to_header = if let Some(ref r_tag) = dialog.remote_tag {
+            format!("<{}>;tag={}", dialog.remote_uri, r_tag)
+        } else {
+            format!("<{}>", dialog.remote_uri)
+        };
+        bye.set_header("To", &to_header);
+        bye.set_header("Call-ID", &dialog.call_id);
+        let cseq = self.cseq.fetch_add(1, Ordering::SeqCst);
+        bye.set_header("CSeq", &format!("{} BYE", cseq));
+        bye.set_header("Max-Forwards", "70");
+        bye.set_header("User-Agent", "rust2rtc");
+
+        info!(
+            call_id = %dialog.call_id,
+            peer = %dialog.peer_addr,
+            to = %to_header,
+            "Sending SIP BYE to peer"
+        );
+        let _ = self.socket.send_to(bye.serialize().as_bytes(), dialog.peer_addr).await;
+        Ok(())
+    }
+
+    /// Manually hang up active call on this account and send SIP BYE to peer
+    pub async fn hangup(&self) -> Result<()> {
+        let mut active = self.active_call.lock().await;
+        if let Some(mut session) = active.take() {
+            if let Some(ref dialog) = session.dialog {
+                let _ = self.send_bye(dialog).await;
+            }
+            session.stop().await;
+            info!(stream = %self.config.stream_name, "Active SIP call hung up");
+        }
+        Ok(())
     }
 
     async fn register_request(&self, expires: u32) -> Result<()> {
@@ -519,7 +589,7 @@ impl SipCameraAccount {
     }
 
     /// Handle incoming SIP request or response
-    async fn handle_message(&self, msg: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+    async fn handle_message(self: &Arc<Self>, msg: SipMessage, peer_addr: SocketAddr) -> Result<()> {
         if msg.is_response {
             debug!(code = ?msg.status_code, "Received SIP response");
             if let Some(call_id) = msg.get_header("call-id") {
@@ -552,7 +622,7 @@ impl SipCameraAccount {
     }
 
     /// Handle incoming call (e.g. from ESPHome intercom dialing doorbell)
-    async fn handle_invite(&self, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
+    async fn handle_invite(self: &Arc<Self>, req: SipMessage, peer_addr: SocketAddr) -> Result<()> {
         let call_id = req.get_header("call-id").unwrap_or("unknown").to_string();
         info!(
             call_id = %call_id,
@@ -560,6 +630,24 @@ impl SipCameraAccount {
             stream = %self.config.stream_name,
             "Incoming SIP call received"
         );
+
+        // 0. Check if account is already in an active call
+        {
+            let active = self.active_call.lock().await;
+            if let Some(ref current) = *active {
+                if current.call_id != call_id {
+                    warn!(
+                        new_call_id = %call_id,
+                        active_call_id = %current.call_id,
+                        stream = %self.config.stream_name,
+                        "Rejecting incoming call with 486 Busy Here: account already in active call"
+                    );
+                    let busy_resp = self.create_reply(&req, 486, "Busy Here");
+                    self.socket.send_to(busy_resp.serialize().as_bytes(), peer_addr).await?;
+                    return Ok(());
+                }
+            }
+        }
 
         // 1. Send 100 Trying
         let trying = self.create_reply(&req, 100, "Trying");
@@ -622,8 +710,29 @@ impl SipCameraAccount {
             }
         });
 
+        // Construct dialog info for incoming call
+        let from_hdr = req.get_header("from").unwrap_or("");
+        let (remote_uri, remote_tag) = extract_uri_and_tag(from_hdr);
+        let to_hdr = req.get_header("to").unwrap_or("");
+        let (local_uri, _) = extract_uri_and_tag(to_hdr);
+        let contact_hdr = req.get_header("contact");
+        let request_uri = contact_hdr
+            .map(|c| extract_uri_and_tag(c).0)
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| remote_uri.clone());
+
+        let dialog = SipDialog {
+            call_id: call_id.clone(),
+            peer_addr,
+            request_uri,
+            local_uri,
+            remote_uri,
+            local_tag: self.local_tag.clone(),
+            remote_tag,
+        };
+
         // 4. Start media bridge session using high-resolution primary camera stream
-        let session = SipCallSession::start(
+        let mut session = SipCallSession::start(
             call_id.clone(),
             Arc::clone(&self.stream),
             self.rtsp_port,
@@ -639,13 +748,40 @@ impl SipCameraAccount {
             negotiated_video_pt,
         )
         .await?;
+        session.set_dialog(dialog);
 
         let local_audio_port = session.local_audio_port;
         let local_video_port = session.local_video_port;
 
         // Store active call
-        let mut active = self.active_call.lock().await;
-        *active = Some(session);
+        {
+            let mut active = self.active_call.lock().await;
+            *active = Some(session);
+        }
+
+        // Spawn maximum call duration watchdog
+        let call_account = Arc::clone(self);
+        let call_id_timeout = call_id.clone();
+        let max_secs = self.config.max_call_duration_secs.unwrap_or(180);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(max_secs)).await;
+            let mut active = call_account.active_call.lock().await;
+            if let Some(session) = active.as_ref()
+                && session.call_id == call_id_timeout {
+                    warn!(
+                        call_id = %call_id_timeout,
+                        stream = %call_account.config.stream_name,
+                        max_secs = max_secs,
+                        "Inbound SIP call reached maximum duration limit; terminating with BYE"
+                    );
+                    if let Some(mut session) = active.take() {
+                        if let Some(ref dialog) = session.dialog {
+                            let _ = call_account.send_bye(dialog).await;
+                        }
+                        session.stop().await;
+                    }
+                }
+        });
 
         // Extract sprop-parameter-sets from video track if native H.264 is available
         let mut sprop = None;
@@ -697,9 +833,11 @@ impl SipCameraAccount {
         info!(call_id = %call_id, "SIP call terminated by peer (BYE)");
 
         let mut active = self.active_call.lock().await;
-        if let Some(mut session) = active.take() {
-            session.stop().await;
-        }
+        if let Some(current) = active.as_ref()
+            && (current.call_id == call_id || call_id == "unknown") {
+                let mut session = active.take().unwrap();
+                session.stop().await;
+            }
 
         let ok_resp = self.create_reply(&req, 200, "OK");
         self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
@@ -711,10 +849,13 @@ impl SipCameraAccount {
         let ok_resp = self.create_reply(&req, 200, "OK");
         self.socket.send_to(ok_resp.serialize().as_bytes(), peer_addr).await?;
 
+        let call_id = req.get_header("call-id").unwrap_or("unknown");
         let mut active = self.active_call.lock().await;
-        if let Some(mut session) = active.take() {
-            session.stop().await;
-        }
+        if let Some(current) = active.as_ref()
+            && (current.call_id == call_id || call_id == "unknown") {
+                let mut session = active.take().unwrap();
+                session.stop().await;
+            }
         Ok(())
     }
 
@@ -735,14 +876,14 @@ impl SipCameraAccount {
     }
 
     /// Trigger an outbound call to an extension or ring group (e.g. Doorbell button pressed)
-    pub async fn trigger_outbound_call(&self, target_extension: &str) -> Result<()> {
+    pub async fn trigger_outbound_call(self: &Arc<Self>, target_extension: &str) -> Result<()> {
         self.originate_parallel_call(&[target_extension.to_string()]).await
     }
 
     /// Place a parallel fork / conference call to multiple intercom targets.
     /// Rings all target screens in parallel with camera video + audio.
     /// The first target to answer wins, and all other ringing targets are cancelled.
-    pub async fn originate_parallel_call(&self, targets: &[String]) -> Result<()> {
+    pub async fn originate_parallel_call(self: &Arc<Self>, targets: &[String]) -> Result<()> {
         if targets.is_empty() {
             bail!("No targets provided for outbound parallel call");
         }
@@ -1002,7 +1143,7 @@ impl SipCameraAccount {
             });
 
             // 3. Connect audio/video media session
-            let session = SipCallSession::start_with_sockets(
+            let mut session = SipCallSession::start_with_sockets(
                 winning_leg.call_id.clone(),
                 Arc::clone(&self.stream),
                 self.rtsp_port,
@@ -1020,8 +1161,51 @@ impl SipCameraAccount {
                 negotiated_video_pt,
             ).await?;
 
+            let to_hdr = resp.get_header("to").unwrap_or(&winning_leg.to_uri);
+            let (remote_uri, remote_tag) = extract_uri_and_tag(to_hdr);
+            let contact_hdr = resp.get_header("contact");
+            let request_uri = contact_hdr
+                .map(|c| extract_uri_and_tag(c).0)
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| winning_leg.to_uri.clone());
+
+            let dialog = SipDialog {
+                call_id: winning_leg.call_id.clone(),
+                peer_addr: winning_leg.target_addr,
+                request_uri,
+                local_uri: winning_leg.from_uri.clone(),
+                remote_uri,
+                local_tag: self.local_tag.clone(),
+                remote_tag,
+            };
+            session.set_dialog(dialog);
+
             *self.active_call.lock().await = Some(session);
             info!(target = %winning_leg.target_addr, stream = %self.config.stream_name, "Bidirectional intercom call connected!");
+
+            // Spawn maximum call duration watchdog
+            let call_account = Arc::clone(self);
+            let call_id_timeout = winning_leg.call_id.clone();
+            let max_secs = self.config.max_call_duration_secs.unwrap_or(180);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(max_secs)).await;
+                let mut active = call_account.active_call.lock().await;
+                if let Some(session) = active.as_ref()
+                    && session.call_id == call_id_timeout {
+                        warn!(
+                            call_id = %call_id_timeout,
+                            stream = %call_account.config.stream_name,
+                            max_secs = max_secs,
+                            "Outbound SIP call reached maximum duration limit; terminating with BYE"
+                        );
+                        if let Some(mut session) = active.take() {
+                            if let Some(ref dialog) = session.dialog {
+                                let _ = call_account.send_bye(dialog).await;
+                            }
+                            session.stop().await;
+                        }
+                    }
+            });
 
             // 4. Cancel all other ringing legs
             for (k, other_leg) in legs.iter().enumerate() {
@@ -1090,5 +1274,58 @@ impl SipCameraAccount {
         }
         resp.set_header("User-Agent", "rust2rtc");
         resp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_uri_and_tag() {
+        let (uri, tag) = extract_uri_and_tag(r#""Living Room 1" <sip:105@198.51.100.4>;tag=719bf1add5545bcc"#);
+        assert_eq!(uri, "sip:105@198.51.100.4");
+        assert_eq!(tag, Some("719bf1add5545bcc".to_string()));
+
+        let (uri, tag) = extract_uri_and_tag("<sip:camera_doorbell@198.51.100.4:35720>");
+        assert_eq!(uri, "sip:camera_doorbell@198.51.100.4:35720");
+        assert_eq!(tag, None);
+
+        let (uri, tag) = extract_uri_and_tag("sip:101@198.51.100.4;transport=udp");
+        assert_eq!(uri, "sip:101@198.51.100.4");
+        assert_eq!(tag, None);
+
+        let (uri, tag) = extract_uri_and_tag("<sip:101@198.51.100.4>;tag=localtag123;transport=udp");
+        assert_eq!(uri, "sip:101@198.51.100.4");
+        assert_eq!(tag, Some("localtag123".to_string()));
+    }
+
+    #[test]
+    fn test_sip_dialog_construction() {
+        let dialog = SipDialog {
+            call_id: "call-1234@198.51.100.4".to_string(),
+            peer_addr: "198.51.100.4:5060".parse().unwrap(),
+            request_uri: "sip:105@198.51.100.4:5060".to_string(),
+            local_uri: "sip:101@198.51.100.4".to_string(),
+            remote_uri: "sip:105@198.51.100.4".to_string(),
+            local_tag: "localtag".to_string(),
+            remote_tag: Some("remotetag".to_string()),
+        };
+
+        let mut bye = SipMessage::new_request(SipMethod::Bye, &dialog.request_uri);
+        bye.set_header("Via", "SIP/2.0/UDP 198.51.100.4:5060;branch=z9hG4bK-test;rport");
+        bye.set_header("From", &format!(r#""Front Doorbell" <{}>;tag={}"#, dialog.local_uri, dialog.local_tag));
+        bye.set_header("To", &format!("<{}>;tag={}", dialog.remote_uri, dialog.remote_tag.as_ref().unwrap()));
+        bye.set_header("Call-ID", &dialog.call_id);
+        bye.set_header("CSeq", "2 BYE");
+        bye.set_header("Max-Forwards", "70");
+        bye.set_header("User-Agent", "rust2rtc");
+
+        let serialized = bye.serialize();
+        assert!(serialized.starts_with("BYE sip:105@198.51.100.4:5060 SIP/2.0\r\n"));
+        assert!(serialized.contains("Call-ID: call-1234@198.51.100.4\r\n"));
+        assert!(serialized.contains("CSeq: 2 BYE\r\n"));
+        assert!(serialized.contains("To: <sip:105@198.51.100.4>;tag=remotetag\r\n"));
+        assert!(serialized.contains("From: \"Front Doorbell\" <sip:101@198.51.100.4>;tag=localtag\r\n"));
     }
 }

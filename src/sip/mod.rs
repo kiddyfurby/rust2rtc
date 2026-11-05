@@ -92,6 +92,15 @@ impl SipManager {
         account.trigger_outbound_call(&destination).await
     }
 
+    /// Hang up an active call for a specific stream
+    pub async fn hangup(&self, stream_name: &str) -> Result<()> {
+        let accounts = self.accounts.read().await;
+        let account = accounts
+            .get(stream_name)
+            .ok_or_else(|| anyhow::anyhow!("No SIP account registered for stream '{}'", stream_name))?;
+        account.hangup().await
+    }
+
     /// Trigger doorbell call according to DoorbellConfig (parallel SIP targets or HA destination)
     pub async fn trigger_doorbell_call(&self, stream_name: &str, config: &crate::config::DoorbellConfig) -> Result<()> {
         let accounts = self.accounts.read().await;

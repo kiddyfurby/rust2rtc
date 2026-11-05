@@ -112,6 +112,8 @@ pub struct SipConfig {
     #[serde(default)]
     pub names: HashMap<String, String>,
     #[serde(default)]
+    pub max_call_duration_secs: Option<u64>,
+    #[serde(default)]
     pub accounts: HashMap<String, SipAccountYamlConfig>,
 }
 
@@ -129,6 +131,8 @@ pub struct SipAccountYamlConfig {
     pub ring_group: Option<String>,
     #[serde(default = "default_auto_answer")]
     pub auto_answer: bool,
+    #[serde(default)]
+    pub max_call_duration_secs: Option<u64>,
 }
 
 fn default_base_extension() -> u16 {
