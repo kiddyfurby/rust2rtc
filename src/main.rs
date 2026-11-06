@@ -126,17 +126,28 @@ fn main() -> Result<()> {
         .unwrap_or(1);
     let worker_threads = config.worker_threads.unwrap_or(affined_cores).max(1);
 
+    info!(
+        "Starting rust2rtc v{} with {} worker threads (detected {} affined CPU cores)",
+        env!("CARGO_PKG_VERSION"),
+        worker_threads,
+        affined_cores
+    );
+
     if config.worker_threads.is_some() {
         info!(
             worker_threads = worker_threads,
             affined_cores = affined_cores,
-            "Tokio runtime worker threads configured from rust2rtc.yaml"
+            "Tokio runtime configured with {} worker threads (explicitly set via worker_threads in config, affined cores: {})",
+            worker_threads,
+            affined_cores
         );
     } else {
         info!(
             worker_threads = worker_threads,
             affined_cores = affined_cores,
-            "Tokio runtime worker threads defaulting to affined core count (set 'worker_threads' in rust2rtc.yaml to override)"
+            "Tokio runtime configured with {} worker threads (defaulted to affined core count: {}; set 'worker_threads' in rust2rtc.yaml to override)",
+            worker_threads,
+            affined_cores
         );
     }
 
