@@ -397,7 +397,30 @@ sip:
 
 ## 📝 Changelog & Release History
 
-### v0.5.0 (Current)
+### v0.6.0 (Current)
+- **⚡ Dependency Pruning & Pure-Rust Architecture**:
+  - Removed `webrtc-rs` and its dependencies in favor of pure `rustrtc`, drastically reducing binary weight and compile times.
+  - Adopted `mimalloc` as global memory allocator, eliminating heap fragmentation and lowering RSS under sustained 24/7 load.
+- **🚀 High-Throughput Low-Latency RTSP Relay**:
+  - Merged interleaved header (`$`) and payload RTP writes into single vectored operations, cutting syscalls in half and eliminating Nagle / delayed-ACK transmission stalls.
+  - Added explicit socket `TCP_NODELAY` on accepted client connections.
+  - Resilient subscriber lag recovery: automatically seeks ahead to the next IDR keyframe and re-injects parameter sets (SPS/PPS/VPS) instead of stalling or dropping streams.
+- **⚡ Instant Video Startup & GOP Caching**:
+  - WebRTC and RTSP subscribers receive instant replay of cached keyframe and GOP parameter sets on connect, eliminating delays waiting for camera IDR cycles.
+- **💾 Asynchronous Non-Blocking Recorder**:
+  - Offloaded standalone MP4 generation and segment file I/O to dedicated asynchronous writer channels, preventing broadcast lag and packet drops.
+  - Zero-copy `Bytes` slicing across the depacketizer and MP4 muxer pipelines with preserved capacity buffers.
+- **🌐 Zero-Copy Per-Viewer WebRTC Forwarding**:
+  - Deduplicated SPS/PPS parameter set inspection across viewers; forwarders read pre-parsed sets directly from shared tracks.
+  - Zero-copy payload passthrough avoiding redundant allocations and unnecessary FU-A fragmentation.
+- **📸 Coalesced In-Process Snapshot Pipeline**:
+  - Coalesces concurrent snapshot requests into single operations with ~1s result caching.
+  - Feeds cached IDR keyframes directly to FFmpeg stdin, eliminating loopback RTSP re-ingest overhead.
+- **⚙️ Runtime & Concurrency Tuning**:
+  - Configurable `worker_threads` in `rust2rtc.yaml` with automatic affined CPU core detection respecting container `cpuset` (cgroups v1/v2 & `/proc/self/status`).
+  - Optimized release build profile with fat LTO, single codegen unit, and binary symbol stripping.
+
+### v0.5.0
 - **🎙️ WebRTC Full-Duplex Two-Way Talkback**:
   - Pure-Rust in-process `OpusToG711Decoder` automatically decodes incoming Opus audio from browser microphones / Home Assistant cards (`a=sendrecv`) down to 8kHz G.711 $\mu$-law/A-law.
   - Relays audio directly into camera RTSP backchannel sessions in real time across both `webrtc-rs` and `rustrtc` engines.
