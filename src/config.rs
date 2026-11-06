@@ -6,6 +6,8 @@ use std::path::Path;
 #[derive(Default)]
 pub struct Config {
     #[serde(default)]
+    pub worker_threads: Option<usize>,
+    #[serde(default)]
     pub streams: HashMap<String, StreamConfig>,
     #[serde(default)]
     pub api: ApiConfig,
@@ -247,6 +249,9 @@ impl Config {
     }
 
     pub fn merge(&mut self, other: Config) {
+        if other.worker_threads.is_some() {
+            self.worker_threads = other.worker_threads;
+        }
         for (name, stream) in other.streams {
             self.streams.insert(name, stream);
         }
@@ -353,5 +358,17 @@ ffmpeg:
         assert_eq!(rec.dir, "/tmp/cache");
         assert_eq!(rec.segment_duration, 10);
         assert!(rec.streams.is_empty());
+    }
+
+    #[test]
+    fn test_worker_threads_config() {
+        let yaml = "worker_threads: 4\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.worker_threads, Some(4));
+
+        let mut base = Config::default();
+        assert_eq!(base.worker_threads, None);
+        base.merge(cfg);
+        assert_eq!(base.worker_threads, Some(4));
     }
 }

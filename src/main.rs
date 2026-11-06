@@ -48,8 +48,7 @@ fn normalize_args() -> Vec<String> {
         .collect()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let exe = raw_args.first().map(|s| s.as_str()).unwrap_or("");
     if exe.ends_with("ffmpeg") || raw_args.get(1).map(|s| s.as_str()) == Some("ffmpeg-shim") {
@@ -119,6 +118,34 @@ async fn main() -> Result<()> {
         info!("No configuration files loaded, using default config");
     }
 
+    let affined_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let worker_threads = config.worker_threads.unwrap_or(affined_cores).max(1);
+
+    if config.worker_threads.is_some() {
+        info!(
+            worker_threads = worker_threads,
+            affined_cores = affined_cores,
+            "Tokio runtime worker threads configured from rust2rtc.yaml"
+        );
+    } else {
+        info!(
+            worker_threads = worker_threads,
+            affined_cores = affined_cores,
+            "Tokio runtime worker threads defaulting to affined core count (set 'worker_threads' in rust2rtc.yaml to override)"
+        );
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .build()?;
+
+    runtime.block_on(async_main(config))
+}
+
+async fn async_main(config: Config) -> Result<()> {
     let ffmpeg_manager = Arc::new(FfmpegManager::new(
         config.ffmpeg.bin.clone(),
         config.ffmpeg.global.clone(),
