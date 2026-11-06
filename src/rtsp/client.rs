@@ -258,6 +258,9 @@ impl RtspClient {
         );
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let read_timeout = tokio::time::sleep(Duration::from_secs(8));
+        tokio::pin!(read_timeout);
+
         loop {
             // Process all buffered binary packets first
             while !buffer.is_empty() && buffer[0] == b'$' {
@@ -279,10 +282,11 @@ impl RtspClient {
                 let packet_bytes = buffer.split_to(length).freeze();
 
                 // Channel is RTP
+                let packet_len = packet_bytes.len() as u64;
                 if let Some(track) = channel_map.get(&ch)
-                    && let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
+                    && let Some(rtp) = RtpPacket::parse(packet_bytes) {
                         stream.packets_recv.fetch_add(1, Ordering::Relaxed);
-                        stream.bytes_recv.fetch_add(packet_bytes.len() as u64, Ordering::Relaxed);
+                        stream.bytes_recv.fetch_add(packet_len, Ordering::Relaxed);
                         track.send(rtp);
                     }
             }
@@ -379,24 +383,24 @@ impl RtspClient {
                             ).await;
                         }
                 }
-                read_res = tokio::time::timeout(Duration::from_secs(8), tcp.read_buf(&mut buffer)) => {
-                    match read_res {
-                        Ok(Ok(0)) => {
+                res = tcp.read_buf(&mut buffer) => {
+                    match res {
+                        Ok(0) => {
                             warn!(stream = %stream.name, "RTSP connection reached EOF");
                             return Ok(false);
                         }
-                        Ok(Ok(_)) => {
-                            // Loop around to process buffered data
+                        Ok(_) => {
+                            read_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(8));
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             warn!(stream = %stream.name, "RTSP TCP socket read error: {}", e);
                             return Err(e.into());
                         }
-                        Err(_) => {
-                            warn!(stream = %stream.name, "RTSP stream read timeout (no packets for 8s), reconnecting");
-                            return Ok(false);
-                        }
                     }
+                }
+                _ = &mut read_timeout => {
+                    warn!(stream = %stream.name, "RTSP stream read timeout (no packets for 8s), reconnecting");
+                    return Ok(false);
                 }
             }
         }
@@ -506,12 +510,13 @@ impl RtspClient {
                 let _len = buffer.get_u16();
                 let packet_bytes = buffer.split_to(length).freeze();
 
+                let packet_len = packet_bytes.len() as u64;
                 if let Some(cmap) = channel_map
                     && let Some(track) = cmap.get(&ch)
-                        && let Some(rtp) = RtpPacket::parse(packet_bytes.clone()) {
+                        && let Some(rtp) = RtpPacket::parse(packet_bytes) {
                             if let Some(st) = stream {
                                 st.packets_recv.fetch_add(1, Ordering::Relaxed);
-                                st.bytes_recv.fetch_add(packet_bytes.len() as u64, Ordering::Relaxed);
+                                st.bytes_recv.fetch_add(packet_len, Ordering::Relaxed);
                             }
                             track.send(rtp);
                         }
