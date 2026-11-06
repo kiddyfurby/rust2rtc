@@ -51,6 +51,76 @@ fn normalize_args() -> Vec<String> {
         .collect()
 }
 
+fn parse_cpuset_list(s: &str) -> Option<usize> {
+    let mut total = 0;
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let start: usize = start.trim().parse().ok()?;
+            let end: usize = end.trim().parse().ok()?;
+            if end >= start {
+                total += end - start + 1;
+            }
+        } else {
+            let _cpu: usize = part.parse().ok()?;
+            total += 1;
+        }
+    }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn detect_cpus_allowed_from_proc_status() -> Option<usize> {
+    let content = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(list_str) = line.strip_prefix("Cpus_allowed_list:") {
+            return parse_cpuset_list(list_str);
+        }
+    }
+    None
+}
+
+fn detect_cpus_from_cgroup() -> Option<usize> {
+    let candidate_paths = [
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset.cpus",
+        "/sys/fs/cgroup/cpuset/cpuset.cpus",
+    ];
+    for path in candidate_paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                if let Some(count) = parse_cpuset_list(trimmed) {
+                    return Some(count);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_available_cores() -> usize {
+    let mut detected = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    if let Some(proc_cpus) = detect_cpus_allowed_from_proc_status() {
+        detected = detected.min(proc_cpus);
+    }
+
+    if let Some(cgroup_cpus) = detect_cpus_from_cgroup() {
+        detected = detected.min(cgroup_cpus);
+    }
+
+    detected.max(1)
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let exe = raw_args.first().map(|s| s.as_str()).unwrap_or("");
@@ -121,9 +191,7 @@ fn main() -> Result<()> {
         info!("No configuration files loaded, using default config");
     }
 
-    let affined_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let affined_cores = detect_available_cores();
     let worker_threads = config.worker_threads.unwrap_or(affined_cores).max(1);
 
     info!(
@@ -486,4 +554,21 @@ impl AddPortStr for String {
         format!("{}:{}", self, port).to_socket_addrs()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cpuset_list() {
+        assert_eq!(parse_cpuset_list("4-6"), Some(3));
+        assert_eq!(parse_cpuset_list("0,2,4-6"), Some(5));
+        assert_eq!(parse_cpuset_list("0-7"), Some(8));
+        assert_eq!(parse_cpuset_list("3"), Some(1));
+        assert_eq!(parse_cpuset_list(""), None);
+        assert_eq!(parse_cpuset_list("invalid"), None);
+        assert_eq!(parse_cpuset_list("0-3,7,9-11"), Some(8));
+    }
+}
+
 
