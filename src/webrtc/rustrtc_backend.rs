@@ -397,36 +397,6 @@ impl RustRtcSession {
                 let mut last_keyframe_ts: Option<u32> = None;
                 let mut connected_fired = false;
 
-                let mut cached_h264_sps: Option<Vec<u8>> = None;
-                let mut cached_h264_pps: Option<Vec<u8>> = None;
-                let mut cached_h265_vps: Option<Vec<u8>> = None;
-                let mut cached_h265_sps: Option<Vec<u8>> = None;
-                let mut cached_h265_pps: Option<Vec<u8>> = None;
-
-                // Pre-generate parameter sets packets (STAP-A for H264, individual VPS/SPS/PPS for H265) if available
-                let mut param_set_packets = if let Some(ref fmtp) = video_track.codec.fmtp {
-                    if is_hevc {
-                        crate::core::extract_h265_vps_sps_pps(fmtp)
-                            .map(|(vps, sps, pps)| {
-                                cached_h265_vps = Some(vps.clone());
-                                cached_h265_sps = Some(sps.clone());
-                                cached_h265_pps = Some(pps.clone());
-                                vec![vps, sps, pps]
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        crate::core::extract_h264_sps_pps(fmtp)
-                            .map(|(sps, pps)| {
-                                cached_h264_sps = Some(sps.clone());
-                                cached_h264_pps = Some(pps.clone());
-                                vec![crate::core::build_h264_stap_a(&sps, &pps)]
-                            })
-                            .unwrap_or_default()
-                    }
-                } else {
-                    Vec::new()
-                };
-
                 let cached_gop = video_track.get_gop_packets();
                 if !cached_gop.is_empty() {
                     tracing::info!(
@@ -477,59 +447,6 @@ impl RustRtcSession {
                     let (is_keyframe, is_param_set) =
                         crate::core::is_keyframe_or_param_set(is_hevc, payload_slice);
 
-                    // Dynamically cache parameter sets seen in stream
-                    if is_param_set {
-                        if !is_hevc {
-                            let nalu_type = payload_slice[0] & 0x1F;
-                            if nalu_type == 7 {
-                                cached_h264_sps = Some(payload_slice.to_vec());
-                            } else if nalu_type == 8 {
-                                cached_h264_pps = Some(payload_slice.to_vec());
-                            } else if nalu_type == 24 {
-                                param_set_packets = vec![payload_slice.to_vec()];
-                            }
-                            if let (Some(sps), Some(pps)) = (&cached_h264_sps, &cached_h264_pps) {
-                                param_set_packets = vec![crate::core::build_h264_stap_a(sps, pps)];
-                            }
-                        } else {
-                            let nalu_type = (payload_slice[0] >> 1) & 0x3F;
-                            if nalu_type == 32 {
-                                cached_h265_vps = Some(payload_slice.to_vec());
-                            } else if nalu_type == 33 {
-                                cached_h265_sps = Some(payload_slice.to_vec());
-                            } else if nalu_type == 34 {
-                                cached_h265_pps = Some(payload_slice.to_vec());
-                            } else if nalu_type == 48 {
-                                let unpacked = crate::core::unpack_h265_ap(payload_slice);
-                                for nalu in unpacked {
-                                    if !nalu.is_empty() {
-                                        let sub_type = (nalu[0] >> 1) & 0x3F;
-                                        if sub_type == 32 {
-                                            cached_h265_vps = Some(nalu);
-                                        } else if sub_type == 33 {
-                                            cached_h265_sps = Some(nalu);
-                                        } else if sub_type == 34 {
-                                            cached_h265_pps = Some(nalu);
-                                        }
-                                    }
-                                }
-                            }
-                            let mut ps = Vec::new();
-                            if let Some(ref v) = cached_h265_vps {
-                                ps.push(v.clone());
-                            }
-                            if let Some(ref s) = cached_h265_sps {
-                                ps.push(s.clone());
-                            }
-                            if let Some(ref p) = cached_h265_pps {
-                                ps.push(p.clone());
-                            }
-                            if !ps.is_empty() {
-                                param_set_packets = ps;
-                            }
-                        }
-                    }
-
                     if !sent_first_keyframe {
                         if !is_keyframe {
                             continue;
@@ -540,23 +457,26 @@ impl RustRtcSession {
                     if is_keyframe && last_keyframe_ts != Some(packet.timestamp) {
                         last_keyframe_ts = Some(packet.timestamp);
                         if !last_was_param_set {
-                            for ps_bytes in &param_set_packets {
-                                let ps_frame = rustrtc::media::frame::VideoFrame {
-                                    rtp_timestamp: packet.timestamp,
-                                    width: 0,
-                                    height: 0,
-                                    format: rustrtc::media::VideoPixelFormat::Unspecified,
-                                    rotation_deg: 0,
-                                    is_last_packet: false,
-                                    data: bytes::Bytes::copy_from_slice(ps_bytes),
-                                    header_extension: None,
-                                    csrcs: vec![],
-                                    sequence_number: None,
-                                    payload_type: Some(actual_video_pt),
-                                    source_addr: None,
-                                    raw_packet: None,
-                                };
-                                let _ = v_source.send_video(ps_frame);
+                            let ps_pkts = video_track.get_param_sets();
+                            for ps_pkt in &ps_pkts {
+                                if ps_pkt.payload_offset + ps_pkt.payload_len <= ps_pkt.raw.len() && ps_pkt.payload_len > 0 {
+                                    let ps_frame = rustrtc::media::frame::VideoFrame {
+                                        rtp_timestamp: packet.timestamp,
+                                        width: 0,
+                                        height: 0,
+                                        format: rustrtc::media::VideoPixelFormat::Unspecified,
+                                        rotation_deg: 0,
+                                        is_last_packet: false,
+                                        data: ps_pkt.raw.slice(ps_pkt.payload_offset..ps_pkt.payload_offset + ps_pkt.payload_len),
+                                        header_extension: None,
+                                        csrcs: vec![],
+                                        sequence_number: None,
+                                        payload_type: Some(actual_video_pt),
+                                        source_addr: None,
+                                        raw_packet: None,
+                                    };
+                                    let _ = v_source.send_video(ps_frame);
+                                }
                             }
                         }
                     }
