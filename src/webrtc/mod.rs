@@ -44,16 +44,28 @@ pub struct WebRtcManager {
     pub rtsp_port: u16,
     #[allow(dead_code)]
     pub ffmpeg_bin: String,
+    pub max_payload_size: usize,
     pub sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, ActivePeerConnection>>>,
 }
 
 impl WebRtcManager {
     pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String, engine: String) -> Self {
+        Self::with_max_payload_size(candidates, rtsp_port, ffmpeg_bin, engine, 1200)
+    }
+
+    pub fn with_max_payload_size(
+        candidates: Vec<String>,
+        rtsp_port: u16,
+        ffmpeg_bin: String,
+        engine: String,
+        max_payload_size: usize,
+    ) -> Self {
         Self {
             engine,
             candidates,
             rtsp_port,
             ffmpeg_bin,
+            max_payload_size,
             sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
@@ -84,9 +96,10 @@ impl WebRtcManager {
             Arc::clone(&stream),
             offer_sdp,
             &self.candidates,
+            self.max_payload_size,
         )
         .await?;
-        rustrtc_session.start_forwarding(Arc::clone(&stream), is_stream_hevc, &answer_sdp);
+        rustrtc_session.start_forwarding(Arc::clone(&stream), is_stream_hevc, &answer_sdp, self.max_payload_size);
         let session_id = rustrtc_session.session_id.clone();
         let mut keeper_rx = rustrtc_session.close_tx.subscribe();
         let session_arc = Arc::new(rustrtc_session);
@@ -216,52 +229,86 @@ pub use crate::core::{
     is_keyframe_or_param_set, unpack_h265_ap,
 };
 
-/// Re-fragment oversized video payloads into safe MTU slices (<= 1180 bytes)
-/// to prevent IP fragmentation and UDP packet loss across WebRTC paths.
-pub fn fragment_payload_for_webrtc(
+/// Forward WebRTC video payload directly into a sink closure without allocating intermediate vectors.
+/// Passes through with zero-copy `raw.slice(..)` when the payload fits within `max_chunk` (default 1200),
+/// preventing unnecessary SRTP packet doubling and avoiding heap allocations on live streams.
+pub fn forward_webrtc_payload<F: FnMut(Bytes, bool) -> bool>(
     is_hevc: bool,
-    payload: &[u8],
+    raw_packet: &Bytes,
+    payload_offset: usize,
+    payload_len: usize,
     marker: bool,
-) -> Vec<(Bytes, bool)> {
-    const MAX_CHUNK: usize = 1170; // Guaranteed safe under 1280 MTU with IP/UDP/SRTP headers
+    max_chunk: usize,
+    mut emit: F,
+) -> bool {
+    forward_webrtc_payload_inner(
+        is_hevc,
+        raw_packet,
+        payload_offset,
+        payload_len,
+        marker,
+        max_chunk,
+        &mut emit,
+    )
+}
 
-    if payload.is_empty() {
-        return Vec::new();
+fn forward_webrtc_payload_inner(
+    is_hevc: bool,
+    raw_packet: &Bytes,
+    payload_offset: usize,
+    payload_len: usize,
+    marker: bool,
+    max_chunk: usize,
+    emit: &mut dyn FnMut(Bytes, bool) -> bool,
+) -> bool {
+    if payload_len == 0 || payload_offset + payload_len > raw_packet.len() {
+        return true;
     }
+    let payload = &raw_packet[payload_offset..payload_offset + payload_len];
 
     // For H.265, unpack Aggregation Packets (NAL 48) into individual Single NAL Unit packets
     // so SRST WebRTC receivers (Chromium/Safari) decode VPS/SPS/PPS reliably, and ensure marker=false on parameter sets.
     if is_hevc {
         let nalu_type = (payload[0] >> 1) & 0x3F;
         if nalu_type == 48 {
-            let sub_nals = unpack_h265_ap(payload);
-            let mut out = Vec::with_capacity(sub_nals.len());
-            for (i, nalu) in sub_nals.into_iter().enumerate() {
-                if nalu.is_empty() {
-                    continue;
+            let mut offset = 2;
+            let mut sub_nals = Vec::new();
+            while offset + 2 <= payload_len {
+                let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if size > 0 && offset + size <= payload_len {
+                    sub_nals.push((payload_offset + offset, size));
+                    offset += size;
+                } else {
+                    break;
                 }
-                let sub_type = (nalu[0] >> 1) & 0x3F;
-                // Parameter sets (32, 33, 34) and SEI (39, 40) must have marker=false
-                let is_ps_or_sei = matches!(sub_type, 32 | 33 | 34 | 39 | 40);
-                let sub_marker = if is_ps_or_sei { false } else { marker && i == 0 };
-                out.extend(fragment_payload_for_webrtc(true, &nalu, sub_marker));
             }
-            return out;
-        } else if matches!(nalu_type, 32 | 33 | 34 | 39 | 40) && payload.len() <= MAX_CHUNK {
-            return vec![(Bytes::copy_from_slice(payload), false)];
+            let total = sub_nals.len();
+            for (i, (sub_off, sub_len)) in sub_nals.into_iter().enumerate() {
+                let sub_payload = &raw_packet[sub_off..sub_off + sub_len];
+                let sub_type = (sub_payload[0] >> 1) & 0x3F;
+                let is_ps_or_sei = matches!(sub_type, 32 | 33 | 34 | 39 | 40);
+                let sub_marker = if is_ps_or_sei { false } else { marker && i == total - 1 };
+                if !forward_webrtc_payload_inner(true, raw_packet, sub_off, sub_len, sub_marker, max_chunk, emit) {
+                    return false;
+                }
+            }
+            return true;
+        } else if matches!(nalu_type, 32 | 33 | 34 | 39 | 40) && payload_len <= max_chunk {
+            return emit(raw_packet.slice(payload_offset..payload_offset + payload_len), false);
         }
     }
 
-    if payload.len() <= MAX_CHUNK {
-        return vec![(Bytes::copy_from_slice(payload), marker)];
+    // Zero-copy passthrough when payload fits within max_chunk
+    if payload_len <= max_chunk {
+        return emit(raw_packet.slice(payload_offset..payload_offset + payload_len), marker);
     }
 
-    let mut result = Vec::new();
-
+    // Re-fragment oversized video payloads only when they exceed max_chunk
     if !is_hevc {
         // H.264 (RFC 6184)
         let nalu_type = payload[0] & 0x1F;
-        if nalu_type == 28 && payload.len() >= 2 {
+        if nalu_type == 28 && payload_len >= 2 {
             // FU-A packet
             let indicator = payload[0];
             let fu_header = payload[1];
@@ -270,7 +317,8 @@ pub fn fragment_payload_for_webrtc(
             let r_and_type = fu_header & 0x3F;
 
             let data = &payload[2..];
-            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 2).collect();
+            let chunk_size = max_chunk.saturating_sub(2).max(1);
+            let chunks: Vec<_> = data.chunks(chunk_size).collect();
             let total = chunks.len();
 
             for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -286,16 +334,19 @@ pub fn fragment_payload_for_webrtc(
                 out.push(indicator);
                 out.push(new_fu);
                 out.extend_from_slice(chunk);
-                result.push((Bytes::from(out), is_last && marker));
+                if !emit(Bytes::from(out), is_last && marker) {
+                    return false;
+                }
             }
-        } else if nalu_type < 24 && payload.len() > 1 {
+        } else if nalu_type < 24 && payload_len > 1 {
             // Single NAL unit needing fragmentation into FU-A
             let nal_header = payload[0];
             let indicator = (nal_header & 0xE0) | 28;
             let nal_type = nal_header & 0x1F;
 
             let data = &payload[1..];
-            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 2).collect();
+            let chunk_size = max_chunk.saturating_sub(2).max(1);
+            let chunks: Vec<_> = data.chunks(chunk_size).collect();
             let total = chunks.len();
 
             for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -309,16 +360,17 @@ pub fn fragment_payload_for_webrtc(
                 out.push(indicator);
                 out.push(new_fu);
                 out.extend_from_slice(chunk);
-                result.push((Bytes::from(out), is_last && marker));
+                if !emit(Bytes::from(out), is_last && marker) {
+                    return false;
+                }
             }
         } else {
-            // STAP-A or unknown; pass through
-            result.push((Bytes::copy_from_slice(payload), marker));
+            return emit(raw_packet.slice(payload_offset..payload_offset + payload_len), marker);
         }
     } else {
         // H.265 (HEVC RFC 7798)
         let nalu_type = (payload[0] >> 1) & 0x3F;
-        if nalu_type == 49 && payload.len() >= 3 {
+        if nalu_type == 49 && payload_len >= 3 {
             // Fragmentation Unit (FU)
             let h0 = payload[0];
             let h1 = payload[1];
@@ -328,7 +380,8 @@ pub fn fragment_payload_for_webrtc(
             let fu_type = fu_header & 0x3F;
 
             let data = &payload[3..];
-            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 3).collect();
+            let chunk_size = max_chunk.saturating_sub(3).max(1);
+            let chunks: Vec<_> = data.chunks(chunk_size).collect();
             let total = chunks.len();
 
             for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -345,9 +398,11 @@ pub fn fragment_payload_for_webrtc(
                 out.push(h1);
                 out.push(new_fu);
                 out.extend_from_slice(chunk);
-                result.push((Bytes::from(out), is_last && marker));
+                if !emit(Bytes::from(out), is_last && marker) {
+                    return false;
+                }
             }
-        } else if nalu_type < 48 && payload.len() > 2 {
+        } else if nalu_type < 48 && payload_len > 2 {
             // Single NAL unit needing fragmentation into FU
             let h0 = payload[0];
             let h1 = payload[1];
@@ -356,7 +411,8 @@ pub fn fragment_payload_for_webrtc(
             let nal_type = (h0 >> 1) & 0x3F;
 
             let data = &payload[2..];
-            let chunks: Vec<_> = data.chunks(MAX_CHUNK - 3).collect();
+            let chunk_size = max_chunk.saturating_sub(3).max(1);
+            let chunks: Vec<_> = data.chunks(chunk_size).collect();
             let total = chunks.len();
 
             for (idx, chunk) in chunks.into_iter().enumerate() {
@@ -371,14 +427,30 @@ pub fn fragment_payload_for_webrtc(
                 out.push(fu_h1);
                 out.push(new_fu);
                 out.extend_from_slice(chunk);
-                result.push((Bytes::from(out), is_last && marker));
+                if !emit(Bytes::from(out), is_last && marker) {
+                    return false;
+                }
             }
         } else {
-            result.push((Bytes::copy_from_slice(payload), marker));
+            return emit(raw_packet.slice(payload_offset..payload_offset + payload_len), marker);
         }
     }
+    true
+}
 
-    result
+/// Convenience wrapper for backwards compatibility and tests
+pub fn fragment_payload_for_webrtc(
+    is_hevc: bool,
+    payload: &[u8],
+    marker: bool,
+) -> Vec<(Bytes, bool)> {
+    let raw = Bytes::copy_from_slice(payload);
+    let mut out = Vec::new();
+    forward_webrtc_payload(is_hevc, &raw, 0, raw.len(), marker, 1170, |chunk, m| {
+        out.push((chunk, m));
+        true
+    });
+    out
 }
 
 #[cfg(test)]
@@ -495,5 +567,50 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         assert!(answer_sdp.contains("v=0"));
         let ActivePeerConnection::RustRtc(session) = active_pc;
         assert!(!session.session_id.is_empty());
+    }
+
+    #[test]
+    fn test_forward_webrtc_payload_passthrough_and_fragment() {
+        // 1000-byte NAL packet with 1200 limit -> passthrough
+        let mut raw = vec![0x61]; // NRI=3, Type=1
+        raw.extend(vec![0xAA; 999]);
+        let raw_bytes = Bytes::from(raw);
+
+        let mut emitted = Vec::new();
+        let ok = forward_webrtc_payload(false, &raw_bytes, 0, raw_bytes.len(), true, 1200, |chunk, marker| {
+            emitted.push((chunk, marker));
+            true
+        });
+        assert!(ok);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0.len(), 1000);
+        assert_eq!(emitted[0].1, true);
+        // Verify underlying ptr slice
+        assert_eq!(emitted[0].0.as_ptr(), raw_bytes.as_ptr());
+
+        // 1400-byte packet with 1200 limit -> re-fragmented into 2 FU-A chunks
+        let mut raw_1400 = vec![0x61];
+        raw_1400.extend(vec![0xBB; 1399]);
+        let raw_1400_bytes = Bytes::from(raw_1400);
+
+        let mut emitted_1200 = Vec::new();
+        forward_webrtc_payload(false, &raw_1400_bytes, 0, raw_1400_bytes.len(), true, 1200, |chunk, marker| {
+            emitted_1200.push((chunk, marker));
+            true
+        });
+        assert_eq!(emitted_1200.len(), 2);
+        assert!(!emitted_1200[0].1);
+        assert!(emitted_1200[1].1);
+
+        // 1400-byte packet with 1400 limit -> passthrough!
+        let mut emitted_1400 = Vec::new();
+        forward_webrtc_payload(false, &raw_1400_bytes, 0, raw_1400_bytes.len(), true, 1400, |chunk, marker| {
+            emitted_1400.push((chunk, marker));
+            true
+        });
+        assert_eq!(emitted_1400.len(), 1);
+        assert_eq!(emitted_1400[0].0.len(), 1400);
+        assert_eq!(emitted_1400[0].1, true);
+        assert_eq!(emitted_1400[0].0.as_ptr(), raw_1400_bytes.as_ptr());
     }
 }

@@ -187,11 +187,18 @@ async fn main() -> Result<()> {
 
     info!(engine = %webrtc_engine, "WebRTC engine selected");
 
-    let webrtc_manager = Arc::new(webrtc::WebRtcManager::new(
+    let webrtc_max_payload = config
+        .webrtc
+        .as_ref()
+        .and_then(|w| w.max_payload_size)
+        .unwrap_or(1200);
+
+    let webrtc_manager = Arc::new(webrtc::WebRtcManager::with_max_payload_size(
         webrtc_candidates,
         rtsp_port,
         ffmpeg_manager.bin().to_string(),
         webrtc_engine,
+        webrtc_max_payload,
     ));
 
     // Initialize SIP Manager

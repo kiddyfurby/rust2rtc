@@ -24,6 +24,7 @@ pub struct RustRtcSession {
     pub negotiated_video_pt: u8,
     pub negotiated_audio_pt: u8,
     pub audio_clock_rate: u32,
+    pub max_payload_size: usize,
 }
 
 impl RustRtcSession {
@@ -31,6 +32,7 @@ impl RustRtcSession {
         stream: Arc<Stream>,
         offer_sdp: &str,
         candidates: &[String],
+        max_payload_size: usize,
     ) -> Result<(Self, String)> {
         let offer = SessionDescription::parse(SdpType::Offer, offer_sdp)?;
 
@@ -233,7 +235,7 @@ impl RustRtcSession {
                                 if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
                                     let kf_pkts = vt.get_keyframe_packets();
                                     for pkt in &kf_pkts {
-                                        if !forward_packet_to_webrtc(&v_source_fb, pkt, negotiated_video_pt, is_stream_hevc) {
+                                        if !forward_packet_to_webrtc(&v_source_fb, pkt, negotiated_video_pt, is_stream_hevc, max_payload_size) {
                                             break;
                                         }
                                     }
@@ -356,6 +358,7 @@ impl RustRtcSession {
                 negotiated_video_pt,
                 negotiated_audio_pt,
                 audio_clock_rate,
+                max_payload_size,
             },
             answer_sdp,
         ))
@@ -367,7 +370,7 @@ impl RustRtcSession {
     }
 
     /// Spawn background video and audio forwarding workers from stream tracks
-    pub fn start_forwarding(&self, stream: Arc<Stream>, is_hevc: bool, answer_sdp: &str) {
+    pub fn start_forwarding(&self, stream: Arc<Stream>, is_hevc: bool, answer_sdp: &str, max_payload_size: usize) {
         let actual_video_pt = self.negotiated_video_pt;
         let actual_audio_pt = self.negotiated_audio_pt;
         let audio_clock_rate = self.audio_clock_rate;
@@ -405,7 +408,7 @@ impl RustRtcSession {
                         "Replaying cached GOP for instant WebRTC startup"
                     );
                     for pkt in &cached_gop {
-                        if !forward_packet_to_webrtc(&v_source, pkt, actual_video_pt, is_hevc) {
+                        if !forward_packet_to_webrtc(&v_source, pkt, actual_video_pt, is_hevc, max_payload_size) {
                             return;
                         }
                     }
@@ -483,28 +486,8 @@ impl RustRtcSession {
 
                     last_was_param_set = is_param_set;
 
-                    let chunks =
-                        super::fragment_payload_for_webrtc(is_hevc, payload_slice, packet.marker);
-                    for (chunk_bytes, chunk_marker) in chunks {
-                        let v_frame = rustrtc::media::frame::VideoFrame {
-                            rtp_timestamp: packet.timestamp,
-                            width: 0,
-                            height: 0,
-                            format: rustrtc::media::VideoPixelFormat::Unspecified,
-                            rotation_deg: 0,
-                            is_last_packet: chunk_marker,
-                            data: chunk_bytes,
-                            header_extension: None,
-                            csrcs: vec![],
-                            sequence_number: None,
-                            payload_type: Some(actual_video_pt),
-                            source_addr: None,
-                            raw_packet: None,
-                        };
-
-                        if v_source.send_video(v_frame).is_err() {
-                            return;
-                        }
+                    if !forward_packet_to_webrtc(&v_source, &packet, actual_video_pt, is_hevc, max_payload_size) {
+                        return;
                     }
                 }
             });
@@ -574,38 +557,35 @@ fn forward_packet_to_webrtc(
     packet: &crate::core::RtpPacket,
     actual_video_pt: u8,
     is_hevc: bool,
+    max_payload_size: usize,
 ) -> bool {
-    let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
-        &packet.raw[packet.payload_offset..packet.payload_offset + packet.payload_len]
-    } else {
-        return true;
-    };
-    if payload_slice.is_empty() {
-        return true;
-    }
-    let chunks = super::fragment_payload_for_webrtc(is_hevc, payload_slice, packet.marker);
-    for (chunk_bytes, chunk_marker) in chunks {
-        let v_frame = rustrtc::media::frame::VideoFrame {
-            rtp_timestamp: packet.timestamp,
-            width: 0,
-            height: 0,
-            format: rustrtc::media::VideoPixelFormat::Unspecified,
-            rotation_deg: 0,
-            is_last_packet: chunk_marker,
-            data: chunk_bytes,
-            header_extension: None,
-            csrcs: vec![],
-            sequence_number: None,
-            payload_type: Some(actual_video_pt),
-            source_addr: None,
-            raw_packet: None,
-        };
+    super::forward_webrtc_payload(
+        is_hevc,
+        &packet.raw,
+        packet.payload_offset,
+        packet.payload_len,
+        packet.marker,
+        max_payload_size,
+        |chunk_bytes, chunk_marker| {
+            let v_frame = rustrtc::media::frame::VideoFrame {
+                rtp_timestamp: packet.timestamp,
+                width: 0,
+                height: 0,
+                format: rustrtc::media::VideoPixelFormat::Unspecified,
+                rotation_deg: 0,
+                is_last_packet: chunk_marker,
+                data: chunk_bytes,
+                header_extension: None,
+                csrcs: vec![],
+                sequence_number: None,
+                payload_type: Some(actual_video_pt),
+                source_addr: None,
+                raw_packet: None,
+            };
 
-        if v_source.send_video(v_frame).is_err() {
-            return false;
-        }
-    }
-    true
+            v_source.send_video(v_frame).is_ok()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -636,7 +616,7 @@ a=rtcp-mux\r\n\
 a=rtpmap:96 H264/90000\r\n\
 a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
 
-        let (session, answer_sdp) = RustRtcSession::create(stream, offer_sdp, &[]).await.unwrap();
+        let (session, answer_sdp) = RustRtcSession::create(stream, offer_sdp, &[], 1200).await.unwrap();
         assert!(!session.session_id.is_empty());
         assert!(answer_sdp.contains("v=0"));
         assert!(answer_sdp.contains("m=video"));

@@ -89,6 +89,8 @@ pub struct WebRtcConfig {
     pub candidates: Vec<String>,
     #[serde(default)]
     pub engine: Option<String>,
+    #[serde(default)]
+    pub max_payload_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -266,6 +268,9 @@ impl Config {
                 }
                 if webrtc.engine.is_some() {
                     our_webrtc.engine = webrtc.engine;
+                }
+                if webrtc.max_payload_size.is_some() {
+                    our_webrtc.max_payload_size = webrtc.max_payload_size;
                 }
             } else {
                 self.webrtc = Some(webrtc);
