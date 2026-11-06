@@ -31,6 +31,7 @@ anyhow = "1.0"
 url = "2.5"
 base64 = "0.22"
 memchr = "2.7"
+mimalloc = { version = "0.1", default-features = false }
 
 # WebRTC
 rustrtc = "0.6.0"

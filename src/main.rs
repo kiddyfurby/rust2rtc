@@ -24,6 +24,9 @@ use streams::StreamManager;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "rust2rtc - high performance streaming gateway in Rust", long_about = None)]
 struct Args {
