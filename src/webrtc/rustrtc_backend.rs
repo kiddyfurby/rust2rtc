@@ -456,6 +456,9 @@ impl RustRtcSession {
                             Ok(pkt) => pkt,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("rustrtc video receiver lagged by {} packets", n);
+                                sent_first_keyframe = false;
+                                last_keyframe_ts = None;
+                                last_was_param_set = false;
                                 continue;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
