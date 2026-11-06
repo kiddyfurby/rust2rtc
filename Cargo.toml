@@ -30,6 +30,7 @@ hex = "0.4"
 anyhow = "1.0"
 url = "2.5"
 base64 = "0.22"
+memchr = "2.7"
 
 # WebRTC
 rustrtc = "0.6.0"

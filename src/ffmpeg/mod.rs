@@ -627,9 +627,9 @@ impl FfmpegManager {
     }
 }
 
-/// Locate a two-byte marker in a buffer
+/// Locate a two-byte marker in a buffer using SIMD pattern search
 pub fn find_marker(buf: &[u8], marker: &[u8; 2]) -> Option<usize> {
-    buf.windows(2).position(|w| w == marker)
+    memchr::memmem::find(buf, marker)
 }
 
 pub fn resolve_source(source: &str, rtsp_port: u16) -> String {

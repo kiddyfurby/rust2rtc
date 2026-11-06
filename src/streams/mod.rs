@@ -221,14 +221,16 @@ impl Stream {
 
         tokio::spawn(async move {
             info!(stream = %stream_name, "Starting shared MJPEG broadcaster worker");
-            let mut stream_buf = Vec::with_capacity(65536);
-            let mut chunk = [0u8; 8192];
+            let mut stream_buf = bytes::BytesMut::with_capacity(131072);
+            let mut scan_pos = 0usize;
+            let soi_finder = memchr::memmem::Finder::new(&[0xFF, 0xD8]);
+            let eoi_finder = memchr::memmem::Finder::new(&[0xFF, 0xD9]);
             let mut idle_seconds = 0;
 
             loop {
                 tokio::select! {
-                    read_res = stdout.read(&mut chunk) => {
-                        let n = match read_res {
+                    read_res = stdout.read_buf(&mut stream_buf) => {
+                        let _n = match read_res {
                             Ok(0) => {
                                 debug!(stream = %stream_name, "FFmpeg MJPEG stdout reached EOF");
                                 break;
@@ -240,30 +242,48 @@ impl Stream {
                             }
                         };
 
-                        stream_buf.extend_from_slice(&chunk[..n]);
-
-                        while let Some(soi_pos) = crate::ffmpeg::find_marker(&stream_buf, &[0xFF, 0xD8]) {
-                            if soi_pos > 0 {
-                                stream_buf.drain(..soi_pos);
+                        loop {
+                            // 1. Ensure buffer starts with JPEG SOI ([0xFF, 0xD8])
+                            if !stream_buf.starts_with(&[0xFF, 0xD8]) {
+                                if let Some(soi_pos) = soi_finder.find(&stream_buf) {
+                                    let _ = stream_buf.split_to(soi_pos);
+                                    scan_pos = 2;
+                                } else {
+                                    // No SOI in buffer; preserve at most 1 trailing byte if 0xFF
+                                    if stream_buf.ends_with(&[0xFF]) {
+                                        let drop_len = stream_buf.len() - 1;
+                                        let _ = stream_buf.split_to(drop_len);
+                                    } else {
+                                        stream_buf.clear();
+                                    }
+                                    scan_pos = 0;
+                                    break;
+                                }
                             }
+
                             if stream_buf.len() < 4 {
                                 break;
                             }
-                            if let Some(eoi_rel) = crate::ffmpeg::find_marker(&stream_buf[2..], &[0xFF, 0xD9]) {
-                                let eoi_pos = 2 + eoi_rel + 2;
-                                let jpeg = &stream_buf[..eoi_pos];
+
+                            // 2. Scan for JPEG EOI ([0xFF, 0xD9]) starting from scan_pos - 1
+                            let search_start = scan_pos.saturating_sub(1).max(2);
+                            if let Some(rel) = eoi_finder.find(&stream_buf[search_start..]) {
+                                let eoi_end = search_start + rel + 2;
+                                let jpeg = stream_buf.split_to(eoi_end).freeze();
+                                scan_pos = 0;
+
                                 let part_header = format!(
                                     "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
                                     jpeg.len()
                                 );
-                                let mut packet = Vec::with_capacity(part_header.len() + jpeg.len() + 2);
+                                let mut packet = bytes::BytesMut::with_capacity(part_header.len() + jpeg.len() + 2);
                                 packet.extend_from_slice(part_header.as_bytes());
-                                packet.extend_from_slice(jpeg);
+                                packet.extend_from_slice(&jpeg);
                                 packet.extend_from_slice(b"\r\n");
 
-                                let _ = tx_clone.send(Bytes::from(packet));
-                                stream_buf.drain(..eoi_pos);
+                                let _ = tx_clone.send(packet.freeze());
                             } else {
+                                scan_pos = stream_buf.len();
                                 break;
                             }
                         }
@@ -704,5 +724,50 @@ mod tests {
 
         let go2rtc_stream = stream.to_go2rtc().await;
         assert!(go2rtc_stream.consumers.iter().any(|c| c.consumer_type == "HTTP MJPEG client"));
+    }
+
+    #[test]
+    fn test_mjpeg_bytesmut_split_parsing() {
+        let mut buf = bytes::BytesMut::new();
+        // Leading garbage before SOI
+        buf.extend_from_slice(b"GARBAGE");
+        // Frame 1
+        buf.extend_from_slice(&[0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9]);
+        // Inter-frame garbage
+        buf.extend_from_slice(b"\r\n\r\n");
+        // Frame 2
+        buf.extend_from_slice(&[0xFF, 0xD8, 0x03, 0x04, 0x05, 0xFF, 0xD9]);
+
+        let soi_finder = memchr::memmem::Finder::new(&[0xFF, 0xD8]);
+        let eoi_finder = memchr::memmem::Finder::new(&[0xFF, 0xD9]);
+        let mut scan_pos: usize = 0;
+        let mut frames = Vec::new();
+
+        loop {
+            if !buf.starts_with(&[0xFF, 0xD8]) {
+                if let Some(soi_pos) = soi_finder.find(&buf) {
+                    let _ = buf.split_to(soi_pos);
+                    scan_pos = 2;
+                } else {
+                    break;
+                }
+            }
+            if buf.len() < 4 {
+                break;
+            }
+            let search_start = scan_pos.saturating_sub(1).max(2);
+            if let Some(rel) = eoi_finder.find(&buf[search_start..]) {
+                let eoi_end = search_start + rel + 2;
+                let jpeg = buf.split_to(eoi_end).freeze();
+                frames.push(jpeg);
+                scan_pos = 0;
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(&frames[0][..], &[0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9]);
+        assert_eq!(&frames[1][..], &[0xFF, 0xD8, 0x03, 0x04, 0x05, 0xFF, 0xD9]);
     }
 }
