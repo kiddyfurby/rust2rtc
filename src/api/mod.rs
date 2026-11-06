@@ -1334,9 +1334,11 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     };
 
-                                    if let Some((is_keyframe, rtp_ts, nalus)) = depacketizer.feed_packet(&packet) {
+                                    let mut frame_opt = depacketizer.feed_packet(&packet);
+                                    while let Some((is_keyframe, rtp_ts, nalus)) = frame_opt {
                                         if !sent_init {
                                             if !is_keyframe {
+                                                frame_opt = depacketizer.pop_frame();
                                                 continue;
                                             }
                                             if let (Some(vps), Some(sps), Some(pps)) = (&depacketizer.vps, &depacketizer.sps, &depacketizer.pps) {
@@ -1347,6 +1349,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                                 }
                                                 sent_init = true;
                                             } else {
+                                                frame_opt = depacketizer.pop_frame();
                                                 continue;
                                             }
                                         }
@@ -1365,6 +1368,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                         if tx_mse.send(Message::Binary(media_seg.into())).await.is_err() {
                                             break;
                                         }
+
+                                        frame_opt = depacketizer.pop_frame();
                                     }
                                 }
                             } else {
@@ -1388,10 +1393,12 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     };
 
-                                    if let Some((is_keyframe, rtp_ts, nalus)) = depacketizer.feed_packet(&packet) {
+                                    let mut frame_opt = depacketizer.feed_packet(&packet);
+                                    while let Some((is_keyframe, rtp_ts, nalus)) = frame_opt {
                                         if !sent_init {
                                             // Gate initial playback on a keyframe
                                             if !is_keyframe {
+                                                frame_opt = depacketizer.pop_frame();
                                                 continue;
                                             }
 
@@ -1403,6 +1410,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                                 }
                                                 sent_init = true;
                                             } else {
+                                                frame_opt = depacketizer.pop_frame();
                                                 continue;
                                             }
                                         }
@@ -1421,6 +1429,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                         if tx_mse.send(Message::Binary(media_seg.into())).await.is_err() {
                                             break;
                                         }
+
+                                        frame_opt = depacketizer.pop_frame();
                                     }
                                 }
                             }

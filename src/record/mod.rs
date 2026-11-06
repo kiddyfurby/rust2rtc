@@ -206,20 +206,22 @@ impl SegmentRecorder {
                     }
                 };
 
-                let frame_opt = if is_hevc {
+                let mut frame_opt = if is_hevc {
                     h265_depack.feed_packet(&packet)
                 } else {
                     h264_depack.feed_packet(&packet)
                 };
 
-                let (is_keyframe, rtp_ts, nalus) = match frame_opt {
-                    Some(f) => f,
-                    None => continue,
-                };
+                while let Some((is_keyframe, rtp_ts, nalus)) = frame_opt {
 
                 // A segment MUST always start with a keyframe
                 if current_segment.is_none() {
                     if !is_keyframe {
+                        frame_opt = if is_hevc {
+                            h265_depack.pop_frame()
+                        } else {
+                            h264_depack.pop_frame()
+                        };
                         continue;
                     }
                     current_segment = Some(ActiveSegment {
@@ -232,6 +234,11 @@ impl SegmentRecorder {
                             nalus,
                         }],
                     });
+                    frame_opt = if is_hevc {
+                        h265_depack.pop_frame()
+                    } else {
+                        h264_depack.pop_frame()
+                    };
                     continue;
                 }
 
@@ -329,6 +336,13 @@ impl SegmentRecorder {
                         nalus,
                     });
                 }
+
+                frame_opt = if is_hevc {
+                    h265_depack.pop_frame()
+                } else {
+                    h264_depack.pop_frame()
+                };
+            }
             }
 
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

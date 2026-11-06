@@ -1256,6 +1256,7 @@ pub struct H264RtpDepacketizer {
     last_timestamp: Option<u32>,
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
+    pending_frames: std::collections::VecDeque<(bool, u32, Vec<bytes::Bytes>)>,
 }
 
 impl H264RtpDepacketizer {
@@ -1266,6 +1267,7 @@ impl H264RtpDepacketizer {
             last_timestamp: None,
             sps: None,
             pps: None,
+            pending_frames: std::collections::VecDeque::new(),
         }
     }
 
@@ -1273,23 +1275,26 @@ impl H264RtpDepacketizer {
         self.fu_buffer.clear();
         self.current_frame.clear();
         self.last_timestamp = None;
+        self.pending_frames.clear();
+    }
+
+    pub fn pop_frame(&mut self) -> Option<(bool, u32, Vec<bytes::Bytes>)> {
+        self.pending_frames.pop_front()
     }
 
     /// Feed an RTP packet; returns (is_keyframe, timestamp, nalus) when a complete frame is finished
     pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<bytes::Bytes>)> {
         let payload = packet.payload();
         if payload.is_empty() {
-            return None;
+            return self.pending_frames.pop_front();
         }
-
-        let mut completed_frame = None;
 
         // Check if timestamp changed (new frame boundary)
         if let Some(last_ts) = self.last_timestamp
             && last_ts != packet.timestamp && !self.current_frame.is_empty() {
                 let is_keyframe = self.current_frame.iter().any(|n| !n.is_empty() && (n[0] & 0x1F == 5));
                 let nalus = std::mem::take(&mut self.current_frame);
-                completed_frame = Some((is_keyframe, last_ts, nalus));
+                self.pending_frames.push_back((is_keyframe, last_ts, nalus));
             }
         self.last_timestamp = Some(packet.timestamp);
 
@@ -1343,7 +1348,8 @@ impl H264RtpDepacketizer {
                 }
 
                 if e_bit && !self.fu_buffer.is_empty() {
-                    let complete_nalu = bytes::Bytes::from(std::mem::take(&mut self.fu_buffer));
+                    let complete_nalu = bytes::Bytes::copy_from_slice(&self.fu_buffer);
+                    self.fu_buffer.clear();
                     if inner_type == 7 {
                         self.sps = Some(complete_nalu.to_vec());
                     } else if inner_type == 8 {
@@ -1358,10 +1364,10 @@ impl H264RtpDepacketizer {
         if packet.marker && !self.current_frame.is_empty() {
             let is_keyframe = self.current_frame.iter().any(|n| !n.is_empty() && (n[0] & 0x1F == 5));
             let nalus = std::mem::take(&mut self.current_frame);
-            completed_frame = Some((is_keyframe, packet.timestamp, nalus));
+            self.pending_frames.push_back((is_keyframe, packet.timestamp, nalus));
         }
 
-        completed_frame
+        self.pending_frames.pop_front()
     }
 }
 
@@ -1550,6 +1556,7 @@ pub struct H265RtpDepacketizer {
     pub vps: Option<Vec<u8>>,
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
+    pending_frames: std::collections::VecDeque<(bool, u32, Vec<bytes::Bytes>)>,
 }
 
 impl H265RtpDepacketizer {
@@ -1561,6 +1568,7 @@ impl H265RtpDepacketizer {
             vps: None,
             sps: None,
             pps: None,
+            pending_frames: std::collections::VecDeque::new(),
         }
     }
 
@@ -1568,6 +1576,11 @@ impl H265RtpDepacketizer {
         self.fu_buffer.clear();
         self.current_frame.clear();
         self.last_timestamp = None;
+        self.pending_frames.clear();
+    }
+
+    pub fn pop_frame(&mut self) -> Option<(bool, u32, Vec<bytes::Bytes>)> {
+        self.pending_frames.pop_front()
     }
 
     fn cache_param_set(&mut self, nalu: &[u8]) {
@@ -1585,10 +1598,8 @@ impl H265RtpDepacketizer {
     pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<bytes::Bytes>)> {
         let payload = packet.payload();
         if payload.len() < 2 {
-            return None;
+            return self.pending_frames.pop_front();
         }
-
-        let mut completed_frame = None;
 
         if let Some(last_ts) = self.last_timestamp
             && last_ts != packet.timestamp && !self.current_frame.is_empty() {
@@ -1596,7 +1607,7 @@ impl H265RtpDepacketizer {
                     !n.is_empty() && (19..=21).contains(&((n[0] >> 1) & 0x3F))
                 });
                 let nalus = std::mem::take(&mut self.current_frame);
-                completed_frame = Some((is_keyframe, last_ts, nalus));
+                self.pending_frames.push_back((is_keyframe, last_ts, nalus));
             }
         self.last_timestamp = Some(packet.timestamp);
 
@@ -1641,7 +1652,8 @@ impl H265RtpDepacketizer {
             }
 
             if e_bit && !self.fu_buffer.is_empty() {
-                let complete_nalu = bytes::Bytes::from(std::mem::take(&mut self.fu_buffer));
+                let complete_nalu = bytes::Bytes::copy_from_slice(&self.fu_buffer);
+                self.fu_buffer.clear();
                 self.cache_param_set(&complete_nalu);
                 self.current_frame.push(complete_nalu);
             }
@@ -1652,10 +1664,10 @@ impl H265RtpDepacketizer {
                 !n.is_empty() && (19..=21).contains(&((n[0] >> 1) & 0x3F))
             });
             let nalus = std::mem::take(&mut self.current_frame);
-            completed_frame = Some((is_keyframe, packet.timestamp, nalus));
+            self.pending_frames.push_back((is_keyframe, packet.timestamp, nalus));
         }
 
-        completed_frame
+        self.pending_frames.pop_front()
     }
 }
 
@@ -1859,5 +1871,53 @@ mod tests {
         assert!(find_subsequence(&mp4_pcma, b"vide").is_some());
         assert!(find_subsequence(&mp4_pcma, b"soun").is_some());
         assert!(find_subsequence(&mp4_pcma, b"alaw").is_some());
+    }
+
+    #[test]
+    fn test_h264_depacketizer_fu_buffer_capacity_retained() {
+        let mut depack = H264RtpDepacketizer::new();
+        assert_eq!(depack.fu_buffer.capacity(), 65536);
+
+        // Feed FU-A start packet
+        // Indicator: NRI=3, Type=28 (0x7C)
+        // Header: S=1, E=0, Type=5 (0x85)
+        let fu_start = vec![0x7C, 0x85, 0xAA, 0xBB];
+        let p1 = crate::core::RtpPacket::create(96, 1, 1000, 1234, false, &fu_start);
+        assert!(depack.feed_packet(&p1).is_none());
+
+        // Feed FU-A end packet with marker bit
+        // Header: S=0, E=1, Type=5 (0x45)
+        let fu_end = vec![0x7C, 0x45, 0xCC, 0xDD];
+        let p2 = crate::core::RtpPacket::create(96, 2, 1000, 1234, true, &fu_end);
+        let frame = depack.feed_packet(&p2);
+        assert!(frame.is_some());
+        assert!(depack.fu_buffer.capacity() >= 65536);
+    }
+
+    #[test]
+    fn test_h264_depacketizer_timestamp_change_and_marker_both_retained() {
+        let mut depack = H264RtpDepacketizer::new();
+
+        // Frame 1: Single NAL (type 1), timestamp 1000, marker=false
+        let p1 = crate::core::RtpPacket::create(96, 1, 1000, 1234, false, &[0x21, 0x11, 0x22]);
+        assert!(depack.feed_packet(&p1).is_none());
+
+        // Frame 2: Single NAL (type 5 keyframe), timestamp 2000, marker=true
+        // Arrives on new timestamp AND has marker bit set
+        let p2 = crate::core::RtpPacket::create(96, 2, 2000, 1234, true, &[0x65, 0x33, 0x44]);
+        let first = depack.feed_packet(&p2);
+        assert!(first.is_some());
+        let (is_kf_1, ts_1, nalus_1) = first.unwrap();
+        assert_eq!(ts_1, 1000);
+        assert!(!is_kf_1);
+        assert_eq!(nalus_1.len(), 1);
+
+        // Frame 2 must not be dropped!
+        let second = depack.pop_frame();
+        assert!(second.is_some());
+        let (is_kf_2, ts_2, nalus_2) = second.unwrap();
+        assert_eq!(ts_2, 2000);
+        assert!(is_kf_2);
+        assert_eq!(nalus_2.len(), 1);
     }
 }
