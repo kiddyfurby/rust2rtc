@@ -371,7 +371,7 @@ async fn main() -> Result<()> {
         api_auth,
     };
 
-    let app = api::create_router(app_state);
+    let app = api::create_router_with_origin(app_state, config.api.origin.as_deref());
     let listener = tokio::net::TcpListener::bind(&api_listen)
         .await
         .with_context(|| format!("Failed to bind HTTP API on {}", api_listen))?;

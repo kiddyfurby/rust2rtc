@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncReadExt;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info};
 
 #[derive(Clone)]
@@ -76,7 +76,45 @@ pub struct WsMessage {
     pub value: Option<serde_json::Value>,
 }
 
+/// Router with fully open CORS (kept for callers/tests that don't configure an origin).
 pub fn create_router(state: AppState) -> Router {
+    apply_cors(build_router(state), Some("*"))
+}
+
+/// Router whose CORS policy follows `api.origin`: unset = same-origin only (go2rtc semantics),
+/// "*" = any origin, anything else = that single origin.
+pub fn create_router_with_origin(state: AppState, origin: Option<&str>) -> Router {
+    apply_cors(build_router(state), origin)
+}
+
+fn apply_cors(router: Router, origin: Option<&str>) -> Router {
+    match origin.map(str::trim) {
+        None | Some("") => router,
+        Some("*") => router.layer(CorsLayer::permissive()),
+        Some(o) => match header::HeaderValue::from_str(o) {
+            Ok(hv) => router.layer(
+                CorsLayer::new()
+                    .allow_origin(hv)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            ),
+            Err(_) => {
+                error!(origin = o, "Invalid api.origin; CORS left disabled");
+                router
+            }
+        },
+    }
+}
+
+/// Constant-time string comparison (via SHA-256 digests, so length doesn't leak either).
+fn ct_str_eq(a: &str, b: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let x = Sha256::digest(a.as_bytes());
+    let y = Sha256::digest(b.as_bytes());
+    x.iter().zip(y.iter()).fold(0u8, |acc, (p, q)| acc | (p ^ q)) == 0
+}
+
+fn build_router(state: AppState) -> Router {
     let auth_state = state.clone();
     Router::new()
         .route("/", get(index_handler))
@@ -110,7 +148,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/sip/accounts", get(api_sip_accounts_handler))
         .route("/api/record", get(api_record_handler))
         .layer(axum::middleware::from_fn_with_state(auth_state, basic_auth_middleware))
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -129,7 +166,7 @@ async fn basic_auth_middleware(
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        if auth_hdr != Some(expected.as_str()) {
+        if !auth_hdr.is_some_and(|h| ct_str_eq(h, &expected)) {
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Basic realm=\"rust2rtc\"")],

@@ -1249,6 +1249,10 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Upper bounds for reassembly state fed by untrusted RTP.
+const MAX_NALU_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NALUS_PER_FRAME: usize = 1024;
+
 /// H.264 RTP Depacketizer: reconstructs complete NALUs from single NAL, STAP-A, and FU-A RTP packets
 pub struct H264RtpDepacketizer {
     fu_buffer: Vec<u8>,
@@ -1278,6 +1282,12 @@ impl H264RtpDepacketizer {
 
         let mut completed_frame = None;
 
+        // Defensive cap: a sender that never sets the marker bit / never changes timestamp
+        // must not be able to grow a frame without bound.
+        if self.current_frame.len() >= MAX_NALUS_PER_FRAME {
+            self.current_frame.clear();
+        }
+
         // Check if timestamp changed (new frame boundary)
         if let Some(last_ts) = self.last_timestamp
             && last_ts != packet.timestamp && !self.current_frame.is_empty() {
@@ -1303,7 +1313,7 @@ impl H264RtpDepacketizer {
             while offset + 2 <= payload.len() {
                 let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
                 offset += 2;
-                if offset + size <= payload.len() {
+                if size > 0 && offset + size <= payload.len() {
                     let nalu = payload[offset..offset + size].to_vec();
                     let inner_type = nalu[0] & 0x1F;
                     if inner_type == 7 {
@@ -1332,7 +1342,12 @@ impl H264RtpDepacketizer {
                     self.fu_buffer.push(reconstructed_header);
                     self.fu_buffer.extend_from_slice(&payload[2..]);
                 } else if !self.fu_buffer.is_empty() {
-                    self.fu_buffer.extend_from_slice(&payload[2..]);
+                    if self.fu_buffer.len() + (payload.len() - 2) > MAX_NALU_BYTES {
+                        // Oversized/never-ending fragment run: drop it and wait for the next S bit.
+                        self.fu_buffer.clear();
+                    } else {
+                        self.fu_buffer.extend_from_slice(&payload[2..]);
+                    }
                 }
 
                 if e_bit && !self.fu_buffer.is_empty() {
@@ -1577,6 +1592,12 @@ impl H265RtpDepacketizer {
 
         let mut completed_frame = None;
 
+        // Defensive cap: a sender that never sets the marker bit / never changes timestamp
+        // must not be able to grow a frame without bound.
+        if self.current_frame.len() >= MAX_NALUS_PER_FRAME {
+            self.current_frame.clear();
+        }
+
         if let Some(last_ts) = self.last_timestamp
             && last_ts != packet.timestamp && !self.current_frame.is_empty() {
                 let is_keyframe = self.current_frame.iter().any(|n| {
@@ -1623,7 +1644,11 @@ impl H265RtpDepacketizer {
                 self.fu_buffer.push(h1);
                 self.fu_buffer.extend_from_slice(&payload[3..]);
             } else if !self.fu_buffer.is_empty() {
-                self.fu_buffer.extend_from_slice(&payload[3..]);
+                if self.fu_buffer.len() + (payload.len() - 3) > MAX_NALU_BYTES {
+                    self.fu_buffer.clear();
+                } else {
+                    self.fu_buffer.extend_from_slice(&payload[3..]);
+                }
             }
 
             if e_bit && !self.fu_buffer.is_empty() {
@@ -1845,5 +1870,57 @@ mod tests {
         assert!(find_subsequence(&mp4_pcma, b"vide").is_some());
         assert!(find_subsequence(&mp4_pcma, b"soun").is_some());
         assert!(find_subsequence(&mp4_pcma, b"alaw").is_some());
+    }
+}
+
+#[cfg(test)]
+mod depacketizer_regression_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn rtp(payload: &[u8], ts: u32, marker: bool) -> crate::core::RtpPacket {
+        let mut v = vec![0x80, if marker { 0xE0 } else { 0x60 }, 0, 1];
+        v.extend_from_slice(&ts.to_be_bytes());
+        v.extend_from_slice(&[0, 0, 0, 1]);
+        v.extend_from_slice(payload);
+        crate::core::RtpPacket::parse(Bytes::from(v)).expect("valid rtp")
+    }
+
+    #[test]
+    fn h264_stap_a_zero_length_nalu_does_not_panic() {
+        let mut d = H264RtpDepacketizer::new();
+        let _ = d.feed_packet(&rtp(&[0x18, 0x00, 0x00], 1000, true));
+    }
+
+    #[test]
+    fn h264_fu_a_buffer_is_bounded() {
+        let mut d = H264RtpDepacketizer::new();
+        let _ = d.feed_packet(&rtp(&[&[0x7C, 0x85][..], &[0u8; 1200][..]].concat(), 1, false));
+        let mid = [&[0x7C, 0x05][..], &[0u8; 1200][..]].concat();
+        for _ in 0..20_000 {
+            let _ = d.feed_packet(&rtp(&mid, 1, false));
+        }
+        assert!(d.fu_buffer.len() <= MAX_NALU_BYTES, "fu_buffer = {} bytes", d.fu_buffer.len());
+    }
+
+    #[test]
+    fn h264_frame_nalu_count_is_bounded() {
+        let mut d = H264RtpDepacketizer::new();
+        for _ in 0..(MAX_NALUS_PER_FRAME * 3) {
+            let _ = d.feed_packet(&rtp(&[0x41, 0x00, 0x01], 7, false)); // single NAL, no marker
+        }
+        assert!(d.current_frame.len() <= MAX_NALUS_PER_FRAME);
+    }
+
+    #[test]
+    fn h265_fu_buffer_is_bounded() {
+        let mut d = H265RtpDepacketizer::new();
+        // FU (type 49): header0 = 49<<1, header1 = 1, fu header S=1 type=19
+        let _ = d.feed_packet(&rtp(&[&[0x62, 0x01, 0x93][..], &[0u8; 1200][..]].concat(), 1, false));
+        let mid = [&[0x62, 0x01, 0x13][..], &[0u8; 1200][..]].concat();
+        for _ in 0..20_000 {
+            let _ = d.feed_packet(&rtp(&mid, 1, false));
+        }
+        assert!(d.fu_buffer.len() <= MAX_NALU_BYTES, "fu_buffer = {} bytes", d.fu_buffer.len());
     }
 }
