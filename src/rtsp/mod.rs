@@ -642,7 +642,11 @@ impl TrackDraft {
             payload_type: self.pt,
             fmtp: self.fmtp.clone(),
         };
-        let cap = if self.kind == MediaKind::Video { 2048 } else { 256 };
+        let cap = if self.kind == MediaKind::Video {
+            Track::DEFAULT_VIDEO_CAPACITY
+        } else {
+            Track::DEFAULT_AUDIO_CAPACITY
+        };
         Arc::new(Track::new(codec, self.kind, cap))
     }
 }
@@ -708,7 +712,7 @@ fn parse_sdp_tracks(sdp: &str) -> Vec<Arc<Track>> {
 
     if tracks.is_empty() {
         // Fallback default H264 track
-        tracks.push(Arc::new(Track::new(Codec::new_h264(), MediaKind::Video, 2048)));
+        tracks.push(Arc::new(Track::new(Codec::new_h264(), MediaKind::Video, Track::DEFAULT_VIDEO_CAPACITY)));
     }
 
     tracks

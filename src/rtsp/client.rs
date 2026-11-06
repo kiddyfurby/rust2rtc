@@ -699,7 +699,11 @@ impl TrackDraft {
         let track = if let Some(et) = existing {
             Arc::clone(et)
         } else {
-            let cap = if self.kind == MediaKind::Video { 2048 } else { 256 };
+            let cap = if self.kind == MediaKind::Video {
+                Track::DEFAULT_VIDEO_CAPACITY
+            } else {
+                Track::DEFAULT_AUDIO_CAPACITY
+            };
             Arc::new(Track::new(codec, self.kind, cap))
         };
 

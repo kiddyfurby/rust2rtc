@@ -226,6 +226,12 @@ pub struct ParamSets {
     pub rtp_packets: Vec<RtpPacket>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct GopCache {
+    packets: Vec<RtpPacket>,
+    bytes: usize,
+}
+
 /// Track broadcaster holding a multi-consumer channel
 #[derive(Debug)]
 pub struct Track {
@@ -235,10 +241,15 @@ pub struct Track {
     pub packets_total: Arc<AtomicU64>,
     pub bytes_total: Arc<AtomicU64>,
     param_sets: RwLock<ParamSets>,
-    gop_cache: RwLock<Vec<RtpPacket>>,
+    gop_cache: RwLock<GopCache>,
 }
 
 impl Track {
+    pub const DEFAULT_VIDEO_CAPACITY: usize = 512;
+    pub const DEFAULT_AUDIO_CAPACITY: usize = 256;
+    pub const MAX_GOP_BYTES: usize = 2 * 1024 * 1024; // 2 MB byte-bound
+    pub const MAX_GOP_PACKETS: usize = 512;
+
     pub fn new(codec: Codec, kind: MediaKind, capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         let mut param_sets = ParamSets::default();
@@ -273,7 +284,7 @@ impl Track {
             packets_total: Arc::new(AtomicU64::new(0)),
             bytes_total: Arc::new(AtomicU64::new(0)),
             param_sets: RwLock::new(param_sets),
-            gop_cache: RwLock::new(Vec::new()),
+            gop_cache: RwLock::new(GopCache::default()),
         }
     }
 
@@ -288,16 +299,21 @@ impl Track {
             let (is_keyframe, _is_param_set) = is_keyframe_or_param_set(is_hevc, packet.payload());
 
             let mut gop = self.gop_cache.write().unwrap();
+            let pkt_len = packet.raw.len();
             if is_keyframe {
-                gop.clear();
+                gop.packets.clear();
+                gop.bytes = 0;
                 let ps = self.param_sets.read().unwrap();
                 for ps_pkt in &ps.rtp_packets {
-                    gop.push(ps_pkt.clone());
+                    gop.bytes += ps_pkt.raw.len();
+                    gop.packets.push(ps_pkt.clone());
                 }
-                gop.push(packet.clone());
-            } else if !gop.is_empty() {
-                if gop.len() < 512 {
-                    gop.push(packet.clone());
+                gop.bytes += pkt_len;
+                gop.packets.push(packet.clone());
+            } else if !gop.packets.is_empty() {
+                if gop.packets.len() < Self::MAX_GOP_PACKETS && gop.bytes + pkt_len <= Self::MAX_GOP_BYTES {
+                    gop.bytes += pkt_len;
+                    gop.packets.push(packet.clone());
                 }
             }
         }
@@ -318,27 +334,27 @@ impl Track {
     }
 
     pub fn get_gop_packets(&self) -> Vec<RtpPacket> {
-        self.gop_cache.read().unwrap().clone()
+        self.gop_cache.read().unwrap().packets.clone()
     }
 
     pub fn get_keyframe_packets(&self) -> Vec<RtpPacket> {
         let gop = self.gop_cache.read().unwrap();
-        if gop.is_empty() {
+        if gop.packets.is_empty() {
             return self.get_param_sets();
         }
         let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
-        let kf_ts = gop.iter().find(|p| {
+        let kf_ts = gop.packets.iter().find(|p| {
             let (is_kf, _) = is_keyframe_or_param_set(is_hevc, p.payload());
             is_kf
         }).map(|p| p.timestamp);
 
         if let Some(ts) = kf_ts {
-            gop.iter().filter(|p| {
+            gop.packets.iter().filter(|p| {
                 let (_, is_ps) = is_keyframe_or_param_set(is_hevc, p.payload());
                 is_ps || p.timestamp == ts
             }).cloned().collect()
         } else {
-            gop.clone()
+            gop.packets.clone()
         }
     }
 
@@ -774,5 +790,29 @@ mod tests {
         assert!(annex_b.starts_with(&[0, 0, 0, 1, 0x67]));
         assert!(annex_b.contains(&0x68));
         assert!(annex_b.contains(&0x65));
+    }
+
+    #[test]
+    fn test_track_gop_cache_byte_bound() {
+        let codec = Codec::new_h264();
+        let track = Track::new(codec, MediaKind::Video, 100);
+
+        // IDR Keyframe
+        let idr = vec![0x65; 1000];
+        track.send(RtpPacket::create(96, 1, 1000, 0x1234, true, &idr));
+        assert_eq!(track.get_gop_packets().len(), 1);
+
+        // Push large P-frames up to 2MB limit
+        // Each packet is ~500KB
+        let huge_p = vec![0x41; 500_000];
+        track.send(RtpPacket::create(96, 2, 2000, 0x1234, true, &huge_p)); // ~500KB
+        track.send(RtpPacket::create(96, 3, 3000, 0x1234, true, &huge_p)); // ~1MB
+        track.send(RtpPacket::create(96, 4, 4000, 0x1234, true, &huge_p)); // ~1.5MB
+        track.send(RtpPacket::create(96, 5, 5000, 0x1234, true, &huge_p)); // ~2MB
+        assert_eq!(track.get_gop_packets().len(), 5);
+
+        // Next 500KB packet would exceed 2MB bound (MAX_GOP_BYTES) -> rejected from cache
+        track.send(RtpPacket::create(96, 6, 6000, 0x1234, true, &huge_p));
+        assert_eq!(track.get_gop_packets().len(), 5);
     }
 }
