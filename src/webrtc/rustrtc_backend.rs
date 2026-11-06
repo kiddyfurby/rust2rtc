@@ -617,15 +617,19 @@ impl RustRtcSession {
                                 }
                             };
 
-                            let payload = pkt.payload();
-                            if payload.is_empty() {
+                            let payload_slice = if pkt.payload_offset + pkt.payload_len <= pkt.raw.len() {
+                                pkt.raw.slice(pkt.payload_offset..pkt.payload_offset + pkt.payload_len)
+                            } else {
+                                continue;
+                            };
+                            if payload_slice.is_empty() {
                                 continue;
                             }
 
                             let a_frame = rustrtc::media::frame::AudioFrame {
                                 rtp_timestamp: pkt.timestamp,
                                 clock_rate: audio_clock_rate,
-                                data: bytes::Bytes::copy_from_slice(payload),
+                                data: payload_slice,
                                 sequence_number: None,
                                 payload_type: Some(actual_audio_pt),
                                 marker: pkt.marker,
