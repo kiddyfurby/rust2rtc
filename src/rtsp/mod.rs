@@ -68,6 +68,7 @@ impl RtspServer {
         loop {
             match listener.accept().await {
                 Ok((stream, remote_addr)) => {
+                    let _ = stream.set_nodelay(true);
                     let server = Arc::clone(&self);
                     tokio::spawn(async move {
                         if let Err(e) = server.handle_connection(stream, remote_addr).await {
@@ -345,23 +346,73 @@ impl RtspServer {
 
                         if !track_channels.is_empty() {
                             let (tx, mut rx) = mpsc::channel::<RtspOutgoing>(1024);
-                            let (mut reader, mut writer) = stream.into_split();
+                            let (mut reader, writer) = stream.into_split();
 
                             // Spawn subscriber per mapped channel
                             for (&ch, track) in &track_channels {
                                 let mut track_rx = track.subscribe();
                                 let tx_clone = tx.clone();
+                                let track_clone = Arc::clone(track);
+                                let is_video = track.kind == MediaKind::Video;
+                                let is_hevc = is_video
+                                    && (track.codec.name.eq_ignore_ascii_case("H265")
+                                        || track.codec.name.eq_ignore_ascii_case("HEVC"));
+
                                 tokio::spawn(async move {
-                                    while let Ok(packet) = track_rx.recv().await {
-                                        if tx_clone.send(RtspOutgoing::Rtp(ch, packet.raw)).await.is_err() {
-                                            break;
+                                    let mut waiting_for_keyframe = is_video;
+
+                                    if is_video {
+                                        let cached_gop = track_clone.get_gop_packets();
+                                        if !cached_gop.is_empty() {
+                                            for pkt in cached_gop {
+                                                if tx_clone.send(RtspOutgoing::Rtp(ch, pkt.raw)).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            waiting_for_keyframe = false;
+                                        }
+                                    }
+
+                                    loop {
+                                        match track_rx.recv().await {
+                                            Ok(packet) => {
+                                                if is_video {
+                                                    let (is_keyframe, is_param_set) =
+                                                        crate::core::is_keyframe_or_param_set(is_hevc, packet.payload());
+                                                    if waiting_for_keyframe {
+                                                        if !is_keyframe && !is_param_set {
+                                                            continue;
+                                                        }
+                                                        if is_keyframe {
+                                                            for ps_pkt in track_clone.get_param_sets() {
+                                                                let _ = tx_clone.send(RtspOutgoing::Rtp(ch, ps_pkt.raw)).await;
+                                                            }
+                                                            waiting_for_keyframe = false;
+                                                        }
+                                                    }
+                                                }
+
+                                                if tx_clone.send(RtspOutgoing::Rtp(ch, packet.raw)).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                tracing::warn!(channel = ch, skipped = n, "RTSP track subscriber lagged; skipping to next keyframe");
+                                                if is_video {
+                                                    waiting_for_keyframe = true;
+                                                }
+                                                continue;
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                         }
                                     }
                                 });
                             }
 
-                            // Writer task
+                            // Writer task with BufWriter & coalescing
                             tokio::spawn(async move {
+                                let mut buf_writer = tokio::io::BufWriter::with_capacity(65536, writer);
+
                                 while let Some(msg) = rx.recv().await {
                                     match msg {
                                         RtspOutgoing::Rtp(ch, raw) => {
@@ -371,18 +422,44 @@ impl RtspServer {
                                             let len = raw.len() as u16;
                                             header[2..4].copy_from_slice(&len.to_be_bytes());
 
-                                            if writer.write_all(&header).await.is_err() {
-                                                break;
-                                            }
-                                            if writer.write_all(&raw).await.is_err() {
+                                            if buf_writer.write_all(&header).await.is_err()
+                                                || buf_writer.write_all(&raw).await.is_err()
+                                            {
                                                 break;
                                             }
                                         }
                                         RtspOutgoing::Msg(data) => {
-                                            if writer.write_all(&data).await.is_err() {
+                                            if buf_writer.write_all(&data).await.is_err() {
                                                 break;
                                             }
                                         }
+                                    }
+
+                                    while let Ok(next_msg) = rx.try_recv() {
+                                        match next_msg {
+                                            RtspOutgoing::Rtp(ch, raw) => {
+                                                let mut header = [0u8; 4];
+                                                header[0] = b'$';
+                                                header[1] = ch;
+                                                let len = raw.len() as u16;
+                                                header[2..4].copy_from_slice(&len.to_be_bytes());
+
+                                                if buf_writer.write_all(&header).await.is_err()
+                                                    || buf_writer.write_all(&raw).await.is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                            RtspOutgoing::Msg(data) => {
+                                                if buf_writer.write_all(&data).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if buf_writer.flush().await.is_err() {
+                                        break;
                                     }
                                 }
                             });

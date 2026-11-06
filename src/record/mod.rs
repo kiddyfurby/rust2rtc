@@ -29,6 +29,15 @@ struct ActiveSegment {
     samples: Vec<VideoSample>,
 }
 
+struct SegmentJob {
+    stream_name: String,
+    output_dir: PathBuf,
+    start_utc: chrono::DateTime<chrono::Utc>,
+    elapsed: std::time::Duration,
+    codec_config: VideoCodecConfig,
+    samples: Vec<VideoSample>,
+}
+
 impl SegmentRecorder {
     pub fn new(
         stream_name: String,
@@ -57,6 +66,36 @@ impl SegmentRecorder {
         );
 
         let _ = tokio::fs::create_dir_all(&self.output_dir).await;
+
+        let (seg_tx, mut seg_rx) = tokio::sync::mpsc::channel::<SegmentJob>(16);
+        tokio::spawn(async move {
+            while let Some(job) = seg_rx.recv().await {
+                tokio::task::spawn_blocking(move || {
+                    let mp4_bytes = build_standalone_mp4(&job.codec_config, &job.samples, None);
+                    let date_str = job.start_utc.format("%Y%m%d%H%M%S+0000").to_string();
+                    let target_file = job.output_dir.join(format!("{}@{}.mp4", job.stream_name, date_str));
+                    let tmp_file = job.output_dir.join(format!(".{}@{}.mp4.tmp", job.stream_name, date_str));
+                    if let Err(e) = std::fs::write(&tmp_file, &mp4_bytes) {
+                        error!(stream = %job.stream_name, error = %e, "Failed to write MP4 segment tmp file");
+                        return;
+                    }
+                    if let Err(e) = std::fs::rename(&tmp_file, &target_file) {
+                        error!(stream = %job.stream_name, error = %e, "Failed to atomically rename MP4 segment");
+                    } else {
+                        info!(
+                            stream = %job.stream_name,
+                            path = %target_file.display(),
+                            bytes = mp4_bytes.len(),
+                            samples = job.samples.len(),
+                            duration = ?job.elapsed,
+                            "Saved MP4 segment for Frigate cache"
+                        );
+                    }
+                })
+                .await
+                .ok();
+            }
+        });
 
         loop {
             if let Some(ref rx) = stop_rx
@@ -150,7 +189,13 @@ impl SegmentRecorder {
                         match res {
                             Ok(p) => p,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                warn!(stream = %self.stream_name, skipped = n, "Recorder subscriber lagged");
+                                warn!(stream = %self.stream_name, skipped = n, "Recorder subscriber lagged; resetting depacketizer");
+                                if is_hevc {
+                                    h265_depack.reset();
+                                } else {
+                                    h264_depack.reset();
+                                }
+                                current_segment = None;
                                 continue;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -251,33 +296,16 @@ impl SegmentRecorder {
                     };
 
                     if let Some(codec_config) = codec_config_opt {
-                        let mp4_bytes = build_standalone_mp4(&codec_config, &finished_seg.samples, None);
-                        let date_str = finished_seg.start_utc.format("%Y%m%d%H%M%S+0000").to_string();
-                        let target_file = self
-                            .output_dir
-                            .join(format!("{}@{}.mp4", self.stream_name, date_str));
-                        let tmp_file = self
-                            .output_dir
-                            .join(format!(".{}@{}.mp4.tmp", self.stream_name, date_str));
-
-                        match tokio::fs::write(&tmp_file, &mp4_bytes).await {
-                            Ok(_) => {
-                                if let Err(e) = tokio::fs::rename(&tmp_file, &target_file).await {
-                                    error!(stream = %self.stream_name, error = %e, "Failed to atomically rename MP4 segment");
-                                } else {
-                                    info!(
-                                        stream = %self.stream_name,
-                                        path = %target_file.display(),
-                                        bytes = mp4_bytes.len(),
-                                        samples = finished_seg.samples.len(),
-                                        duration = ?elapsed,
-                                        "Saved MP4 segment for Frigate cache"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(stream = %self.stream_name, error = %e, "Failed to write MP4 segment tmp file");
-                            }
+                        let job = SegmentJob {
+                            stream_name: self.stream_name.clone(),
+                            output_dir: self.output_dir.clone(),
+                            start_utc: finished_seg.start_utc,
+                            elapsed,
+                            codec_config,
+                            samples: finished_seg.samples,
+                        };
+                        if let Err(e) = seg_tx.send(job).await {
+                            error!(stream = %self.stream_name, error = %e, "Failed to queue MP4 segment for background writer");
                         }
                     } else {
                         warn!(stream = %self.stream_name, "Skipping segment write: missing parameter sets (VPS/SPS/PPS)");

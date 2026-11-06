@@ -207,7 +207,7 @@ impl RustRtcSession {
         let mut video_source_opt = None;
         if tracks.iter().any(|t| t.kind == MediaKind::Video) {
             let (v_source, v_track, mut v_fb) = sample_track(rustrtc::media::MediaKind::Video, 512);
-            video_source_opt = Some(v_source);
+            video_source_opt = Some(v_source.clone());
 
             let v_params = RtpCodecParameters {
                 name: if is_stream_hevc { "H265".to_string() } else { "H264".to_string() },
@@ -220,6 +220,7 @@ impl RustRtcSession {
 
             // Listen for keyframe requests (PLI/FIR)
             let s_clone = Arc::clone(&stream);
+            let v_source_fb = v_source.clone();
             let mut close_rx = close_tx.subscribe();
             tokio::spawn(async move {
                 loop {
@@ -227,7 +228,16 @@ impl RustRtcSession {
                         _ = close_rx.recv() => break,
                         fb_opt = v_fb.recv() => match fb_opt {
                             Some(FeedbackEvent::RequestKeyFrame) => {
-                                debug!(stream = %s_clone.name, "Received WebRTC RequestKeyFrame");
+                                debug!(stream = %s_clone.name, "Received WebRTC RequestKeyFrame; replaying cached keyframe");
+                                let tracks = s_clone.get_tracks().await;
+                                if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
+                                    let kf_pkts = vt.get_keyframe_packets();
+                                    for pkt in &kf_pkts {
+                                        if !forward_packet_to_webrtc(&v_source_fb, pkt, negotiated_video_pt, is_stream_hevc) {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                             None => break,
                         }
@@ -416,6 +426,21 @@ impl RustRtcSession {
                 } else {
                     Vec::new()
                 };
+
+                let cached_gop = video_track.get_gop_packets();
+                if !cached_gop.is_empty() {
+                    tracing::info!(
+                        stream = %s_clone.name,
+                        packets = cached_gop.len(),
+                        "Replaying cached GOP for instant WebRTC startup"
+                    );
+                    for pkt in &cached_gop {
+                        if !forward_packet_to_webrtc(&v_source, pkt, actual_video_pt, is_hevc) {
+                            return;
+                        }
+                    }
+                    sent_first_keyframe = true;
+                }
 
                 loop {
                     let packet = tokio::select! {
@@ -615,6 +640,45 @@ impl RustRtcSession {
             }
         }
     }
+}
+
+fn forward_packet_to_webrtc(
+    v_source: &SampleStreamSource,
+    packet: &crate::core::RtpPacket,
+    actual_video_pt: u8,
+    is_hevc: bool,
+) -> bool {
+    let payload_slice = if packet.payload_offset + packet.payload_len <= packet.raw.len() {
+        &packet.raw[packet.payload_offset..packet.payload_offset + packet.payload_len]
+    } else {
+        return true;
+    };
+    if payload_slice.is_empty() {
+        return true;
+    }
+    let chunks = super::fragment_payload_for_webrtc(is_hevc, payload_slice, packet.marker);
+    for (chunk_bytes, chunk_marker) in chunks {
+        let v_frame = rustrtc::media::frame::VideoFrame {
+            rtp_timestamp: packet.timestamp,
+            width: 0,
+            height: 0,
+            format: rustrtc::media::VideoPixelFormat::Unspecified,
+            rotation_deg: 0,
+            is_last_packet: chunk_marker,
+            data: chunk_bytes,
+            header_extension: None,
+            csrcs: vec![],
+            sequence_number: None,
+            payload_type: Some(actual_video_pt),
+            source_addr: None,
+            raw_packet: None,
+        };
+
+        if v_source.send_video(v_frame).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

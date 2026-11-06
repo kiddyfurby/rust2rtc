@@ -235,6 +235,7 @@ pub struct Track {
     pub packets_total: Arc<AtomicU64>,
     pub bytes_total: Arc<AtomicU64>,
     param_sets: RwLock<ParamSets>,
+    gop_cache: RwLock<Vec<RtpPacket>>,
 }
 
 impl Track {
@@ -272,6 +273,7 @@ impl Track {
             packets_total: Arc::new(AtomicU64::new(0)),
             bytes_total: Arc::new(AtomicU64::new(0)),
             param_sets: RwLock::new(param_sets),
+            gop_cache: RwLock::new(Vec::new()),
         }
     }
 
@@ -281,6 +283,23 @@ impl Track {
 
         if self.kind == MediaKind::Video {
             self.inspect_and_cache_params(&packet);
+
+            let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
+            let (is_keyframe, _is_param_set) = is_keyframe_or_param_set(is_hevc, packet.payload());
+
+            let mut gop = self.gop_cache.write().unwrap();
+            if is_keyframe {
+                gop.clear();
+                let ps = self.param_sets.read().unwrap();
+                for ps_pkt in &ps.rtp_packets {
+                    gop.push(ps_pkt.clone());
+                }
+                gop.push(packet.clone());
+            } else if !gop.is_empty() {
+                if gop.len() < 512 {
+                    gop.push(packet.clone());
+                }
+            }
         }
 
         let _ = self.tx.send(packet);
@@ -296,6 +315,31 @@ impl Track {
 
     pub fn get_param_sets(&self) -> Vec<RtpPacket> {
         self.param_sets.read().unwrap().rtp_packets.clone()
+    }
+
+    pub fn get_gop_packets(&self) -> Vec<RtpPacket> {
+        self.gop_cache.read().unwrap().clone()
+    }
+
+    pub fn get_keyframe_packets(&self) -> Vec<RtpPacket> {
+        let gop = self.gop_cache.read().unwrap();
+        if gop.is_empty() {
+            return self.get_param_sets();
+        }
+        let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
+        let kf_ts = gop.iter().find(|p| {
+            let (is_kf, _) = is_keyframe_or_param_set(is_hevc, p.payload());
+            is_kf
+        }).map(|p| p.timestamp);
+
+        if let Some(ts) = kf_ts {
+            gop.iter().filter(|p| {
+                let (_, is_ps) = is_keyframe_or_param_set(is_hevc, p.payload());
+                is_ps || p.timestamp == ts
+            }).cloned().collect()
+        } else {
+            gop.clone()
+        }
     }
 
     pub fn get_param_sets_data(&self) -> ParamSets {
@@ -546,6 +590,86 @@ pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
     (false, false)
 }
 
+pub fn rtp_packets_to_annex_b(is_hevc: bool, packets: &[RtpPacket]) -> Vec<u8> {
+    let mut annex_b = Vec::new();
+    let mut fu_buf = Vec::new();
+
+    for pkt in packets {
+        let payload = pkt.payload();
+        if payload.is_empty() {
+            continue;
+        }
+
+        if !is_hevc {
+            let nal_type = payload[0] & 0x1F;
+            if (1..=23).contains(&nal_type) {
+                annex_b.extend_from_slice(&[0, 0, 0, 1]);
+                annex_b.extend_from_slice(payload);
+            } else if nal_type == 24 {
+                let nals = unpack_h264_stap_a(payload);
+                for nal in nals {
+                    if !nal.is_empty() {
+                        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+                        annex_b.extend_from_slice(&nal);
+                    }
+                }
+            } else if nal_type == 28 && payload.len() >= 2 {
+                let s_bit = (payload[1] & 0x80) != 0;
+                let e_bit = (payload[1] & 0x40) != 0;
+                let inner_type = payload[1] & 0x1F;
+
+                if s_bit {
+                    fu_buf.clear();
+                    fu_buf.push((payload[0] & 0xE0) | inner_type);
+                    fu_buf.extend_from_slice(&payload[2..]);
+                } else if !fu_buf.is_empty() {
+                    fu_buf.extend_from_slice(&payload[2..]);
+                }
+
+                if e_bit && !fu_buf.is_empty() {
+                    annex_b.extend_from_slice(&[0, 0, 0, 1]);
+                    annex_b.extend_from_slice(&fu_buf);
+                    fu_buf.clear();
+                }
+            }
+        } else {
+            let nal_type = (payload[0] >> 1) & 0x3F;
+            if nal_type < 48 {
+                annex_b.extend_from_slice(&[0, 0, 0, 1]);
+                annex_b.extend_from_slice(payload);
+            } else if nal_type == 48 {
+                let nals = unpack_h265_ap(payload);
+                for nal in nals {
+                    if !nal.is_empty() {
+                        annex_b.extend_from_slice(&[0, 0, 0, 1]);
+                        annex_b.extend_from_slice(&nal);
+                    }
+                }
+            } else if nal_type == 49 && payload.len() >= 3 {
+                let s_bit = (payload[2] & 0x80) != 0;
+                let e_bit = (payload[2] & 0x40) != 0;
+                let inner_type = payload[2] & 0x3F;
+
+                if s_bit {
+                    fu_buf.clear();
+                    fu_buf.push((payload[0] & 0x81) | (inner_type << 1));
+                    fu_buf.push(payload[1]);
+                    fu_buf.extend_from_slice(&payload[3..]);
+                } else if !fu_buf.is_empty() {
+                    fu_buf.extend_from_slice(&payload[3..]);
+                }
+
+                if e_bit && !fu_buf.is_empty() {
+                    annex_b.extend_from_slice(&[0, 0, 0, 1]);
+                    annex_b.extend_from_slice(&fu_buf);
+                    fu_buf.clear();
+                }
+            }
+        }
+    }
+    annex_b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +717,62 @@ mod tests {
 
         let sprop = track.get_sprop().expect("sprop should exist from fmtp");
         assert!(sprop.contains("Z0IAKeNQDwBE/LgLcBAQFA=="));
+    }
+
+    #[test]
+    fn test_track_gop_caching_and_replay() {
+        let codec = Codec::new_h264();
+        let track = Track::new(codec, MediaKind::Video, 100);
+
+        // Pre-cache SPS / PPS
+        let sps_payload = vec![0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed];
+        track.send(RtpPacket::create(96, 1, 1000, 0x1234, false, &sps_payload));
+        let pps_payload = vec![0x68, 0xce, 0x38, 0x80];
+        track.send(RtpPacket::create(96, 2, 1000, 0x1234, false, &pps_payload));
+
+        // Send Keyframe (IDR slice: NAL type 5)
+        let idr_payload = vec![0x65, 0x88, 0x84, 0x00, 0x10];
+        track.send(RtpPacket::create(96, 3, 3000, 0x1234, true, &idr_payload));
+
+        // Send P-frame (NAL type 1)
+        let p1_payload = vec![0x41, 0x9a, 0x12, 0x34];
+        track.send(RtpPacket::create(96, 4, 6000, 0x1234, true, &p1_payload));
+
+        // Send second P-frame
+        let p2_payload = vec![0x41, 0x9a, 0x56, 0x78];
+        track.send(RtpPacket::create(96, 5, 9000, 0x1234, true, &p2_payload));
+
+        let gop = track.get_gop_packets();
+        assert_eq!(gop.len(), 4); // STAP-A parameter set + IDR + P1 + P2
+
+        let kf = track.get_keyframe_packets();
+        assert_eq!(kf.len(), 2); // STAP-A parameter set + IDR
+        assert_eq!(kf[1].timestamp, 3000);
+
+        // Send next Keyframe at timestamp 12000
+        let idr2_payload = vec![0x65, 0x88, 0x84, 0x00, 0x20];
+        track.send(RtpPacket::create(96, 6, 12000, 0x1234, true, &idr2_payload));
+
+        let gop2 = track.get_gop_packets();
+        assert_eq!(gop2.len(), 2); // STAP-A + new IDR
+        assert_eq!(gop2[1].timestamp, 12000);
+    }
+
+    #[test]
+    fn test_rtp_packets_to_annex_b_conversion() {
+        let sps = vec![0x67, 0x42, 0x00, 0x1f];
+        let pps = vec![0x68, 0xce, 0x38, 0x80];
+        let stap_a = build_h264_stap_a(&sps, &pps);
+        let stap_pkt = RtpPacket::create(96, 1, 1000, 0x1234, false, &stap_a);
+
+        // Single NAL IDR packet
+        let idr = vec![0x65, 0x88, 0x84, 0x00, 0x10];
+        let idr_pkt = RtpPacket::create(96, 2, 1000, 0x1234, true, &idr);
+
+        let annex_b = rtp_packets_to_annex_b(false, &[stap_pkt, idr_pkt]);
+        // Expect [0, 0, 0, 1] + SPS + [0, 0, 0, 1] + PPS + [0, 0, 0, 1] + IDR
+        assert!(annex_b.starts_with(&[0, 0, 0, 1, 0x67]));
+        assert!(annex_b.contains(&0x68));
+        assert!(annex_b.contains(&0x65));
     }
 }

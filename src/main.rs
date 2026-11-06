@@ -363,6 +363,7 @@ async fn main() -> Result<()> {
         sip: Arc::clone(&sip_manager),
         record: record_manager,
         rtsp_port,
+        snapshots: Arc::new(api::SnapshotManager::new()),
     };
 
     let app = api::create_router(app_state);

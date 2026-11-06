@@ -17,6 +17,47 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info};
 
 #[derive(Clone)]
+struct CachedSnapshot {
+    jpeg: Bytes,
+    created_at: tokio::time::Instant,
+}
+
+#[derive(Default)]
+pub struct SnapshotManager {
+    cache: std::sync::Mutex<std::collections::HashMap<String, CachedSnapshot>>,
+    in_flight: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<Result<Bytes, String>>>>,
+}
+
+impl SnapshotManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get_cached(&self, key: &str) -> Option<Bytes> {
+        let mut map = self.cache.lock().unwrap();
+        if let Some(entry) = map.get(key) {
+            if entry.created_at.elapsed() < std::time::Duration::from_millis(1000) {
+                return Some(entry.jpeg.clone());
+            } else {
+                map.remove(key);
+            }
+        }
+        None
+    }
+
+    pub fn insert_cached(&self, key: String, jpeg: Bytes) {
+        let mut map = self.cache.lock().unwrap();
+        map.insert(
+            key,
+            CachedSnapshot {
+                jpeg,
+                created_at: tokio::time::Instant::now(),
+            },
+        );
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub streams: Arc<StreamManager>,
     pub ffmpeg: Arc<FfmpegManager>,
@@ -24,6 +65,7 @@ pub struct AppState {
     pub sip: Arc<crate::sip::SipManager>,
     pub record: Arc<crate::record::RecordManager>,
     pub rtsp_port: u16,
+    pub snapshots: Arc<SnapshotManager>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -614,11 +656,8 @@ async fn api_ffmpeg_handler(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn api_frame_handler(
-    State(state): State<AppState>,
-    Query(query): Query<FrameQuery>,
-) -> Response {
-    let (source, is_hevc) = if let Some(stream) = state.streams.get(&query.src).await {
+async fn generate_snapshot(state: &AppState, src: &str) -> anyhow::Result<Bytes> {
+    if let Some(stream) = state.streams.get(src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
         // Wait up to 3 seconds for tracks to be populated if just starting
         for _ in 0..30 {
@@ -627,18 +666,123 @@ async fn api_frame_handler(
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+
         let tracks = stream.get_tracks().await;
-        let is_hevc = tracks.iter().any(|t| {
-            t.kind == crate::core::MediaKind::Video
-                && (t.codec.name.to_uppercase().contains("265")
-                    || t.codec.name.to_uppercase().contains("HEVC"))
-        });
-        (format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, query.src), is_hevc)
+        let vtrack = tracks.iter().find(|t| t.kind == MediaKind::Video);
+        if let Some(vtrack) = vtrack {
+            let is_hevc = vtrack.codec.name.eq_ignore_ascii_case("H265")
+                || vtrack.codec.name.eq_ignore_ascii_case("HEVC");
+
+            // Wait up to 2 seconds for a keyframe in track cache if stream just started
+            let mut kf_packets = vtrack.get_keyframe_packets();
+            if kf_packets.is_empty() {
+                let mut rx = vtrack.subscribe();
+                let start = tokio::time::Instant::now();
+                while start.elapsed() < tokio::time::Duration::from_millis(2000) {
+                    if let Ok(pkt) = tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv()).await {
+                        if let Ok(p) = pkt {
+                            let (is_kf, _) = crate::core::is_keyframe_or_param_set(is_hevc, p.payload());
+                            if is_kf {
+                                kf_packets = vtrack.get_keyframe_packets();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !kf_packets.is_empty() {
+                let annex_b = crate::core::rtp_packets_to_annex_b(is_hevc, &kf_packets);
+                if !annex_b.is_empty() {
+                    match state.ffmpeg.take_snapshot_from_keyframe(is_hevc, &annex_b).await {
+                        Ok(bytes) => return Ok(bytes),
+                        Err(e) => {
+                            debug!(error = %e, "Stdin snapshot fallback to loopback RTSP");
+                        }
+                    }
+                }
+            }
+
+            // Fallback to RTSP loopback if keyframe couldn't be extracted
+            let source = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src);
+            state.ffmpeg.take_snapshot(&source, state.rtsp_port, is_hevc).await
+        } else {
+            let source = format!("rtsp://127.0.0.1:{}/{}", state.rtsp_port, src);
+            state.ffmpeg.take_snapshot(&source, state.rtsp_port, false).await
+        }
     } else {
-        (query.src.clone(), false)
+        state.ffmpeg.take_snapshot(src, state.rtsp_port, false).await
+    }
+}
+
+async fn api_frame_handler(
+    State(state): State<AppState>,
+    Query(query): Query<FrameQuery>,
+) -> Response {
+    let key = query.src.clone();
+
+    // 1. Check 1s TTL snapshot cache
+    if let Some(cached) = state.snapshots.get_cached(&key) {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "image/jpeg")],
+            cached,
+        )
+            .into_response();
+    }
+
+    // 2. Request coalescing (singleflight)
+    let (mut rx, is_leader) = {
+        let mut in_flight = state.snapshots.in_flight.lock().unwrap();
+        if let Some(tx) = in_flight.get(&key) {
+            (tx.subscribe(), false)
+        } else {
+            let (tx, rx) = tokio::sync::broadcast::channel(1);
+            in_flight.insert(key.clone(), tx);
+            (rx, true)
+        }
     };
 
-    match state.ffmpeg.take_snapshot(&source, state.rtsp_port, is_hevc).await {
+    if !is_leader {
+        return match rx.recv().await {
+            Ok(Ok(jpeg_bytes)) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "image/jpeg")],
+                jpeg_bytes,
+            )
+                .into_response(),
+            Ok(Err(err_msg)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to take snapshot: {}", err_msg),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Snapshot generator cancelled".to_string(),
+            )
+                .into_response(),
+        };
+    }
+
+    let result = generate_snapshot(&state, &key).await;
+
+    // Cache on success & notify waiting followers
+    {
+        let mut in_flight = state.snapshots.in_flight.lock().unwrap();
+        if let Some(tx) = in_flight.remove(&key) {
+            match &result {
+                Ok(bytes) => {
+                    state.snapshots.insert_cached(key.clone(), bytes.clone());
+                    let _ = tx.send(Ok(bytes.clone()));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                }
+            }
+        }
+    }
+
+    match result {
         Ok(jpeg_bytes) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "image/jpeg")],
@@ -646,7 +790,7 @@ async fn api_frame_handler(
         )
             .into_response(),
         Err(e) => {
-            error!(source = %source, "Failed to capture snapshot: {}", e);
+            error!(source = %key, "Failed to capture snapshot: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to take snapshot: {}", e),
@@ -1183,7 +1327,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                     let packet = match rx.recv().await {
                                         Ok(p) => p,
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE H.265 receiver lagged");
+                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE H.265 receiver lagged; resetting depacketizer");
+                                            depacketizer.reset();
                                             continue;
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1236,7 +1381,8 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                     let packet = match rx.recv().await {
                                         Ok(p) => p,
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged");
+                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged; resetting depacketizer");
+                                            depacketizer.reset();
                                             continue;
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1610,6 +1756,18 @@ mod tests {
         });
         let query: SipHangupQuery = serde_json::from_value(json).expect("deserialize hangup query");
         assert_eq!(query.stream, "doorbell");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_manager_cache() {
+        let sm = SnapshotManager::new();
+        assert!(sm.get_cached("cam1").is_none());
+
+        let fake_jpeg = Bytes::from_static(b"\xFF\xD8\xFF\xE0fakejpeg");
+        sm.insert_cached("cam1".to_string(), fake_jpeg.clone());
+
+        assert_eq!(sm.get_cached("cam1"), Some(fake_jpeg));
+        assert!(sm.get_cached("cam2").is_none());
     }
 }
 

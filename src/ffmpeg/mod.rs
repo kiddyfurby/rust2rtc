@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use md5::{Digest, Md5};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
 
@@ -468,6 +468,48 @@ impl FfmpegManager {
 
         if !status.success() || buffer.is_empty() {
             bail!("FFmpeg snapshot failed or produced empty image");
+        }
+
+        Ok(Bytes::from(buffer))
+    }
+
+    /// Generate a snapshot JPEG image by piping an in-memory Annex-B keyframe into FFmpeg stdin
+    pub async fn take_snapshot_from_keyframe(&self, is_hevc: bool, annex_b: &[u8]) -> Result<Bytes> {
+        if annex_b.is_empty() {
+            bail!("Empty keyframe Annex-B buffer");
+        }
+
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(["-hide_banner", "-v", "error"]);
+
+        if is_hevc {
+            cmd.args(["-f", "hevc"]);
+        } else {
+            cmd.args(["-f", "h264"]);
+        }
+
+        cmd.args(["-i", "-", "-vframes", "1", "-f", "image2", "-c:v", "mjpeg", "-"]);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().with_context(|| "Failed to spawn snapshot FFmpeg stdin worker")?;
+        let mut stdin = child.stdin.take().context("No stdin")?;
+        let mut stdout = child.stdout.take().context("No stdout")?;
+
+        stdin.write_all(annex_b).await?;
+        drop(stdin);
+
+        let mut buffer = Vec::new();
+        let read_res = tokio::time::timeout(tokio::time::Duration::from_secs(5), stdout.read_to_end(&mut buffer)).await;
+        if read_res.is_err() {
+            let _ = child.kill().await;
+            bail!("FFmpeg stdin snapshot timed out");
+        }
+        let status = child.wait().await?;
+
+        if !status.success() || buffer.is_empty() {
+            bail!("FFmpeg stdin snapshot failed or produced empty image");
         }
 
         Ok(Bytes::from(buffer))

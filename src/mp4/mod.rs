@@ -53,7 +53,7 @@ impl BoxWriter {
 pub struct VideoSample {
     pub is_keyframe: bool,
     pub duration: u32,
-    pub nalus: Vec<Vec<u8>>,
+    pub nalus: Vec<bytes::Bytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -878,7 +878,7 @@ pub fn make_h264_media_segment(
     base_decode_time: u64,
     duration: u32,
     is_keyframe: bool,
-    nalus: &[Vec<u8>],
+    nalus: &[bytes::Bytes],
 ) -> Vec<u8> {
     if nalus.is_empty() {
         return Vec::new();
@@ -1252,7 +1252,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// H.264 RTP Depacketizer: reconstructs complete NALUs from single NAL, STAP-A, and FU-A RTP packets
 pub struct H264RtpDepacketizer {
     fu_buffer: Vec<u8>,
-    current_frame: Vec<Vec<u8>>,
+    current_frame: Vec<bytes::Bytes>,
     last_timestamp: Option<u32>,
     pub sps: Option<Vec<u8>>,
     pub pps: Option<Vec<u8>>,
@@ -1269,8 +1269,14 @@ impl H264RtpDepacketizer {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.fu_buffer.clear();
+        self.current_frame.clear();
+        self.last_timestamp = None;
+    }
+
     /// Feed an RTP packet; returns (is_keyframe, timestamp, nalus) when a complete frame is finished
-    pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<Vec<u8>>)> {
+    pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<bytes::Bytes>)> {
         let payload = packet.payload();
         if payload.is_empty() {
             return None;
@@ -1296,7 +1302,8 @@ impl H264RtpDepacketizer {
             } else if nal_type == 8 {
                 self.pps = Some(payload.to_vec());
             }
-            self.current_frame.push(payload.to_vec());
+            let nalu = packet.raw.slice(packet.payload_offset..packet.payload_offset + packet.payload_len);
+            self.current_frame.push(nalu);
         } else if nal_type == 24 {
             // STAP-A packet (aggregates multiple NALUs)
             let mut offset = 1;
@@ -1304,12 +1311,12 @@ impl H264RtpDepacketizer {
                 let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
                 offset += 2;
                 if offset + size <= payload.len() {
-                    let nalu = payload[offset..offset + size].to_vec();
+                    let nalu = packet.raw.slice(packet.payload_offset + offset..packet.payload_offset + offset + size);
                     let inner_type = nalu[0] & 0x1F;
                     if inner_type == 7 {
-                        self.sps = Some(nalu.clone());
+                        self.sps = Some(nalu.to_vec());
                     } else if inner_type == 8 {
-                        self.pps = Some(nalu.clone());
+                        self.pps = Some(nalu.to_vec());
                     }
                     self.current_frame.push(nalu);
                     offset += size;
@@ -1336,11 +1343,11 @@ impl H264RtpDepacketizer {
                 }
 
                 if e_bit && !self.fu_buffer.is_empty() {
-                    let complete_nalu = std::mem::take(&mut self.fu_buffer);
+                    let complete_nalu = bytes::Bytes::from(std::mem::take(&mut self.fu_buffer));
                     if inner_type == 7 {
-                        self.sps = Some(complete_nalu.clone());
+                        self.sps = Some(complete_nalu.to_vec());
                     } else if inner_type == 8 {
-                        self.pps = Some(complete_nalu.clone());
+                        self.pps = Some(complete_nalu.to_vec());
                     }
                     self.current_frame.push(complete_nalu);
                 }
@@ -1538,7 +1545,7 @@ pub fn make_h265_init_segment(
 /// H.265 RTP Depacketizer: reconstructs complete NALUs from single NAL, AP (48), and FU (49) RTP packets
 pub struct H265RtpDepacketizer {
     fu_buffer: Vec<u8>,
-    current_frame: Vec<Vec<u8>>,
+    current_frame: Vec<bytes::Bytes>,
     last_timestamp: Option<u32>,
     pub vps: Option<Vec<u8>>,
     pub sps: Option<Vec<u8>>,
@@ -1557,6 +1564,12 @@ impl H265RtpDepacketizer {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.fu_buffer.clear();
+        self.current_frame.clear();
+        self.last_timestamp = None;
+    }
+
     fn cache_param_set(&mut self, nalu: &[u8]) {
         if nalu.len() >= 2 {
             let nal_type = (nalu[0] >> 1) & 0x3F;
@@ -1569,7 +1582,7 @@ impl H265RtpDepacketizer {
         }
     }
 
-    pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<Vec<u8>>)> {
+    pub fn feed_packet(&mut self, packet: &crate::core::RtpPacket) -> Option<(bool, u32, Vec<bytes::Bytes>)> {
         let payload = packet.payload();
         if payload.len() < 2 {
             return None;
@@ -1591,7 +1604,8 @@ impl H265RtpDepacketizer {
 
         if nal_type < 48 {
             self.cache_param_set(payload);
-            self.current_frame.push(payload.to_vec());
+            let nalu = packet.raw.slice(packet.payload_offset..packet.payload_offset + packet.payload_len);
+            self.current_frame.push(nalu);
         } else if nal_type == 48 {
             // Aggregation Packet (AP)
             let mut offset = 2;
@@ -1599,7 +1613,7 @@ impl H265RtpDepacketizer {
                 let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
                 offset += 2;
                 if size > 0 && offset + size <= payload.len() {
-                    let nalu = payload[offset..offset + size].to_vec();
+                    let nalu = packet.raw.slice(packet.payload_offset + offset..packet.payload_offset + offset + size);
                     self.cache_param_set(&nalu);
                     self.current_frame.push(nalu);
                     offset += size;
@@ -1627,7 +1641,7 @@ impl H265RtpDepacketizer {
             }
 
             if e_bit && !self.fu_buffer.is_empty() {
-                let complete_nalu = std::mem::take(&mut self.fu_buffer);
+                let complete_nalu = bytes::Bytes::from(std::mem::take(&mut self.fu_buffer));
                 self.cache_param_set(&complete_nalu);
                 self.current_frame.push(complete_nalu);
             }
@@ -1700,7 +1714,7 @@ mod tests {
         assert!(find_subsequence(&init, b"moov").is_some());
 
         // Test media segment
-        let nalus = vec![vec![0x65, 0x88, 0x84, 0x00, 0x10]];
+        let nalus = vec![bytes::Bytes::from_static(&[0x65, 0x88, 0x84, 0x00, 0x10])];
         let seg = make_h264_media_segment(1, 0, 3000, true, &nalus);
         assert!(seg.len() > 50);
         assert_eq!(&seg[4..8], b"moof");
@@ -1721,12 +1735,12 @@ mod tests {
             VideoSample {
                 is_keyframe: true,
                 duration: 6000,
-                nalus: vec![vec![0x65, 0x88, 0x84, 0x00, 0x10]],
+                nalus: vec![bytes::Bytes::from_static(&[0x65, 0x88, 0x84, 0x00, 0x10])],
             },
             VideoSample {
                 is_keyframe: false,
                 duration: 6000,
-                nalus: vec![vec![0x41, 0x9a, 0x12, 0x34]],
+                nalus: vec![bytes::Bytes::from_static(&[0x41, 0x9a, 0x12, 0x34])],
             },
         ];
 
