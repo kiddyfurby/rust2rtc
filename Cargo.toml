@@ -42,3 +42,8 @@ symphonia-core = "0.6.1"
 symphonia-codec-aac = "0.6.1"
 opus-pure = "0.2.2"
 tokio-tungstenite = "0.26"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

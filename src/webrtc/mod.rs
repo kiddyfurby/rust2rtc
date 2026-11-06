@@ -49,6 +49,7 @@ pub struct WebRtcManager {
 }
 
 impl WebRtcManager {
+    #[allow(dead_code)]
     pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String, engine: String) -> Self {
         Self::with_max_payload_size(candidates, rtsp_port, ffmpeg_bin, engine, 1200)
     }
@@ -439,6 +440,7 @@ fn forward_webrtc_payload_inner(
 }
 
 /// Convenience wrapper for backwards compatibility and tests
+#[allow(dead_code)]
 pub fn fragment_payload_for_webrtc(
     is_hevc: bool,
     payload: &[u8],
