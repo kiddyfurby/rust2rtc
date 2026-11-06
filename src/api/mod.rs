@@ -154,7 +154,11 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 async fn index_handler() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+    Html(INDEX_HTML)
+}
+
+const INDEX_HTML: &str = concat!(
+    r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -275,6 +279,24 @@ async fn index_handler() -> Html<&'static str> {
         button.btn-primary:hover {
             background: #2ea043;
         }
+        footer {
+            margin-top: 48px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            color: #8b949e;
+            font-size: 13px;
+        }
+        footer .commit-hash {
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+            background: #21262d;
+            padding: 2px 6px;
+            border-radius: 4px;
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
     </style>
 </head>
 <body>
@@ -287,6 +309,21 @@ async fn index_handler() -> Html<&'static str> {
     </header>
 
     <div id="streams" class="stream-grid">Loading streams...</div>
+
+    <footer>
+        <div>
+            <span>🦀 <b>rust2rtc</b> v"#,
+    env!("CARGO_PKG_VERSION"),
+    r#"</span>
+            <span style="margin: 0 8px; color: var(--border);">|</span>
+            <span>Commit: <span class="commit-hash">"#,
+    env!("GIT_HASH"),
+    r#"</span></span>
+        </div>
+        <div>
+            <span style="color: #6e7681;">High-Performance WebRTC &amp; RTSP Gateway</span>
+        </div>
+    </footer>
 
     <script>
         const activePeerConnections = new Map();
@@ -464,13 +501,15 @@ async fn index_handler() -> Html<&'static str> {
         setInterval(loadStreams, 3000);
     </script>
 </body>
-</html>"#)
-}
+</html>"#
+);
 
 async fn api_info_handler(State(state): State<AppState>) -> Response {
     let resp = serde_json::json!({
         "version": "1.9.14",
         "revision": concat!("rust2rtc-", env!("CARGO_PKG_VERSION")),
+        "rust2rtc_version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("GIT_HASH"),
         "host": "127.0.0.1:1984",
         "rtsp": {
             "listen": format!(":{}", state.rtsp_port),
@@ -1778,6 +1817,14 @@ mod tests {
 
         assert_eq!(sm.get_cached("cam1"), Some(fake_jpeg));
         assert!(sm.get_cached("cam2").is_none());
+    }
+
+    #[test]
+    fn test_index_html_footer() {
+        assert!(INDEX_HTML.contains("<footer>"));
+        assert!(INDEX_HTML.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        assert!(INDEX_HTML.contains(env!("GIT_HASH")));
+        assert!(INDEX_HTML.contains("commit-hash"));
     }
 }
 
