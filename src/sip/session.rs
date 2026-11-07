@@ -9,7 +9,7 @@ use crate::core::{MediaKind, RtpPacket};
 use crate::ffmpeg::FfmpegManager;
 use crate::streams::Stream;
 use anyhow::{Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -462,26 +462,41 @@ impl SipCallSession {
 
                                 last_was_param_set = is_param_set;
 
-                                let mut raw = packet.raw.to_vec();
-                                if raw.len() >= 12 {
-                                    if negotiated_video_pt != 0 {
-                                        raw[1] = (raw[1] & 0x80) | (negotiated_video_pt & 0x7F);
+                                let raw_len = packet.raw.len();
+                                let mut send_buf = [0u8; 2048];
+                                let mut heap_fallback;
+                                let to_send: &[u8] = if raw_len <= send_buf.len() {
+                                    send_buf[..raw_len].copy_from_slice(&packet.raw);
+                                    if raw_len >= 12 {
+                                        if negotiated_video_pt != 0 {
+                                            send_buf[1] = (send_buf[1] & 0x80) | (negotiated_video_pt & 0x7F);
+                                        }
+                                        send_buf[2..4].copy_from_slice(&out_seq.to_be_bytes());
+                                        out_seq = out_seq.wrapping_add(1);
+                                        send_buf[8..12].copy_from_slice(&out_ssrc.to_be_bytes());
                                     }
-                                    // Strictly monotonic sequence numbers
-                                    raw[2..4].copy_from_slice(&out_seq.to_be_bytes());
-                                    out_seq = out_seq.wrapping_add(1);
-                                    // Strictly consistent SSRC matching STAP-A
-                                    raw[8..12].copy_from_slice(&out_ssrc.to_be_bytes());
-                                }
+                                    &send_buf[..raw_len]
+                                } else {
+                                    heap_fallback = packet.raw.to_vec();
+                                    if heap_fallback.len() >= 12 {
+                                        if negotiated_video_pt != 0 {
+                                            heap_fallback[1] = (heap_fallback[1] & 0x80) | (negotiated_video_pt & 0x7F);
+                                        }
+                                        heap_fallback[2..4].copy_from_slice(&out_seq.to_be_bytes());
+                                        out_seq = out_seq.wrapping_add(1);
+                                        heap_fallback[8..12].copy_from_slice(&out_ssrc.to_be_bytes());
+                                    }
+                                    &heap_fallback
+                                };
 
                                 let (primary, alt) = *tx_v_targets.lock().await;
-                                if let Err(e) = video_socket.send_to(&raw, primary).await {
+                                if let Err(e) = video_socket.send_to(to_send, primary).await {
                                     debug!("Error forwarding video to SIP peer: {}", e);
                                     break;
                                 }
                                 if let Some(alt_addr) = alt
                                     && alt_addr != primary {
-                                        let _ = video_socket.send_to(&raw, alt_addr).await;
+                                        let _ = video_socket.send_to(to_send, alt_addr).await;
                                     }
                                 pkt_count += 1;
                                 if pkt_count == 1 || pkt_count.is_multiple_of(300) {
@@ -670,7 +685,7 @@ impl SipCallSession {
                             *guard = Some(child);
                         }
 
-                        let mut stream_buf = Vec::with_capacity(65536);
+                        let mut stream_buf = BytesMut::with_capacity(65536);
                         let mut chunk = [0u8; 8192];
                         let mut pkt_count = 0u64;
                         let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
@@ -678,6 +693,9 @@ impl SipCallSession {
                         let base_timestamp: u32 = (uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32;
                         let start_time = tokio::time::Instant::now();
                         let mut next_frame_time = tokio::time::Instant::now();
+                        let soi_finder = memchr::memmem::Finder::new(&[0xFF, 0xD8]);
+                        let eoi_finder = memchr::memmem::Finder::new(&[0xFF, 0xD9]);
+                        let mut scan_pos = 0usize;
 
                         loop {
                             let n = match stdout.read(&mut chunk).await {
@@ -695,25 +713,41 @@ impl SipCallSession {
                             stream_buf.extend_from_slice(&chunk[..n]);
 
                             // Extract complete frames. If backlog has accumulated, drop stale frames and keep only the latest live frame
-                            let mut latest_frame: Option<Vec<u8>> = None;
+                            let mut latest_frame: Option<Bytes> = None;
                             let mut dropped_count = 0;
 
-                            while let Some(soi_pos) = find_marker(&stream_buf, &[0xFF, 0xD8]) {
-                                if soi_pos > 0 {
-                                    stream_buf.drain(..soi_pos);
+                            loop {
+                                if !stream_buf.starts_with(&[0xFF, 0xD8]) {
+                                    if let Some(soi_pos) = soi_finder.find(&stream_buf) {
+                                        let _ = stream_buf.split_to(soi_pos);
+                                        scan_pos = 2;
+                                    } else {
+                                        if stream_buf.ends_with(&[0xFF]) {
+                                            let drop_len = stream_buf.len() - 1;
+                                            let _ = stream_buf.split_to(drop_len);
+                                        } else {
+                                            stream_buf.clear();
+                                        }
+                                        scan_pos = 0;
+                                        break;
+                                    }
                                 }
+
                                 if stream_buf.len() < 4 {
                                     break;
                                 }
-                                if let Some(eoi_rel) = find_marker(&stream_buf[2..], &[0xFF, 0xD9]) {
-                                    let eoi_pos = 2 + eoi_rel + 2;
+
+                                let search_start = scan_pos.saturating_sub(1).max(2);
+                                if let Some(rel) = eoi_finder.find(&stream_buf[search_start..]) {
+                                    let eoi_end = search_start + rel + 2;
+                                    let jpeg = stream_buf.split_to(eoi_end).freeze();
+                                    scan_pos = 0;
                                     if latest_frame.is_some() {
                                         dropped_count += 1;
                                     }
-                                    latest_frame = Some(stream_buf[..eoi_pos].to_vec());
-                                    stream_buf.drain(..eoi_pos);
+                                    latest_frame = Some(jpeg);
                                 } else {
-                                    // Incomplete frame, wait for more data
+                                    scan_pos = stream_buf.len();
                                     break;
                                 }
                             }
@@ -815,6 +849,7 @@ impl Drop for SipCallSession {
     }
 }
 
+#[allow(dead_code)]
 fn find_marker(buf: &[u8], marker: &[u8; 2]) -> Option<usize> {
-    buf.windows(2).position(|w| w == marker)
+    memchr::memmem::find(buf, marker)
 }
