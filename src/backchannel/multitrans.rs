@@ -397,7 +397,7 @@ async fn read_rtsp_response(
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 fn extract_session_id(body: &str) -> Option<String> {

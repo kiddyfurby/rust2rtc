@@ -251,6 +251,14 @@ impl RtspClient {
 
         info!(stream = %stream.name, "RTSP PLAY active, streaming in-process interleaved RTP");
 
+        // Fast flat-array channel lookup table (O(1) index without hash calculation)
+        let mut channel_table: [Option<Arc<Track>>; 16] = Default::default();
+        for (&ch, track) in &channel_map {
+            if (ch as usize) < channel_table.len() {
+                channel_table[ch as usize] = Some(Arc::clone(track));
+            }
+        }
+
         // 6. Interleaved RTP packet loop
         let mut keepalive_timer = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(25),
@@ -283,7 +291,12 @@ impl RtspClient {
 
                 // Channel is RTP
                 let packet_len = packet_bytes.len() as u64;
-                if let Some(track) = channel_map.get(&ch)
+                let track_opt = if (ch as usize) < channel_table.len() {
+                    channel_table[ch as usize].as_ref()
+                } else {
+                    channel_map.get(&ch)
+                };
+                if let Some(track) = track_opt
                     && let Some(rtp) = RtpPacket::parse(packet_bytes) {
                         stream.packets_recv.fetch_add(1, Ordering::Relaxed);
                         stream.bytes_recv.fetch_add(packet_len, Ordering::Relaxed);
@@ -309,7 +322,7 @@ impl RtspClient {
                             continue;
                         }
                     }
-                } else if let Some(dollar_pos) = buffer.iter().position(|&b| b == b'$') {
+                } else if let Some(dollar_pos) = memchr::memchr(b'$', &buffer) {
                     // Resynchronize to next interleaved RTP packet!
                     warn!(stream = %stream.name, discarded = dollar_pos, "Resynchronizing interleaved RTSP stream to next '$'");
                     let _ = buffer.split_to(dollar_pos);
@@ -643,7 +656,7 @@ fn hex_md5(input: &str) -> String {
 }
 
 fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+    memchr::memmem::find(buf, b"\r\n\r\n")
 }
 
 #[derive(Debug, Clone)]

@@ -1246,7 +1246,7 @@ impl<'a> BitReader<'a> {
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// H.264 RTP Depacketizer: reconstructs complete NALUs from single NAL, STAP-A, and FU-A RTP packets

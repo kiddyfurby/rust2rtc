@@ -546,12 +546,7 @@ impl RtspServer {
 }
 
 fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
-    for i in 0..buf.len().saturating_sub(3) {
-        if &buf[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    None
+    memchr::memmem::find(buf, b"\r\n\r\n")
 }
 
 fn parse_rtsp_headers(raw: &[u8]) -> Result<(String, String, String, HashMap<String, String>)> {
