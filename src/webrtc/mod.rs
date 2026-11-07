@@ -347,10 +347,9 @@ fn forward_webrtc_payload_inner(
 
             let data = &payload[1..];
             let chunk_size = max_chunk.saturating_sub(2).max(1);
-            let chunks: Vec<_> = data.chunks(chunk_size).collect();
-            let total = chunks.len();
+            let total = data.len().div_ceil(chunk_size);
 
-            for (idx, chunk) in chunks.into_iter().enumerate() {
+            for (idx, chunk) in data.chunks(chunk_size).enumerate() {
                 let is_first = idx == 0;
                 let is_last = idx == total - 1;
                 let new_fu = (if is_first { 0x80 } else { 0 })
@@ -382,10 +381,9 @@ fn forward_webrtc_payload_inner(
 
             let data = &payload[3..];
             let chunk_size = max_chunk.saturating_sub(3).max(1);
-            let chunks: Vec<_> = data.chunks(chunk_size).collect();
-            let total = chunks.len();
+            let total = data.len().div_ceil(chunk_size);
 
-            for (idx, chunk) in chunks.into_iter().enumerate() {
+            for (idx, chunk) in data.chunks(chunk_size).enumerate() {
                 let is_first = idx == 0;
                 let is_last = idx == total - 1;
                 let chunk_s = if is_first { s_bit } else { false };
@@ -413,10 +411,9 @@ fn forward_webrtc_payload_inner(
 
             let data = &payload[2..];
             let chunk_size = max_chunk.saturating_sub(3).max(1);
-            let chunks: Vec<_> = data.chunks(chunk_size).collect();
-            let total = chunks.len();
+            let total = data.len().div_ceil(chunk_size);
 
-            for (idx, chunk) in chunks.into_iter().enumerate() {
+            for (idx, chunk) in data.chunks(chunk_size).enumerate() {
                 let is_first = idx == 0;
                 let is_last = idx == total - 1;
                 let new_fu = (if is_first { 0x80 } else { 0 })
