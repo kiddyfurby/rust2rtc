@@ -237,6 +237,7 @@ struct GopCache {
 pub struct Track {
     pub codec: Codec,
     pub kind: MediaKind,
+    pub is_hevc: bool,
     tx: broadcast::Sender<RtpPacket>,
     pub packets_total: Arc<AtomicU64>,
     pub bytes_total: Arc<AtomicU64>,
@@ -253,9 +254,10 @@ impl Track {
     pub fn new(codec: Codec, kind: MediaKind, capacity: usize) -> Self {
         let (tx, _) = broadcast::channel(capacity);
         let mut param_sets = ParamSets::default();
+        let is_hevc = kind == MediaKind::Video
+            && (codec.name.eq_ignore_ascii_case("H265") || codec.name.eq_ignore_ascii_case("HEVC"));
 
         if kind == MediaKind::Video {
-            let is_hevc = codec.name.eq_ignore_ascii_case("H265") || codec.name.eq_ignore_ascii_case("HEVC");
             if let Some(ref fmtp) = codec.fmtp {
                 if !is_hevc {
                     if let Some((sps, pps)) = extract_h264_sps_pps(fmtp) {
@@ -280,6 +282,7 @@ impl Track {
         Self {
             codec,
             kind,
+            is_hevc,
             tx,
             packets_total: Arc::new(AtomicU64::new(0)),
             bytes_total: Arc::new(AtomicU64::new(0)),
@@ -293,10 +296,12 @@ impl Track {
         self.bytes_total.fetch_add(packet.raw.len() as u64, Ordering::Relaxed);
 
         if self.kind == MediaKind::Video {
-            self.inspect_and_cache_params(&packet);
+            let payload = packet.payload();
+            let (is_keyframe, is_param_set) = is_keyframe_or_param_set(self.is_hevc, payload);
 
-            let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
-            let (is_keyframe, _is_param_set) = is_keyframe_or_param_set(is_hevc, packet.payload());
+            if is_param_set {
+                self.inspect_and_cache_params(&packet);
+            }
 
             let mut gop = self.gop_cache.write().unwrap();
             let pkt_len = packet.raw.len();
@@ -342,15 +347,14 @@ impl Track {
         if gop.packets.is_empty() {
             return self.get_param_sets();
         }
-        let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
         let kf_ts = gop.packets.iter().find(|p| {
-            let (is_kf, _) = is_keyframe_or_param_set(is_hevc, p.payload());
+            let (is_kf, _) = is_keyframe_or_param_set(self.is_hevc, p.payload());
             is_kf
         }).map(|p| p.timestamp);
 
         if let Some(ts) = kf_ts {
             gop.packets.iter().filter(|p| {
-                let (_, is_ps) = is_keyframe_or_param_set(is_hevc, p.payload());
+                let (_, is_ps) = is_keyframe_or_param_set(self.is_hevc, p.payload());
                 is_ps || p.timestamp == ts
             }).cloned().collect()
         } else {
@@ -384,14 +388,8 @@ impl Track {
             return;
         }
 
-        let is_hevc = self.codec.name.eq_ignore_ascii_case("H265") || self.codec.name.eq_ignore_ascii_case("HEVC");
-        let (_, is_param_set) = is_keyframe_or_param_set(is_hevc, payload);
-        if !is_param_set {
-            return;
-        }
-
         let mut ps = self.param_sets.write().unwrap();
-        if !is_hevc {
+        if !self.is_hevc {
             let nalu_type = payload[0] & 0x1F;
             if nalu_type == 7 {
                 ps.h264_sps = Some(payload.to_vec());
@@ -607,8 +605,9 @@ pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
 }
 
 pub fn rtp_packets_to_annex_b(is_hevc: bool, packets: &[RtpPacket]) -> Vec<u8> {
-    let mut annex_b = Vec::new();
-    let mut fu_buf = Vec::new();
+    let est_cap: usize = packets.iter().map(|p| p.payload_len + 4).sum();
+    let mut annex_b = Vec::with_capacity(est_cap);
+    let mut fu_buf = Vec::with_capacity(65536);
 
     for pkt in packets {
         let payload = pkt.payload();
