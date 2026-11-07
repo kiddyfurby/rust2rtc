@@ -285,6 +285,22 @@ fn resample_to_48k_stereo(
         return;
     }
 
+    // Fast-path 1: 48kHz stereo input is already in destination format (direct copy)
+    if in_rate == 48000 && in_channels == 2 {
+        output_buf.extend_from_slice(input);
+        return;
+    }
+
+    // Fast-path 2: 48kHz mono input (direct duplicate each sample into L/R, no interpolation)
+    if in_rate == 48000 && in_channels == 1 {
+        output_buf.reserve(input.len() * 2);
+        for &sample in input {
+            output_buf.push(sample);
+            output_buf.push(sample);
+        }
+        return;
+    }
+
     let in_frames = input.len() / in_channels;
     if in_frames == 0 {
         return;
@@ -566,6 +582,18 @@ mod tests {
         assert_eq!(out.len(), 960);
         assert!((out[0] - 0.5).abs() < 1e-4);
         assert!((out[1] - 0.5).abs() < 1e-4);
+
+        // Test 48kHz stereo passthrough fast-path
+        let stereo_48k = vec![0.1f32, 0.2f32, 0.3f32, 0.4f32];
+        let mut out_stereo = Vec::new();
+        resample_to_48k_stereo(&stereo_48k, 48000, 2, &mut out_stereo);
+        assert_eq!(out_stereo, stereo_48k);
+
+        // Test 48kHz mono duplicate fast-path
+        let mono_48k = vec![0.7f32, 0.8f32];
+        let mut out_mono = Vec::new();
+        resample_to_48k_stereo(&mono_48k, 48000, 1, &mut out_mono);
+        assert_eq!(out_mono, vec![0.7f32, 0.7f32, 0.8f32, 0.8f32]);
     }
 
     #[test]
