@@ -392,14 +392,28 @@ const INDEX_HTML: &str = concat!(
                     if (pc.iceGatheringState === 'complete') {
                         resolve();
                     } else {
-                        const check = () => {
-                            if (pc.iceGatheringState === 'complete') {
+                        let resolved = false;
+                        const done = () => {
+                            if (!resolved) {
+                                resolved = true;
                                 pc.removeEventListener('icegatheringstatechange', check);
+                                pc.removeEventListener('icecandidate', onCand);
                                 resolve();
                             }
                         };
+                        const check = () => {
+                            if (pc.iceGatheringState === 'complete') done();
+                        };
+                        const onCand = (e) => {
+                            if (!e.candidate) {
+                                done();
+                            } else if (e.candidate.candidate && e.candidate.candidate.includes('typ host')) {
+                                setTimeout(done, 150);
+                            }
+                        };
                         pc.addEventListener('icegatheringstatechange', check);
-                        setTimeout(resolve, 800);
+                        pc.addEventListener('icecandidate', onCand);
+                        setTimeout(done, 400);
                     }
                 });
 

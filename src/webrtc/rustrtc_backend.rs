@@ -166,6 +166,7 @@ impl RustRtcSession {
             image: vec![],
         });
 
+        let has_ice_servers = !config.ice_servers.is_empty();
         let pc = Arc::new(PeerConnection::new(config));
 
         // 1. Set Remote Description
@@ -269,9 +270,14 @@ impl RustRtcSession {
         pc.set_local_description(answer)?;
 
         // 5. Wait for ICE gathering to complete for non-trickle (WHEP)
+        let gather_timeout = if has_ice_servers {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(100)
+        };
         tokio::select! {
             _ = pc.wait_for_gathering_complete() => {}
-            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = tokio::time::sleep(gather_timeout) => {}
         }
 
         let local_desc = pc
@@ -420,9 +426,27 @@ impl RustRtcSession {
                         _ = close_rx.recv() => break,
                         Ok(()) = connected_rx.recv(), if !connected_fired => {
                             connected_fired = true;
-                            sent_first_keyframe = false;
-                            last_was_param_set = false;
-                            last_keyframe_ts = None;
+                            while rx.try_recv().is_ok() {}
+                            let cached_gop = video_track.get_gop_packets();
+                            if !cached_gop.is_empty() {
+                                tracing::info!(
+                                    stream = %s_clone.name,
+                                    packets = cached_gop.len(),
+                                    "Replaying cached GOP on WebRTC PeerConnection connected"
+                                );
+                                for pkt in &cached_gop {
+                                    if !forward_packet_to_webrtc(&v_source, pkt, actual_video_pt, is_hevc, max_payload_size) {
+                                        return;
+                                    }
+                                }
+                                sent_first_keyframe = true;
+                                last_was_param_set = false;
+                                last_keyframe_ts = cached_gop.last().map(|p| p.timestamp);
+                            } else {
+                                sent_first_keyframe = false;
+                                last_was_param_set = false;
+                                last_keyframe_ts = None;
+                            }
                             continue;
                         }
                         res = rx.recv() => match res {
