@@ -264,6 +264,7 @@ impl RtspClient {
             Duration::from_secs(25),
         );
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut idle_keepalives = 0u32;
 
         let read_timeout = tokio::time::sleep(Duration::from_secs(8));
         tokio::pin!(read_timeout);
@@ -353,6 +354,32 @@ impl RtspClient {
                     return Ok(true);
                 }
                 _ = keepalive_timer.tick() => {
+                    if stream.total_consumers().await == 0 {
+                        idle_keepalives += 1;
+                        if idle_keepalives >= 2 {
+                            info!(stream = %stream.name, "No active consumers on RTSP stream for 50s, stopping on-demand producer");
+                            if let Some(ref sess) = session_id {
+                                let _ = Self::send_raw_request(
+                                    &mut tcp,
+                                    &mut buffer,
+                                    "TEARDOWN",
+                                    &clean_url,
+                                    &mut cseq,
+                                    Some(sess),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                ).await;
+                            }
+                            *stream.producer.lock().await = None;
+                            stream.clear_tracks().await;
+                            return Ok(true);
+                        }
+                    } else {
+                        idle_keepalives = 0;
+                    }
+
                     trace!(stream = %stream.name, "Sending RTSP keepalive");
                     // Try GET_PARAMETER with session first (RFC 2326 standard, preferred by Reolink)
                     let gp_res = tokio::time::timeout(

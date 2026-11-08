@@ -124,6 +124,17 @@ impl Stream {
         tracks.clone()
     }
 
+    pub async fn total_consumers(&self) -> usize {
+        let mut count: usize = self.tracks.read().await.iter().map(|t| t.consumer_count()).sum();
+        if let Some(ref opus) = *self.opus_track.lock().await {
+            count += opus.consumer_count();
+        }
+        if let Some(ref mjpeg) = *self.mjpeg_broadcaster.lock().await {
+            count += mjpeg.receiver_count();
+        }
+        count
+    }
+
     /// Wait until at least one track is registered on this stream, or until `timeout` elapses.
     pub async fn wait_for_tracks(&self, timeout: std::time::Duration) {
         if !self.tracks.read().await.is_empty() {

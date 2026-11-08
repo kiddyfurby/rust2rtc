@@ -136,7 +136,7 @@ fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "rust2rtc=debug,tower_http=debug".into()),
+                .unwrap_or_else(|_| "rust2rtc=info,tower_http=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -222,6 +222,7 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(worker_threads)
+        .thread_stack_size(512 * 1024)
         .build()?;
 
     runtime.block_on(async_main(config))
