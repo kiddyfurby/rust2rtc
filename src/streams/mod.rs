@@ -204,30 +204,36 @@ impl Stream {
             let mut idle_ticks = 0;
 
             loop {
-                // If no viewers are listening to this Opus track for ~60 seconds, shut down worker to save resources
+                // If no viewers are listening to this Opus track for ~5 seconds, shut down worker to save CPU
                 if track_for_worker.consumer_count() == 0 {
                     idle_ticks += 1;
-                    if idle_ticks > 3000 { // ~60 seconds with 20ms audio packets
-                        info!(stream = %stream_name, "No active consumers on shared Opus track after 60s, terminating transcode worker");
+                    if idle_ticks > 250 { // ~5 seconds with 20ms audio packets
+                        info!(stream = %stream_name, "No active consumers on shared Opus track after 5s, terminating transcode worker");
                         break;
                     }
                 } else {
                     idle_ticks = 0;
                 }
 
-                match rx.recv().await {
-                    Ok(packet) => {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                    Ok(Ok(packet)) => {
                         let opus_packets = transcoder.process_packet(&packet);
                         for opus_pkt in opus_packets {
                             track_for_worker.send(opus_pkt);
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
                         tracing::warn!(stream = %stream_name, lagged = n, "Audio transcoder lagged");
                         continue;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                         break;
+                    }
+                    Err(_) => {
+                        if track_for_worker.consumer_count() == 0 {
+                            info!(stream = %stream_name, "Shared Opus source idle with no consumers, terminating transcode worker");
+                            break;
+                        }
                     }
                 }
             }

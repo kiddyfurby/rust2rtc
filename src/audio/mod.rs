@@ -19,6 +19,7 @@ pub struct AudioTranscoder {
     source_channels: usize,
     aac_decoder: Option<AacDecoder>,
     opus_encoder: OpusMSEncoder,
+    decode_scratch: Vec<f32>,
     pcm_buffer: Vec<f32>,
     out_seq: u16,
     out_ts: u32,
@@ -82,6 +83,7 @@ impl AudioTranscoder {
             source_channels,
             aac_decoder,
             opus_encoder,
+            decode_scratch: Vec::with_capacity(2048),
             pcm_buffer: Vec::with_capacity(3840),
             out_seq: 0,
             out_ts: 0,
@@ -115,23 +117,24 @@ impl AudioTranscoder {
             }
         }
 
-        let pcm_floats = if let Some(decoder) = &mut self.aac_decoder {
-            decode_aac_payload(decoder, payload, self.source_rate)
+        self.decode_scratch.clear();
+        if let Some(decoder) = &mut self.aac_decoder {
+            decode_aac_payload_into(decoder, payload, &mut self.decode_scratch);
         } else if self.source_codec.contains("PCMU") {
-            decode_pcmu_payload(payload)
+            decode_pcmu_payload_into(payload, &mut self.decode_scratch);
         } else if self.source_codec.contains("PCMA") {
-            decode_pcma_payload(payload)
+            decode_pcma_payload_into(payload, &mut self.decode_scratch);
         } else {
             return Vec::new();
-        };
+        }
 
-        if pcm_floats.is_empty() {
+        if self.decode_scratch.is_empty() {
             return Vec::new();
         }
 
         // Resample decoded floats to 48000 Hz stereo
         resample_to_48k_stereo(
-            &pcm_floats,
+            &self.decode_scratch,
             self.source_rate,
             self.source_channels,
             &mut self.pcm_buffer,
@@ -172,10 +175,10 @@ impl AudioTranscoder {
     }
 }
 
-/// Decode RFC 3640 AAC-hbr RTP payload using symphonia-codec-aac
-fn decode_aac_payload(decoder: &mut AacDecoder, payload: &[u8], _sample_rate: u32) -> Vec<f32> {
+/// Decode RFC 3640 AAC-hbr RTP payload using symphonia-codec-aac into caller-provided buffer
+fn decode_aac_payload_into(decoder: &mut AacDecoder, payload: &[u8], out: &mut Vec<f32>) {
     if payload.len() < 4 {
-        return Vec::new();
+        return;
     }
 
     // In RFC 3640 mode=AAC-hbr:
@@ -199,49 +202,62 @@ fn decode_aac_payload(decoder: &mut AacDecoder, payload: &[u8], _sample_rate: u3
 
     let packet_ref = PacketRef::new(0, Timestamp::from(0u32), Duration::from(1024u32), aac_frame);
     match decoder.decode_ref(&packet_ref) {
-        Ok(buf_ref) => {
-            let mut out = Vec::new();
-            match buf_ref {
-                GenericAudioBufferRef::F32(b) => {
-                    b.copy_to_vec_interleaved(&mut out);
-                }
-                GenericAudioBufferRef::S16(b) => {
-                    b.copy_to_vec_interleaved(&mut out);
-                }
-                _ => {}
+        Ok(buf_ref) => match buf_ref {
+            GenericAudioBufferRef::F32(b) => {
+                b.copy_to_vec_interleaved(out);
             }
-            out
-        }
+            GenericAudioBufferRef::S16(b) => {
+                b.copy_to_vec_interleaved(out);
+            }
+            _ => {}
+        },
         Err(e) => {
             debug!("AAC decode error (frame len {}): {}", aac_frame.len(), e);
-            Vec::new()
         }
     }
 }
 
-/// Decode G.711 u-law payload (8000 Hz, mono) to f32 samples
-fn decode_pcmu_payload(payload: &[u8]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(payload.len());
-    for &u in payload {
-        let sample = ulaw_to_pcm(u);
-        out.push(sample as f32 / 32768.0);
+const ULAW_TO_F32: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = ulaw_to_pcm(i as u8) as f32 / 32768.0;
+        i += 1;
     }
-    out
+    table
+};
+
+const ALAW_TO_F32: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = alaw_to_pcm(i as u8) as f32 / 32768.0;
+        i += 1;
+    }
+    table
+};
+
+/// Decode G.711 u-law payload (8000 Hz, mono) to f32 samples via compile-time LUT
+#[inline]
+fn decode_pcmu_payload_into(payload: &[u8], out: &mut Vec<f32>) {
+    out.reserve(payload.len());
+    for &u in payload {
+        out.push(ULAW_TO_F32[u as usize]);
+    }
 }
 
-/// Decode G.711 A-law payload (8000 Hz, mono) to f32 samples
-fn decode_pcma_payload(payload: &[u8]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(payload.len());
+/// Decode G.711 A-law payload (8000 Hz, mono) to f32 samples via compile-time LUT
+#[inline]
+fn decode_pcma_payload_into(payload: &[u8], out: &mut Vec<f32>) {
+    out.reserve(payload.len());
     for &a in payload {
-        let sample = alaw_to_pcm(a);
-        out.push(sample as f32 / 32768.0);
+        out.push(ALAW_TO_F32[a as usize]);
     }
-    out
 }
 
 /// Standard G.711 u-law expansion to linear 16-bit PCM
 #[inline]
-fn ulaw_to_pcm(u: u8) -> i16 {
+const fn ulaw_to_pcm(u: u8) -> i16 {
     let u = !u;
     let sign = u & 0x80;
     let exponent = (u >> 4) & 0x07;
@@ -258,7 +274,7 @@ fn ulaw_to_pcm(u: u8) -> i16 {
 
 /// Standard G.711 A-law expansion to linear 16-bit PCM
 #[inline]
-fn alaw_to_pcm(a: u8) -> i16 {
+const fn alaw_to_pcm(a: u8) -> i16 {
     let a = a ^ 0x55;
     let sign = a & 0x80;
     let exponent = (a >> 4) & 0x07;
@@ -306,24 +322,61 @@ fn resample_to_48k_stereo(
         return;
     }
 
+    // Fast-path 3: 16kHz mono input (exact 3x upsample, zero f64 floor/division)
+    if in_rate == 16000 && in_channels == 1 {
+        output_buf.reserve(in_frames * 6);
+        for i in 0..in_frames {
+            let s0 = input[i];
+            let s1 = input[(i + 1).min(in_frames - 1)];
+            let step = (s1 - s0) * (1.0 / 3.0);
+            let v1 = s0 + step;
+            let v2 = s0 + step * 2.0;
+            output_buf.extend_from_slice(&[s0, s0, v1, v1, v2, v2]);
+        }
+        return;
+    }
+
+    // Fast-path 4: 8kHz mono input (exact 6x upsample, zero f64 floor/division)
+    if in_rate == 8000 && in_channels == 1 {
+        output_buf.reserve(in_frames * 12);
+        for i in 0..in_frames {
+            let s0 = input[i];
+            let s1 = input[(i + 1).min(in_frames - 1)];
+            let step = (s1 - s0) * (1.0 / 6.0);
+            let v1 = s0 + step;
+            let v2 = s0 + step * 2.0;
+            let v3 = s0 + step * 3.0;
+            let v4 = s0 + step * 4.0;
+            let v5 = s0 + step * 5.0;
+            output_buf.extend_from_slice(&[s0, s0, v1, v1, v2, v2, v3, v3, v4, v4, v5, v5]);
+        }
+        return;
+    }
+
     let out_frames = ((in_frames as u64 * 48000) / in_rate as u64) as usize;
     output_buf.reserve(out_frames * 2);
 
     let step = in_rate as f64 / 48000.0;
 
-    for i in 0..out_frames {
-        let src_pos = i as f64 * step;
-        let idx0 = src_pos.floor() as usize;
-        let frac = (src_pos - idx0 as f64) as f32;
-        let idx1 = (idx0 + 1).min(in_frames - 1);
-
-        if in_channels == 1 {
+    if in_channels == 1 {
+        for i in 0..out_frames {
+            let src_pos = i as f64 * step;
+            let idx0 = src_pos as usize;
+            let frac = (src_pos - idx0 as f64) as f32;
+            let idx1 = (idx0 + 1).min(in_frames - 1);
             let s0 = input[idx0];
             let s1 = input[idx1];
             let val = s0 + frac * (s1 - s0);
             output_buf.push(val);
-            output_buf.push(val); // Duplicate to stereo
-        } else {
+            output_buf.push(val);
+        }
+    } else {
+        for i in 0..out_frames {
+            let src_pos = i as f64 * step;
+            let idx0 = src_pos as usize;
+            let frac = (src_pos - idx0 as f64) as f32;
+            let idx1 = (idx0 + 1).min(in_frames - 1);
+
             let left0 = input[idx0 * in_channels];
             let left1 = input[idx1 * in_channels];
             let left = left0 + frac * (left1 - left0);
@@ -435,6 +488,7 @@ pub struct AacToG711Decoder {
     decoder: AacDecoder,
     clock_rate: u32,
     channels: usize,
+    decode_scratch: Vec<f32>,
 }
 
 impl AacToG711Decoder {
@@ -468,38 +522,53 @@ impl AacToG711Decoder {
             decoder,
             clock_rate,
             channels,
+            decode_scratch: Vec::with_capacity(2048),
         })
     }
 
     /// Decode incoming AAC RTP packet and return G.711 (PCMU or PCMA) audio bytes at 8000 Hz.
     pub fn decode_to_g711(&mut self, payload: &[u8], is_pcmu: bool) -> Bytes {
-        let f32_samples = decode_aac_payload(&mut self.decoder, payload, self.clock_rate);
-        if f32_samples.is_empty() {
+        self.decode_scratch.clear();
+        decode_aac_payload_into(&mut self.decoder, payload, &mut self.decode_scratch);
+        if self.decode_scratch.is_empty() {
             return Bytes::new();
         }
 
-        // 1. Downmix to mono if stereo
-        let mono_samples: Vec<f32> = if self.channels == 2 {
-            f32_samples.chunks_exact(2).map(|c| (c[0] + c[1]) * 0.5).collect()
-        } else {
-            f32_samples
-        };
+        let ch = self.channels.max(1);
+        let in_frames = self.decode_scratch.len() / ch;
+        if in_frames == 0 {
+            return Bytes::new();
+        }
 
-        // 2. Resample from self.clock_rate to 8000 Hz
+        // Resample from self.clock_rate to 8000 Hz without intermediate mono Vec allocation
         let ratio = self.clock_rate as f64 / 8000.0;
-        let num_out = ((mono_samples.len() as f64) / ratio).floor() as usize;
+        let num_out = ((in_frames as f64) / ratio) as usize;
         let mut out = Vec::with_capacity(num_out);
 
         let mut src_pos = 0.0f64;
-        while (src_pos as usize) < mono_samples.len() {
-            let sample = mono_samples[src_pos as usize];
-            let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
-            if is_pcmu {
-                out.push(crate::backchannel::pcm::s16_to_ulaw(s16));
-            } else {
-                out.push(crate::backchannel::pcm::s16_to_alaw(s16));
+        if ch == 2 {
+            while (src_pos as usize) < in_frames {
+                let idx = (src_pos as usize) * 2;
+                let sample = (self.decode_scratch[idx] + self.decode_scratch[idx + 1]) * 0.5;
+                let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                out.push(if is_pcmu {
+                    crate::backchannel::pcm::s16_to_ulaw(s16)
+                } else {
+                    crate::backchannel::pcm::s16_to_alaw(s16)
+                });
+                src_pos += ratio;
             }
-            src_pos += ratio;
+        } else {
+            while (src_pos as usize) < in_frames {
+                let sample = self.decode_scratch[src_pos as usize];
+                let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                out.push(if is_pcmu {
+                    crate::backchannel::pcm::s16_to_ulaw(s16)
+                } else {
+                    crate::backchannel::pcm::s16_to_alaw(s16)
+                });
+                src_pos += ratio;
+            }
         }
 
         Bytes::from(out)
