@@ -112,15 +112,10 @@ impl SegmentRecorder {
             }
 
             // 2. Discover video track
-            let mut video_track = None;
-            for _ in 0..30 {
-                let tracks = self.stream.get_tracks().await;
-                if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
-                    video_track = Some(Arc::clone(t));
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
+            let video_track = self
+                .stream
+                .wait_for_track(tokio::time::Duration::from_secs(15), |t| t.kind == MediaKind::Video)
+                .await;
 
             let video_track = match video_track {
                 Some(t) => t,

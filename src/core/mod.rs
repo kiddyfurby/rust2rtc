@@ -230,6 +230,8 @@ pub struct ParamSets {
 struct GopCache {
     packets: Vec<RtpPacket>,
     bytes: usize,
+    keyframe_end: usize,
+    keyframe_ts: Option<u32>,
 }
 
 /// Track broadcaster holding a multi-consumer channel
@@ -315,10 +317,17 @@ impl Track {
                 }
                 gop.bytes += pkt_len;
                 gop.packets.push(packet.clone());
+                gop.keyframe_ts = Some(packet.timestamp);
+                gop.keyframe_end = gop.packets.len();
             } else if !gop.packets.is_empty() {
                 if gop.packets.len() < Self::MAX_GOP_PACKETS && gop.bytes + pkt_len <= Self::MAX_GOP_BYTES {
+                    let in_keyframe = gop.keyframe_ts == Some(packet.timestamp)
+                        && gop.keyframe_end == gop.packets.len();
                     gop.bytes += pkt_len;
                     gop.packets.push(packet.clone());
+                    if in_keyframe {
+                        gop.keyframe_end = gop.packets.len();
+                    }
                 }
             }
         }
@@ -347,19 +356,21 @@ impl Track {
         if gop.packets.is_empty() {
             return self.get_param_sets();
         }
-        let kf_ts = gop.packets.iter().find(|p| {
-            let (is_kf, _) = is_keyframe_or_param_set(self.is_hevc, p.payload());
-            is_kf
-        }).map(|p| p.timestamp);
-
-        if let Some(ts) = kf_ts {
-            gop.packets.iter().filter(|p| {
-                let (_, is_ps) = is_keyframe_or_param_set(self.is_hevc, p.payload());
-                is_ps || p.timestamp == ts
-            }).cloned().collect()
+        let end = gop.keyframe_end.min(gop.packets.len());
+        if end > 0 {
+            gop.packets[..end].to_vec()
         } else {
             gop.packets.clone()
         }
+    }
+
+    pub fn clear_gop_cache(&self) {
+        let mut gop = self.gop_cache.write().unwrap();
+        gop.packets.clear();
+        gop.packets.shrink_to_fit();
+        gop.bytes = 0;
+        gop.keyframe_end = 0;
+        gop.keyframe_ts = None;
     }
 
     pub fn get_param_sets_data(&self) -> ParamSets {
@@ -388,27 +399,61 @@ impl Track {
             return;
         }
 
+        // Fast-path read lock: skip allocation and RTP packet rebuild if parameter set is unchanged
+        {
+            let ps = self.param_sets.read().unwrap();
+            if !ps.rtp_packets.is_empty() {
+                if !self.is_hevc {
+                    let nalu_type = payload[0] & 0x1F;
+                    if (nalu_type == 7 && ps.h264_sps.as_deref() == Some(payload))
+                        || (nalu_type == 8 && ps.h264_pps.as_deref() == Some(payload))
+                    {
+                        return;
+                    }
+                } else {
+                    let nalu_type = (payload[0] >> 1) & 0x3F;
+                    if (nalu_type == 32 && ps.h265_vps.as_deref() == Some(payload))
+                        || (nalu_type == 33 && ps.h265_sps.as_deref() == Some(payload))
+                        || (nalu_type == 34 && ps.h265_pps.as_deref() == Some(payload))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
         let mut ps = self.param_sets.write().unwrap();
+        let mut changed = false;
         if !self.is_hevc {
             let nalu_type = payload[0] & 0x1F;
             if nalu_type == 7 {
-                ps.h264_sps = Some(payload.to_vec());
+                if ps.h264_sps.as_deref() != Some(payload) {
+                    ps.h264_sps = Some(payload.to_vec());
+                    changed = true;
+                }
             } else if nalu_type == 8 {
-                ps.h264_pps = Some(payload.to_vec());
+                if ps.h264_pps.as_deref() != Some(payload) {
+                    ps.h264_pps = Some(payload.to_vec());
+                    changed = true;
+                }
             } else if nalu_type == 24 {
                 let nals = unpack_h264_stap_a(payload);
                 for nal in nals {
                     if !nal.is_empty() {
                         let sub_type = nal[0] & 0x1F;
-                        if sub_type == 7 {
+                        if sub_type == 7 && ps.h264_sps.as_deref() != Some(nal.as_slice()) {
                             ps.h264_sps = Some(nal);
-                        } else if sub_type == 8 {
+                            changed = true;
+                        } else if sub_type == 8 && ps.h264_pps.as_deref() != Some(nal.as_slice()) {
                             ps.h264_pps = Some(nal);
+                            changed = true;
                         }
                     }
                 }
             }
-            if let (Some(sps), Some(pps)) = (&ps.h264_sps, &ps.h264_pps) {
+            if (changed || ps.rtp_packets.is_empty())
+                && let (Some(sps), Some(pps)) = (&ps.h264_sps, &ps.h264_pps)
+            {
                 let stap_a = build_h264_stap_a(sps, pps);
                 let rtp = RtpPacket::create(packet.payload_type, packet.sequence_number, packet.timestamp, packet.ssrc, false, &stap_a);
                 ps.rtp_packets = vec![rtp];
@@ -416,38 +461,52 @@ impl Track {
         } else {
             let nalu_type = (payload[0] >> 1) & 0x3F;
             if nalu_type == 32 {
-                ps.h265_vps = Some(payload.to_vec());
+                if ps.h265_vps.as_deref() != Some(payload) {
+                    ps.h265_vps = Some(payload.to_vec());
+                    changed = true;
+                }
             } else if nalu_type == 33 {
-                ps.h265_sps = Some(payload.to_vec());
+                if ps.h265_sps.as_deref() != Some(payload) {
+                    ps.h265_sps = Some(payload.to_vec());
+                    changed = true;
+                }
             } else if nalu_type == 34 {
-                ps.h265_pps = Some(payload.to_vec());
+                if ps.h265_pps.as_deref() != Some(payload) {
+                    ps.h265_pps = Some(payload.to_vec());
+                    changed = true;
+                }
             } else if nalu_type == 48 {
                 let nals = unpack_h265_ap(payload);
                 for nal in nals {
                     if !nal.is_empty() {
                         let sub_type = (nal[0] >> 1) & 0x3F;
-                        if sub_type == 32 {
+                        if sub_type == 32 && ps.h265_vps.as_deref() != Some(nal.as_slice()) {
                             ps.h265_vps = Some(nal);
-                        } else if sub_type == 33 {
+                            changed = true;
+                        } else if sub_type == 33 && ps.h265_sps.as_deref() != Some(nal.as_slice()) {
                             ps.h265_sps = Some(nal);
-                        } else if sub_type == 34 {
+                            changed = true;
+                        } else if sub_type == 34 && ps.h265_pps.as_deref() != Some(nal.as_slice()) {
                             ps.h265_pps = Some(nal);
+                            changed = true;
                         }
                     }
                 }
             }
-            let mut rtp_pkts = Vec::new();
-            if let Some(ref vps) = ps.h265_vps {
-                rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number, packet.timestamp, packet.ssrc, false, vps));
-            }
-            if let Some(ref sps) = ps.h265_sps {
-                rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number.wrapping_add(1), packet.timestamp, packet.ssrc, false, sps));
-            }
-            if let Some(ref pps) = ps.h265_pps {
-                rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number.wrapping_add(2), packet.timestamp, packet.ssrc, false, pps));
-            }
-            if !rtp_pkts.is_empty() {
-                ps.rtp_packets = rtp_pkts;
+            if changed || ps.rtp_packets.is_empty() {
+                let mut rtp_pkts = Vec::new();
+                if let Some(ref vps) = ps.h265_vps {
+                    rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number, packet.timestamp, packet.ssrc, false, vps));
+                }
+                if let Some(ref sps) = ps.h265_sps {
+                    rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number.wrapping_add(1), packet.timestamp, packet.ssrc, false, sps));
+                }
+                if let Some(ref pps) = ps.h265_pps {
+                    rtp_pkts.push(RtpPacket::create(packet.payload_type, packet.sequence_number.wrapping_add(2), packet.timestamp, packet.ssrc, false, pps));
+                }
+                if !rtp_pkts.is_empty() {
+                    ps.rtp_packets = rtp_pkts;
+                }
             }
         }
     }

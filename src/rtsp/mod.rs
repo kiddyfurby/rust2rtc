@@ -198,13 +198,11 @@ impl RtspServer {
                         let tracks = parse_sdp_tracks(&sdp_str);
 
                         let stream_obj = self.streams.get_or_create(&stream_id).await;
-                        stream_obj.clear_tracks().await;
-
-                        for (idx, track) in tracks.into_iter().enumerate() {
+                        for (idx, track) in tracks.iter().enumerate() {
                             let ch = (idx * 2) as u8;
-                            track_channels.insert(ch, Arc::clone(&track));
-                            stream_obj.add_track(track).await;
+                            track_channels.insert(ch, Arc::clone(track));
                         }
+                        stream_obj.set_tracks(tracks).await;
 
                         let response = format!(
                             "RTSP/1.0 200 OK\r\n\
@@ -224,12 +222,7 @@ impl RtspServer {
                         }
 
                         // Wait for tracks to be announced if stream is starting up
-                        let start = tokio::time::Instant::now();
-                        while stream_obj.get_tracks().await.is_empty()
-                            && start.elapsed() < tokio::time::Duration::from_secs(6)
-                        {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
+                        stream_obj.wait_for_tracks(tokio::time::Duration::from_secs(6)).await;
 
                         let sdp = stream_obj.generate_sdp(&self.listen_addr).await;
 

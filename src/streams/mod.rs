@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
-use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 use tracing::{debug, info};
 
 pub struct ActiveProducer {
@@ -23,6 +23,7 @@ pub struct Stream {
     pub name: String,
     pub sources: Vec<String>,
     pub tracks: RwLock<Vec<Arc<Track>>>,
+    track_count_tx: watch::Sender<usize>,
     pub producer: Mutex<Option<ActiveProducer>>,
     pub bytes_recv: AtomicU64,
     pub packets_recv: AtomicU64,
@@ -33,10 +34,12 @@ pub struct Stream {
 
 impl Stream {
     pub fn new(name: String, sources: Vec<String>) -> Self {
+        let (track_count_tx, _) = watch::channel(0);
         Self {
             name,
             sources,
             tracks: RwLock::new(Vec::new()),
+            track_count_tx,
             producer: Mutex::new(None),
             bytes_recv: AtomicU64::new(0),
             packets_recv: AtomicU64::new(0),
@@ -85,20 +88,73 @@ impl Stream {
     pub async fn add_track(&self, track: Arc<Track>) {
         let mut tracks = self.tracks.write().await;
         tracks.push(track);
+        let len = tracks.len();
+        drop(tracks);
+        let _ = self.track_count_tx.send_replace(len);
     }
 
-    pub async fn clear_tracks(&self) {
+    pub async fn set_tracks(&self, new_tracks: Vec<Arc<Track>>) {
         let mut tracks = self.tracks.write().await;
-        tracks.clear();
+        *tracks = new_tracks;
+        let len = tracks.len();
+        drop(tracks);
         let mut opus = self.opus_track.lock().await;
         *opus = None;
         let mut mjpeg = self.mjpeg_broadcaster.lock().await;
         *mjpeg = None;
+        let _ = self.track_count_tx.send_replace(len);
+    }
+
+    pub async fn clear_tracks(&self) {
+        let mut tracks = self.tracks.write().await;
+        for t in tracks.iter() {
+            t.clear_gop_cache();
+        }
+        tracks.clear();
+        drop(tracks);
+        let mut opus = self.opus_track.lock().await;
+        *opus = None;
+        let mut mjpeg = self.mjpeg_broadcaster.lock().await;
+        *mjpeg = None;
+        let _ = self.track_count_tx.send_replace(0);
     }
 
     pub async fn get_tracks(&self) -> Vec<Arc<Track>> {
         let tracks = self.tracks.read().await;
         tracks.clone()
+    }
+
+    /// Wait until at least one track is registered on this stream, or until `timeout` elapses.
+    pub async fn wait_for_tracks(&self, timeout: std::time::Duration) {
+        if !self.tracks.read().await.is_empty() {
+            return;
+        }
+        let mut rx = self.track_count_tx.subscribe();
+        let _ = tokio::time::timeout(timeout, rx.wait_for(|&c| c > 0)).await;
+    }
+
+    /// Wait until a track matching `predicate` is registered, or until `timeout` elapses.
+    pub async fn wait_for_track<F>(&self, timeout: std::time::Duration, mut predicate: F) -> Option<Arc<Track>>
+    where
+        F: FnMut(&Arc<Track>) -> bool,
+    {
+        let mut rx = self.track_count_tx.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let tracks = self.tracks.read().await;
+                if let Some(t) = tracks.iter().find(|t| predicate(t)) {
+                    return Some(Arc::clone(t));
+                }
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if tokio::time::timeout(deadline - now, rx.changed()).await.is_err() {
+                return None;
+            }
+        }
     }
 
     /// Get or dynamically spawn a shared in-process Opus transcoding track

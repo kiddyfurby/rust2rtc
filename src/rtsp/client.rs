@@ -216,7 +216,6 @@ impl RtspClient {
         let same = current_tracks.len() == registered_tracks.len()
             && current_tracks.iter().zip(&registered_tracks).all(|(a, b)| Arc::ptr_eq(a, b));
         if !same {
-            stream.clear_tracks().await;
             for t in &registered_tracks {
                 info!(
                     stream = %stream.name,
@@ -225,8 +224,8 @@ impl RtspClient {
                     pt = t.codec.payload_type,
                     "Registered in-process camera media track"
                 );
-                stream.add_track(Arc::clone(t)).await;
             }
+            stream.set_tracks(registered_tracks).await;
         }
 
         // 5. Send PLAY

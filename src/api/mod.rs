@@ -698,13 +698,7 @@ async fn api_ffmpeg_handler(State(state): State<AppState>) -> Response {
 async fn generate_snapshot(state: &AppState, src: &str) -> anyhow::Result<Bytes> {
     if let Some(stream) = state.streams.get(src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        // Wait up to 3 seconds for tracks to be populated if just starting
-        for _ in 0..30 {
-            if !stream.get_tracks().await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+        stream.wait_for_tracks(tokio::time::Duration::from_secs(3)).await;
 
         let tracks = stream.get_tracks().await;
         let vtrack = tracks.iter().find(|t| t.kind == MediaKind::Video);
@@ -856,13 +850,7 @@ async fn api_stream_mjpeg_handler(
 
     if let Some(stream) = state.streams.get(&stream_name).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        // Wait up to 3 seconds for tracks to be populated if just starting
-        for _ in 0..30 {
-            if !stream.get_tracks().await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+        stream.wait_for_tracks(tokio::time::Duration::from_secs(3)).await;
 
         if !is_custom {
             if let Some(broadcaster) = stream.get_or_create_mjpeg_broadcaster(state.rtsp_port, &state.ffmpeg).await {
@@ -986,13 +974,7 @@ async fn api_webrtc_handler(
 ) -> Response {
     if let Some(stream) = state.streams.get(&query.src).await {
         let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-        // Wait up to 5 seconds for producer to establish RTSP streaming if starting
-        for _ in 0..50 {
-            if !stream.get_tracks().await.is_empty() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+        stream.wait_for_tracks(tokio::time::Duration::from_secs(5)).await;
 
         let offer_upper = body.to_uppercase();
         let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
@@ -1005,12 +987,7 @@ async fn api_webrtc_handler(
                 let sub_name = format!("{}_sub", query.src);
                 if let Some(sub_stream) = state.streams.get(&sub_name).await {
                     let _ = sub_stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-                    for _ in 0..50 {
-                        if !sub_stream.get_tracks().await.is_empty() {
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
+                    sub_stream.wait_for_tracks(tokio::time::Duration::from_secs(5)).await;
                     info!(stream = %query.src, fallback = %sub_name, "Client does not support WebRTC H.265, seamlessly serving H.264 sub-stream");
                     sub_stream
                 } else {
@@ -1118,12 +1095,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                 let src_name = default_src.as_deref().unwrap_or("");
                 if let Some(stream) = state.streams.get(src_name).await {
                     let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-                    for _ in 0..50 {
-                        if !stream.get_tracks().await.is_empty() {
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
+                    stream.wait_for_tracks(tokio::time::Duration::from_secs(5)).await;
 
                     let offer_upper = offer_sdp.to_uppercase();
                     let offer_has_hevc = offer_upper.contains("H265") || offer_upper.contains("HEVC");
@@ -1136,12 +1108,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                             let sub_name = format!("{}_sub", src_name);
                             if let Some(sub_stream) = state.streams.get(&sub_name).await {
                                 let _ = sub_stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-                                for _ in 0..50 {
-                                    if !sub_stream.get_tracks().await.is_empty() {
-                                        break;
-                                    }
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                }
+                                sub_stream.wait_for_tracks(tokio::time::Duration::from_secs(5)).await;
                                 info!(stream = %src_name, fallback = %sub_name, "Client does not support WebRTC H.265, seamlessly serving H.264 sub-stream");
                                 sub_stream
                             } else {
@@ -1211,12 +1178,7 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                 let src_name = default_src.as_deref().unwrap_or("").to_string();
                 if let Some(stream) = state.streams.get(&src_name).await {
                     let _ = stream.ensure_started(state.rtsp_port, &state.ffmpeg).await;
-                    for _ in 0..50 {
-                        if !stream.get_tracks().await.is_empty() {
-                            break;
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
+                    stream.wait_for_tracks(tokio::time::Duration::from_secs(5)).await;
 
                     let tracks = stream.get_tracks().await;
                     let mut has_h265 = false;

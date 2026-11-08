@@ -202,15 +202,9 @@ impl SipCallSession {
         let stream_tx = Arc::clone(&stream);
         let call_id_audio = call_id.clone();
         tasks.push(tokio::spawn(async move {
-            let mut audio_track = None;
-            for _ in 0..30 {
-                let tracks = stream_tx.get_tracks().await;
-                if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Audio) {
-                    audio_track = Some(Arc::clone(t));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            let audio_track = stream_tx
+                .wait_for_track(Duration::from_secs(3), |t| t.kind == MediaKind::Audio)
+                .await;
             if let Some(audio_track) = audio_track {
                 info!(
                     call_id = %call_id_audio,
@@ -366,20 +360,10 @@ impl SipCallSession {
                     let tx_video_sock = Arc::clone(&video_socket);
 
                     tasks.push(tokio::spawn(async move {
-                        let mut video_track = None;
-                        for _ in 0..30 {
-                            let tracks = stream_video.get_tracks().await;
-                            if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")) {
-                                video_track = Some(Arc::clone(t));
-                                break;
-                            }
-                            if tracks.iter().any(|t| t.kind == MediaKind::Video) {
-                                // Camera already registered its video track and it is not H.264 (e.g. H.265 / HEVC);
-                                // break immediately instead of blocking the call for 8s waiting for H.264 to appear
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+                        let any_video = stream_video
+                            .wait_for_track(Duration::from_secs(3), |t| t.kind == MediaKind::Video)
+                            .await;
+                        let video_track = any_video.filter(|t| t.codec.name.eq_ignore_ascii_case("H264"));
                         if let Some(video_track) = video_track {
                             info!(
                                 call_id = %call_id_video,
@@ -607,15 +591,9 @@ impl SipCallSession {
 
                     tasks.push(tokio::spawn(async move {
                         // Wait for stream producer to be established
-                        let mut video_track = None;
-                        for _ in 0..80 {
-                            let tracks = stream_video.get_tracks().await;
-                            if let Some(t) = tracks.iter().find(|t| t.kind == MediaKind::Video) {
-                                video_track = Some(Arc::clone(t));
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
+                        let video_track = stream_video
+                            .wait_for_track(Duration::from_secs(8), |t| t.kind == MediaKind::Video)
+                            .await;
 
                         if video_track.is_none() {
                             warn!(
