@@ -893,22 +893,16 @@ pub fn make_h264_media_segment(
     let moof_pos = writer.start_box(b"moof");
 
     // 'mfhd' box (Movie Fragment Header: sequence_number)
-    let mut mfhd = Vec::with_capacity(4);
-    mfhd.extend_from_slice(&seq.to_be_bytes());
-    writer.write_full_box(b"mfhd", 0, 0, &mfhd);
+    writer.write_full_box(b"mfhd", 0, 0, &seq.to_be_bytes());
 
     // 'traf' box
     let traf_pos = writer.start_box(b"traf");
 
     // 'tfhd' box (Track Fragment Header: track_id=1, default-base-is-moof = 0x020000)
-    let mut tfhd = Vec::with_capacity(4);
-    tfhd.extend_from_slice(&1u32.to_be_bytes()); // track_id = 1
-    writer.write_full_box(b"tfhd", 0, 0x020000, &tfhd);
+    writer.write_full_box(b"tfhd", 0, 0x020000, &1u32.to_be_bytes());
 
     // 'tfdt' box (Base Media Decode Time: version 1, 64-bit timestamp)
-    let mut tfdt = Vec::with_capacity(8);
-    tfdt.extend_from_slice(&base_decode_time.to_be_bytes());
-    writer.write_full_box(b"tfdt", 1, 0, &tfdt);
+    writer.write_full_box(b"tfdt", 1, 0, &base_decode_time.to_be_bytes());
 
     // 'trun' box (Track Fragment Run)
     // Flags: 0x000701
@@ -922,32 +916,25 @@ pub fn make_h264_media_segment(
         0x01010000u32 // sample_depends_on = 1 (dependent), sample_is_non_sync = 1
     };
 
-    let mut trun = Vec::with_capacity(24);
-    trun.extend_from_slice(&1u32.to_be_bytes()); // sample_count = 1
-    trun.extend_from_slice(&0i32.to_be_bytes()); // placeholder for data_offset
-    trun.extend_from_slice(&duration.to_be_bytes()); // sample_duration
-    trun.extend_from_slice(&(sample_size as u32).to_be_bytes()); // sample_size
-    trun.extend_from_slice(&sample_flags.to_be_bytes()); // sample_flags
+    let mut trun = [0u8; 20];
+    trun[0..4].copy_from_slice(&1u32.to_be_bytes()); // sample_count = 1
+    // trun[4..8] is placeholder for data_offset (0)
+    trun[8..12].copy_from_slice(&duration.to_be_bytes()); // sample_duration
+    trun[12..16].copy_from_slice(&(sample_size as u32).to_be_bytes()); // sample_size
+    trun[16..20].copy_from_slice(&sample_flags.to_be_bytes()); // sample_flags
 
-    // We write trun and traf, then fix up data_offset = moof_size + 8 (mdat header)
+    // Record exact byte position of trun box to patch data_offset in O(1)
+    let trun_box_pos = writer.buf.len();
     writer.write_full_box(b"trun", 0, 0x000701, &trun);
     writer.end_box(traf_pos);
     writer.end_box(moof_pos);
 
     // Fix data_offset inside trun:
-    // data_offset is the byte offset from the start of the 'moof' box to the start of payload inside 'mdat'
+    // trun box layout: [4 size][4 "trun"][1 version][3 flags][4 sample_count][4 data_offset]
     let moof_len = writer.buf.len();
     let data_offset = (moof_len + 8) as i32; // +8 for [mdat_size: 4][b"mdat": 4]
-
-    // Find trun data offset placeholder and patch it
-    // trun payload starts at writer.buf inside moof
-    if let Some(pos) = find_subsequence(&writer.buf[..moof_len], b"trun") {
-        // trun box: [4 bytes size][4 bytes name 'trun'][1 byte version][3 bytes flags][4 bytes sample_count][4 bytes data_offset]
-        let offset_pos = pos + 4 + 1 + 3 + 4;
-        if offset_pos + 4 <= moof_len {
-            writer.buf[offset_pos..offset_pos + 4].copy_from_slice(&data_offset.to_be_bytes());
-        }
-    }
+    let offset_pos = trun_box_pos + 16;
+    writer.buf[offset_pos..offset_pos + 4].copy_from_slice(&data_offset.to_be_bytes());
 
     // 2. 'mdat' box
     let mdat_size = (8 + sample_size) as u32;

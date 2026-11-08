@@ -1337,16 +1337,33 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                                         depacketizer.sps = Some(sps);
                                         depacketizer.pps = Some(pps);
                                     }
+                                let cached_ps = vtrack.get_param_sets_data();
+                                if depacketizer.vps.is_none() {
+                                    depacketizer.vps = cached_ps.h265_vps;
+                                }
+                                if depacketizer.sps.is_none() {
+                                    depacketizer.sps = cached_ps.h265_sps;
+                                }
+                                if depacketizer.pps.is_none() {
+                                    depacketizer.pps = cached_ps.h265_pps;
+                                }
+
+                                while rx.try_recv().is_ok() {}
+                                let mut initial_packets = std::collections::VecDeque::from(vtrack.get_gop_packets());
 
                                 loop {
-                                    let packet = match rx.recv().await {
-                                        Ok(p) => p,
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE H.265 receiver lagged; resetting depacketizer");
-                                            depacketizer.reset();
-                                            continue;
+                                    let packet = if let Some(p) = initial_packets.pop_front() {
+                                        p
+                                    } else {
+                                        match rx.recv().await {
+                                            Ok(p) => p,
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                tracing::warn!(stream = %stream_name, lagged = n, "MSE H.265 receiver lagged; resetting depacketizer");
+                                                depacketizer.reset();
+                                                continue;
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                         }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     };
 
                                     let mut frame_opt = depacketizer.feed_packet(&packet);
@@ -1390,22 +1407,36 @@ async fn handle_ws(socket: WebSocket, query: StreamsQuery, state: AppState) {
                             } else {
                                 let mut depacketizer = crate::mp4::H264RtpDepacketizer::new();
 
-                                // Pre-load SPS / PPS from track SDP fmtp if available
+                                // Pre-load SPS / PPS from track SDP fmtp or cached in-band parameter sets
                                 if let Some(ref fmtp) = vtrack.codec.fmtp
                                     && let Some((sps, pps)) = crate::webrtc::extract_h264_sps_pps(fmtp) {
                                         depacketizer.sps = Some(sps);
                                         depacketizer.pps = Some(pps);
                                     }
+                                let cached_ps = vtrack.get_param_sets_data();
+                                if depacketizer.sps.is_none() {
+                                    depacketizer.sps = cached_ps.h264_sps;
+                                }
+                                if depacketizer.pps.is_none() {
+                                    depacketizer.pps = cached_ps.h264_pps;
+                                }
+
+                                while rx.try_recv().is_ok() {}
+                                let mut initial_packets = std::collections::VecDeque::from(vtrack.get_gop_packets());
 
                                 loop {
-                                    let packet = match rx.recv().await {
-                                        Ok(p) => p,
-                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                            tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged; resetting depacketizer");
-                                            depacketizer.reset();
-                                            continue;
+                                    let packet = if let Some(p) = initial_packets.pop_front() {
+                                        p
+                                    } else {
+                                        match rx.recv().await {
+                                            Ok(p) => p,
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                                tracing::warn!(stream = %stream_name, lagged = n, "MSE receiver lagged; resetting depacketizer");
+                                                depacketizer.reset();
+                                                continue;
+                                            }
+                                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                         }
-                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     };
 
                                     let mut frame_opt = depacketizer.feed_packet(&packet);
