@@ -257,17 +257,20 @@ impl MultitransClient {
     ) -> Result<()> {
         let mut stream = self.stream.take().context("Not connected")?;
 
+        let mut scratch = Vec::new();
         if self.is_http_tapo {
             let boundary = "----client-stream-boundary--";
             let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes PCMA
 
             while let Some((payload, is_pcmu)) = rx.recv().await {
-                let mut data = payload.to_vec();
-                if is_pcmu {
-                    transcode_ulaw_to_alaw(&mut data);
-                }
-
-                let chunks = repacker.push_payload(&data);
+                let chunks = if is_pcmu {
+                    scratch.clear();
+                    scratch.extend_from_slice(&payload);
+                    transcode_ulaw_to_alaw(&mut scratch);
+                    repacker.push_payload(&scratch)
+                } else {
+                    repacker.push_payload(&payload)
+                };
                 for chunk in chunks {
                     let mut block = Vec::with_capacity(chunk.len() + 128);
                     block.extend_from_slice(
@@ -290,12 +293,14 @@ impl MultitransClient {
             let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes (80ms PCMA/8000)
 
             while let Some((payload, is_pcmu)) = rx.recv().await {
-                let mut data = payload.to_vec();
-                if is_pcmu {
-                    transcode_ulaw_to_alaw(&mut data);
-                }
-
-                let rtp_packets = repacker.push_payload(&data);
+                let rtp_packets = if is_pcmu {
+                    scratch.clear();
+                    scratch.extend_from_slice(&payload);
+                    transcode_ulaw_to_alaw(&mut scratch);
+                    repacker.push_payload(&scratch)
+                } else {
+                    repacker.push_payload(&payload)
+                };
                 for rtp in rtp_packets {
                     let size = rtp.len();
                     let mut frame = BytesMut::with_capacity(4 + size);

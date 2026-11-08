@@ -787,15 +787,23 @@ impl SipCameraAccount {
         let mut sprop = None;
         if negotiated_video_codec == VideoCodecKind::H264 {
             let tracks = self.stream.get_tracks().await;
-            if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264"))
-                && let Some(ref fmtp) = vt.codec.fmtp
-                    && let Some(pos) = fmtp.find("sprop-parameter-sets=") {
-                        let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
-                        let val = after.split(';').next().unwrap_or("").trim();
-                        if !val.is_empty() {
-                            sprop = Some(val.to_string());
-                        }
+            if let Some(vt) = tracks.iter().find(|t| t.kind == MediaKind::Video && t.codec.name.eq_ignore_ascii_case("H264")) {
+                if let Some(ref fmtp) = vt.codec.fmtp
+                    && let Some(pos) = fmtp.find("sprop-parameter-sets=")
+                {
+                    let after = &fmtp[pos + "sprop-parameter-sets=".len()..];
+                    let val = after.split(';').next().unwrap_or("").trim();
+                    if !val.is_empty() {
+                        sprop = Some(val.to_string());
                     }
+                }
+                if sprop.is_none()
+                    && let Some(sprop_full) = vt.get_sprop()
+                        && let Some(val) = sprop_full.strip_prefix("sprop-parameter-sets=")
+                    {
+                        sprop = Some(val.to_string());
+                    }
+            }
         }
 
         // 5. Send 200 OK with Answer SDP

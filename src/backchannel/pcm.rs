@@ -75,7 +75,7 @@ pub fn ulaw_to_s16(u: u8) -> i16 {
 
 pub fn s16_to_ulaw(mut pcm: i16) -> u8 {
     let sign = if pcm < 0 {
-        pcm = -pcm;
+        pcm = pcm.saturating_neg();
         0x80
     } else {
         0
@@ -84,12 +84,7 @@ pub fn s16_to_ulaw(mut pcm: i16) -> u8 {
         pcm = 32635;
     }
     pcm += 0x84;
-    let mut exponent = 7;
-    let mut mask = 0x4000;
-    while (pcm & mask) == 0 && exponent > 0 {
-        exponent -= 1;
-        mask >>= 1;
-    }
+    let exponent = 8u32.saturating_sub((pcm as u16).leading_zeros()).min(7) as i16;
     let mantissa = (pcm >> (exponent + 3)) & 0x0f;
     let ulaw = (sign | (exponent << 4) | mantissa) as u8;
     !ulaw
@@ -97,18 +92,13 @@ pub fn s16_to_ulaw(mut pcm: i16) -> u8 {
 
 pub fn s16_to_alaw(mut pcm: i16) -> u8 {
     let sign = if pcm < 0 {
-        pcm = -pcm;
+        pcm = pcm.saturating_neg();
         0
     } else {
         0x80
     };
     let (exponent, mantissa) = if pcm >= 256 {
-        let mut exp = 7;
-        let mut mask = 0x4000;
-        while (pcm & mask) == 0 && exp > 1 {
-            exp -= 1;
-            mask >>= 1;
-        }
+        let exp = 8u32.saturating_sub((pcm as u16).leading_zeros()).clamp(1, 7) as i16;
         (exp, (pcm >> (exp + 3)) & 0x0f)
     } else {
         (0, (pcm >> 4) & 0x0f)
@@ -190,10 +180,18 @@ impl G711Repacker {
     /// Push raw audio payload bytes into the repacker and extract framed RTP packets
     pub fn push_payload(&mut self, payload: &[u8]) -> Vec<Bytes> {
         self.buffer.extend_from_slice(payload);
-        let mut packets = Vec::new();
+        let num_packets = self.buffer.len() / self.packet_size;
+        if num_packets == 0 {
+            return Vec::new();
+        }
 
-        while self.buffer.len() >= self.packet_size {
-            let chunk: Vec<u8> = self.buffer.drain(..self.packet_size).collect();
+        let mut packets = Vec::with_capacity(num_packets);
+        let mut offset = 0;
+
+        while offset + self.packet_size <= self.buffer.len() {
+            let chunk = &self.buffer[offset..offset + self.packet_size];
+            offset += self.packet_size;
+
             let mut rtp_packet = BytesMut::with_capacity(12 + self.packet_size);
 
             // RTP Header (Marker bit only on first packet of talkspurt)
@@ -207,7 +205,7 @@ impl G711Repacker {
             rtp_packet.extend_from_slice(&self.ssrc.to_be_bytes());
 
             // Payload
-            rtp_packet.extend_from_slice(&chunk);
+            rtp_packet.extend_from_slice(chunk);
 
             self.sequence_number = self.sequence_number.wrapping_add(1);
             self.timestamp = self.timestamp.wrapping_add(self.timestamp_step);
@@ -215,6 +213,7 @@ impl G711Repacker {
             packets.push(rtp_packet.freeze());
         }
 
+        self.buffer.drain(..offset);
         packets
     }
 

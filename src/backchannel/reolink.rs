@@ -213,13 +213,16 @@ impl OnvifBackchannelClient {
             }
         });
 
+        let mut scratch = Vec::new();
         while let Some((payload, is_pcmu)) = rx.recv().await {
-            let mut data = payload.to_vec();
-            if !is_pcmu {
-                transcode_alaw_to_ulaw(&mut data);
-            }
-
-            let rtp_packets = repacker.push_payload(&data);
+            let rtp_packets = if is_pcmu {
+                repacker.push_payload(&payload)
+            } else {
+                scratch.clear();
+                scratch.extend_from_slice(&payload);
+                transcode_alaw_to_ulaw(&mut scratch);
+                repacker.push_payload(&scratch)
+            };
             for rtp in rtp_packets {
                 let size = rtp.len();
                 let mut frame = BytesMut::with_capacity(4 + size);

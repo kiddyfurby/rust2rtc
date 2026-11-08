@@ -184,7 +184,8 @@ impl SipCallSession {
                                 let _ = stream_bc.send_backchannel_audio(Bytes::from(g711_bytes), true).await;
                             } else {
                                 let is_pcmu = rtp.payload_type == 0;
-                                let _ = stream_bc.send_backchannel_audio(Bytes::copy_from_slice(payload), is_pcmu).await;
+                                let payload_bytes = rtp.raw.slice(rtp.payload_offset..rtp.payload_offset + rtp.payload_len);
+                                let _ = stream_bc.send_backchannel_audio(payload_bytes, is_pcmu).await;
                             }
                         }
                     }
@@ -271,23 +272,25 @@ impl SipCallSession {
             } else {
                 0xffu8
             };
-            let silence_frame = vec![silence_byte; frame_size];
+            let mut frame_buf = vec![silence_byte; frame_size];
             let mut ticker = tokio::time::interval(Duration::from_millis(ptime_ms));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 ticker.tick().await;
 
-                let frame: Vec<u8> = {
+                {
                     let mut q = pcm_queue.lock().await;
                     if q.len() >= frame_size {
-                        q.drain(..frame_size).collect()
+                        for b in &mut frame_buf {
+                            *b = q.pop_front().unwrap();
+                        }
                     } else {
-                        silence_frame.clone()
+                        frame_buf.fill(silence_byte);
                     }
-                };
+                }
 
-                let packets = repacker.push_payload(&frame);
+                let packets = repacker.push_payload(&frame_buf);
                 let (primary, alt) = *tx_targets.lock().await;
                 for pkt in packets {
                     if let Err(e) = tx_audio_sock.send_to(&pkt, primary).await {
@@ -380,9 +383,18 @@ impl SipCallSession {
                                 .fmtp
                                 .as_ref()
                                 .and_then(|f| crate::webrtc::extract_h264_sps_pps(f))
-                                .map(|(sps, pps)| crate::webrtc::build_h264_stap_a(&sps, &pps));
+                                .map(|(sps, pps)| crate::webrtc::build_h264_stap_a(&sps, &pps))
+                                .or_else(|| {
+                                    let ps = video_track.get_param_sets_data();
+                                    match (ps.h264_sps, ps.h264_pps) {
+                                        (Some(sps), Some(pps)) => Some(crate::webrtc::build_h264_stap_a(&sps, &pps)),
+                                        _ => None,
+                                    }
+                                });
 
                             let mut sub = video_track.subscribe();
+                            while sub.try_recv().is_ok() {}
+                            let mut initial_packets = std::collections::VecDeque::from(video_track.get_keyframe_packets());
                             let mut pkt_count = 0u64;
                             let out_ssrc = 0x52544302u32;
                             let mut out_seq: u16 = (uuid::Uuid::new_v4().as_u128() & 0xFFFF) as u16;
@@ -390,14 +402,18 @@ impl SipCallSession {
                             let mut last_was_param_set = false;
 
                             loop {
-                                let packet = match sub.recv().await {
-                                    Ok(p) => p,
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        debug!("Video forwarder lagged by {} packets - resuming", n);
-                                        continue;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                        break;
+                                let packet = if let Some(p) = initial_packets.pop_front() {
+                                    p
+                                } else {
+                                    match sub.recv().await {
+                                        Ok(p) => p,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                            debug!("Video forwarder lagged by {} packets - resuming", n);
+                                            continue;
+                                        }
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            break;
+                                        }
                                     }
                                 };
 
