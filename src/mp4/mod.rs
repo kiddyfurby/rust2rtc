@@ -318,7 +318,8 @@ pub fn write_audio_stsd(writer: &mut BoxWriter, codec: &AudioCodecConfig) {
 
 /// Generate a complete, standalone progressive MP4 file (`ftyp` + `moov` + `mdat`)
 /// compatible with Frigate, FFmpeg, QuickTime, and browsers.
-pub fn build_standalone_mp4(
+/// Build the `ftyp` + `moov` + 8-byte `mdat` header for a standalone MP4 file without copying media payloads.
+pub fn build_standalone_mp4_header(
     codec_config: &VideoCodecConfig,
     samples: &[VideoSample],
     audio: Option<(&AudioCodecConfig, &[AudioSample])>,
@@ -340,7 +341,7 @@ pub fn build_standalone_mp4(
         .map(|(_, a_samples)| a_samples.iter().map(|s| s.data.len()).sum::<usize>())
         .unwrap_or(0);
 
-    let mut writer = BoxWriter::with_capacity(4096 + total_video_bytes + total_audio_bytes);
+    let mut writer = BoxWriter::with_capacity(4096 + samples.len() * 12);
 
     // 1. 'ftyp'
     let mut ftyp = Vec::with_capacity(16);
@@ -672,27 +673,55 @@ pub fn build_standalone_mp4(
         }
     }
 
-    // 3. 'mdat'
+    // 3. 'mdat' header
     let mdat_size = (8 + total_video_bytes + total_audio_bytes) as u32;
     writer.buf.extend_from_slice(&mdat_size.to_be_bytes());
     writer.buf.extend_from_slice(b"mdat");
 
-    // Write video samples
+    writer.buf
+}
+
+/// Stream a standalone MP4 file directly to a `Write` sink without duplicating NALU buffers in memory.
+pub fn write_standalone_mp4<W: std::io::Write>(
+    out: &mut W,
+    codec_config: &VideoCodecConfig,
+    samples: &[VideoSample],
+    audio: Option<(&AudioCodecConfig, &[AudioSample])>,
+) -> std::io::Result<usize> {
+    if samples.is_empty() {
+        return Ok(0);
+    }
+
+    let header = build_standalone_mp4_header(codec_config, samples, audio);
+    out.write_all(&header)?;
+    let mut total_written = header.len();
+
     for s in samples {
         for nalu in &s.nalus {
-            writer.buf.extend_from_slice(&(nalu.len() as u32).to_be_bytes());
-            writer.buf.extend_from_slice(nalu);
+            out.write_all(&(nalu.len() as u32).to_be_bytes())?;
+            out.write_all(nalu)?;
+            total_written += 4 + nalu.len();
         }
     }
 
-    // Write audio samples
     if let Some((_, a_samples)) = audio {
         for s in a_samples {
-            writer.buf.extend_from_slice(&s.data);
+            out.write_all(&s.data)?;
+            total_written += s.data.len();
         }
     }
 
-    writer.buf
+    Ok(total_written)
+}
+
+pub fn build_standalone_mp4(
+    codec_config: &VideoCodecConfig,
+    samples: &[VideoSample],
+    audio: Option<(&AudioCodecConfig, &[AudioSample])>,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = write_standalone_mp4(&mut buf, codec_config, samples, audio);
+    buf
 }
 
 /// Generate ISO BMFF Initialization Segment (`ftyp` + `moov`) for H.264
@@ -1289,9 +1318,9 @@ impl H264RtpDepacketizer {
 
         if (1..=23).contains(&nal_type) {
             // Single NAL unit packet
-            if nal_type == 7 {
+            if nal_type == 7 && self.sps.as_deref() != Some(payload) {
                 self.sps = Some(payload.to_vec());
-            } else if nal_type == 8 {
+            } else if nal_type == 8 && self.pps.as_deref() != Some(payload) {
                 self.pps = Some(payload.to_vec());
             }
             let nalu = packet.raw.slice(packet.payload_offset..packet.payload_offset + packet.payload_len);
@@ -1305,9 +1334,9 @@ impl H264RtpDepacketizer {
                 if offset + size <= payload.len() {
                     let nalu = packet.raw.slice(packet.payload_offset + offset..packet.payload_offset + offset + size);
                     let inner_type = nalu[0] & 0x1F;
-                    if inner_type == 7 {
+                    if inner_type == 7 && self.sps.as_deref() != Some(&nalu[..]) {
                         self.sps = Some(nalu.to_vec());
-                    } else if inner_type == 8 {
+                    } else if inner_type == 8 && self.pps.as_deref() != Some(&nalu[..]) {
                         self.pps = Some(nalu.to_vec());
                     }
                     self.current_frame.push(nalu);
@@ -1337,9 +1366,9 @@ impl H264RtpDepacketizer {
                 if e_bit && !self.fu_buffer.is_empty() {
                     let complete_nalu = bytes::Bytes::copy_from_slice(&self.fu_buffer);
                     self.fu_buffer.clear();
-                    if inner_type == 7 {
+                    if inner_type == 7 && self.sps.as_deref() != Some(&complete_nalu[..]) {
                         self.sps = Some(complete_nalu.to_vec());
-                    } else if inner_type == 8 {
+                    } else if inner_type == 8 && self.pps.as_deref() != Some(&complete_nalu[..]) {
                         self.pps = Some(complete_nalu.to_vec());
                     }
                     self.current_frame.push(complete_nalu);
@@ -1574,9 +1603,9 @@ impl H265RtpDepacketizer {
         if nalu.len() >= 2 {
             let nal_type = (nalu[0] >> 1) & 0x3F;
             match nal_type {
-                32 => self.vps = Some(nalu.to_vec()),
-                33 => self.sps = Some(nalu.to_vec()),
-                34 => self.pps = Some(nalu.to_vec()),
+                32 if self.vps.as_deref() != Some(nalu) => self.vps = Some(nalu.to_vec()),
+                33 if self.sps.as_deref() != Some(nalu) => self.sps = Some(nalu.to_vec()),
+                34 if self.pps.as_deref() != Some(nalu) => self.pps = Some(nalu.to_vec()),
                 _ => {}
             }
         }

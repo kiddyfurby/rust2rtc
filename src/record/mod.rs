@@ -3,7 +3,7 @@
 use crate::core::MediaKind;
 use crate::ffmpeg::FfmpegManager;
 use crate::mp4::{
-    build_standalone_mp4, parse_h264_sps_dimensions, parse_h265_sps, H264RtpDepacketizer,
+    parse_h264_sps_dimensions, parse_h265_sps, write_standalone_mp4, H264RtpDepacketizer,
     H265RtpDepacketizer, VideoCodecConfig, VideoSample,
 };
 use crate::streams::Stream;
@@ -71,21 +71,30 @@ impl SegmentRecorder {
         tokio::spawn(async move {
             while let Some(job) = seg_rx.recv().await {
                 tokio::task::spawn_blocking(move || {
-                    let mp4_bytes = build_standalone_mp4(&job.codec_config, &job.samples, None);
+                    use std::io::Write;
                     let date_str = job.start_utc.format("%Y%m%d%H%M%S+0000").to_string();
                     let target_file = job.output_dir.join(format!("{}@{}.mp4", job.stream_name, date_str));
                     let tmp_file = job.output_dir.join(format!(".{}@{}.mp4.tmp", job.stream_name, date_str));
-                    if let Err(e) = std::fs::write(&tmp_file, &mp4_bytes) {
-                        error!(stream = %job.stream_name, error = %e, "Failed to write MP4 segment tmp file");
-                        return;
-                    }
+                    let write_res = std::fs::File::create(&tmp_file).and_then(|file| {
+                        let mut writer = std::io::BufWriter::with_capacity(65536, file);
+                        let bytes = write_standalone_mp4(&mut writer, &job.codec_config, &job.samples, None)?;
+                        writer.flush()?;
+                        Ok(bytes)
+                    });
+                    let written_bytes = match write_res {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!(stream = %job.stream_name, error = %e, "Failed to write MP4 segment tmp file");
+                            return;
+                        }
+                    };
                     if let Err(e) = std::fs::rename(&tmp_file, &target_file) {
                         error!(stream = %job.stream_name, error = %e, "Failed to atomically rename MP4 segment");
                     } else {
                         info!(
                             stream = %job.stream_name,
                             path = %target_file.display(),
-                            bytes = mp4_bytes.len(),
+                            bytes = written_bytes,
                             samples = job.samples.len(),
                             duration = ?job.elapsed,
                             "Saved MP4 segment for Frigate cache"
@@ -136,27 +145,28 @@ impl SegmentRecorder {
             );
 
             let mut rx = video_track.subscribe();
-            let mut h264_depack = H264RtpDepacketizer::new();
-            let mut h265_depack = H265RtpDepacketizer::new();
+            let mut h264_depack = (!is_hevc).then(H264RtpDepacketizer::new);
+            let mut h265_depack = is_hevc.then(H265RtpDepacketizer::new);
 
             // Pre-seed parameter sets if already cached in track
             let initial_params = video_track.get_param_sets_data();
-            if is_hevc {
+            if let Some(ref mut depack) = h265_depack {
                 if let Some(ref vps) = initial_params.h265_vps {
-                    h265_depack.vps = Some(vps.clone());
+                    depack.vps = Some(vps.clone());
                 }
                 if let Some(ref sps) = initial_params.h265_sps {
-                    h265_depack.sps = Some(sps.clone());
+                    depack.sps = Some(sps.clone());
                 }
                 if let Some(ref pps) = initial_params.h265_pps {
-                    h265_depack.pps = Some(pps.clone());
+                    depack.pps = Some(pps.clone());
                 }
-            } else {
+            }
+            if let Some(ref mut depack) = h264_depack {
                 if let Some(ref sps) = initial_params.h264_sps {
-                    h264_depack.sps = Some(sps.clone());
+                    depack.sps = Some(sps.clone());
                 }
                 if let Some(ref pps) = initial_params.h264_pps {
-                    h264_depack.pps = Some(pps.clone());
+                    depack.pps = Some(pps.clone());
                 }
             }
 
@@ -185,10 +195,11 @@ impl SegmentRecorder {
                             Ok(p) => p,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!(stream = %self.stream_name, skipped = n, "Recorder subscriber lagged; resetting depacketizer");
-                                if is_hevc {
-                                    h265_depack.reset();
-                                } else {
-                                    h264_depack.reset();
+                                if let Some(ref mut d) = h265_depack {
+                                    d.reset();
+                                }
+                                if let Some(ref mut d) = h264_depack {
+                                    d.reset();
                                 }
                                 current_segment = None;
                                 continue;
@@ -201,10 +212,12 @@ impl SegmentRecorder {
                     }
                 };
 
-                let mut frame_opt = if is_hevc {
-                    h265_depack.feed_packet(&packet)
+                let mut frame_opt = if let Some(ref mut d) = h265_depack {
+                    d.feed_packet(&packet)
+                } else if let Some(ref mut d) = h264_depack {
+                    d.feed_packet(&packet)
                 } else {
-                    h264_depack.feed_packet(&packet)
+                    None
                 };
 
                 while let Some((is_keyframe, rtp_ts, nalus)) = frame_opt {
@@ -212,10 +225,12 @@ impl SegmentRecorder {
                 // A segment MUST always start with a keyframe
                 if current_segment.is_none() {
                     if !is_keyframe {
-                        frame_opt = if is_hevc {
-                            h265_depack.pop_frame()
+                        frame_opt = if let Some(ref mut d) = h265_depack {
+                            d.pop_frame()
+                        } else if let Some(ref mut d) = h264_depack {
+                            d.pop_frame()
                         } else {
-                            h264_depack.pop_frame()
+                            None
                         };
                         continue;
                     }
@@ -229,10 +244,12 @@ impl SegmentRecorder {
                             nalus,
                         }],
                     });
-                    frame_opt = if is_hevc {
-                        h265_depack.pop_frame()
+                    frame_opt = if let Some(ref mut d) = h265_depack {
+                        d.pop_frame()
+                    } else if let Some(ref mut d) = h264_depack {
+                        d.pop_frame()
                     } else {
-                        h264_depack.pop_frame()
+                        None
                     };
                     continue;
                 }
@@ -261,11 +278,11 @@ impl SegmentRecorder {
                     let finished_seg = current_segment.take().unwrap();
 
                     // Resolve codec config
-                    let codec_config_opt = if is_hevc {
+                    let codec_config_opt = if let Some(ref d) = h265_depack {
                         let track_params = video_track.get_param_sets_data();
-                        let vps = h265_depack.vps.clone().or(track_params.h265_vps);
-                        let sps = h265_depack.sps.clone().or(track_params.h265_sps);
-                        let pps = h265_depack.pps.clone().or(track_params.h265_pps);
+                        let vps = d.vps.clone().or(track_params.h265_vps);
+                        let sps = d.sps.clone().or(track_params.h265_sps);
+                        let pps = d.pps.clone().or(track_params.h265_pps);
 
                         if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
                             let (w, h, _) = parse_h265_sps(&sps);
@@ -279,10 +296,10 @@ impl SegmentRecorder {
                         } else {
                             None
                         }
-                    } else {
+                    } else if let Some(ref d) = h264_depack {
                         let track_params = video_track.get_param_sets_data();
-                        let sps = h264_depack.sps.clone().or(track_params.h264_sps);
-                        let pps = h264_depack.pps.clone().or(track_params.h264_pps);
+                        let sps = d.sps.clone().or(track_params.h264_sps);
+                        let pps = d.pps.clone().or(track_params.h264_pps);
 
                         if let (Some(sps), Some(pps)) = (sps, pps) {
                             let (w, h) = parse_h264_sps_dimensions(&sps);
@@ -295,6 +312,8 @@ impl SegmentRecorder {
                         } else {
                             None
                         }
+                    } else {
+                        None
                     };
 
                     if let Some(codec_config) = codec_config_opt {
@@ -332,10 +351,12 @@ impl SegmentRecorder {
                     });
                 }
 
-                frame_opt = if is_hevc {
-                    h265_depack.pop_frame()
+                frame_opt = if let Some(ref mut d) = h265_depack {
+                    d.pop_frame()
+                } else if let Some(ref mut d) = h264_depack {
+                    d.pop_frame()
                 } else {
-                    h264_depack.pop_frame()
+                    None
                 };
             }
             }
