@@ -246,8 +246,11 @@ async fn async_main(config: Config) -> Result<()> {
     // Register configured streams
     for (name, stream_cfg) in &config.streams {
         let sources = stream_cfg.to_vec();
-        info!(stream = %name, sources = ?sources, "Registering stream");
-        stream_manager.add_configured_stream(name.clone(), sources).await;
+        let keep_warm_secs = stream_cfg.keep_warm_secs().unwrap_or(0);
+        info!(stream = %name, sources = ?sources, keep_warm_secs, "Registering stream");
+        stream_manager
+            .add_configured_stream_with_options(name.clone(), sources, keep_warm_secs)
+            .await;
     }
 
     // Determine RTSP port

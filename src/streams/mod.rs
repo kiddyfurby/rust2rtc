@@ -22,6 +22,11 @@ pub struct ActiveProducer {
 pub struct Stream {
     pub name: String,
     pub sources: Vec<String>,
+    /// Seconds to keep an on-demand native RTSP producer alive after its last
+    /// consumer disconnects (0 = default 50s idle stop). Keeps the GOP cache
+    /// hot so SIP calls get an instant keyframe instead of a cold RTSP
+    /// handshake with the camera.
+    pub keep_warm_secs: u64,
     pub tracks: RwLock<Vec<Arc<Track>>>,
     track_count_tx: watch::Sender<usize>,
     pub producer: Mutex<Option<ActiveProducer>>,
@@ -66,10 +71,15 @@ fn select_primary_source(sources: &[String]) -> &String {
 
 impl Stream {
     pub fn new(name: String, sources: Vec<String>) -> Self {
+        Self::with_options(name, sources, 0)
+    }
+
+    pub fn with_options(name: String, sources: Vec<String>, keep_warm_secs: u64) -> Self {
         let (track_count_tx, _) = watch::channel(0);
         Self {
             name,
             sources,
+            keep_warm_secs,
             tracks: RwLock::new(Vec::new()),
             track_count_tx,
             producer: Mutex::new(None),
@@ -732,8 +742,20 @@ impl StreamManager {
     }
 
     pub async fn add_configured_stream(&self, name: String, sources: Vec<String>) {
+        self.add_configured_stream_with_options(name, sources, 0).await
+    }
+
+    pub async fn add_configured_stream_with_options(
+        &self,
+        name: String,
+        sources: Vec<String>,
+        keep_warm_secs: u64,
+    ) {
         let mut map = self.streams.write().await;
-        map.insert(name.clone(), Arc::new(Stream::new(name, sources)));
+        map.insert(
+            name.clone(),
+            Arc::new(Stream::with_options(name, sources, keep_warm_secs)),
+        );
     }
 
     pub async fn get(&self, name: &str) -> Option<Arc<Stream>> {

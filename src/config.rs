@@ -157,6 +157,28 @@ fn default_auto_answer() -> bool {
 pub enum StreamConfig {
     Single(String),
     Multiple(Vec<String>),
+    Detailed(StreamDetailedConfig),
+}
+
+/// Expanded (map) form of a stream entry, allowing per-stream options:
+///
+/// ```yaml
+/// streams:
+///   doorbell:
+///     sources:
+///       - "rtsp://camera/Preview_01_main"
+///     keep_warm_secs: 86400
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamDetailedConfig {
+    /// Camera sources; accepts the same string-or-list forms as the shorthand.
+    pub sources: Box<StreamConfig>,
+    /// Keep the on-demand RTSP producer alive this many seconds after the last
+    /// consumer disconnects (keeps the GOP cache hot so SIP calls and new
+    /// subscribers get an instant keyframe). 0 or absent keeps the default
+    /// 50s idle stop.
+    #[serde(default)]
+    pub keep_warm_secs: Option<u64>,
 }
 
 impl StreamConfig {
@@ -164,6 +186,15 @@ impl StreamConfig {
         match self {
             StreamConfig::Single(s) => vec![s.clone()],
             StreamConfig::Multiple(v) => v.clone(),
+            StreamConfig::Detailed(d) => d.sources.to_vec(),
+        }
+    }
+
+    /// Per-stream keep-warm window in seconds (expanded map form only).
+    pub fn keep_warm_secs(&self) -> Option<u64> {
+        match self {
+            StreamConfig::Detailed(d) => d.keep_warm_secs,
+            _ => None,
         }
     }
 }
@@ -370,5 +401,52 @@ ffmpeg:
         assert_eq!(base.worker_threads, None);
         base.merge(cfg);
         assert_eq!(base.worker_threads, Some(4));
+    }
+
+    #[test]
+    fn test_stream_config_expanded_form() {
+        let yaml = r#"
+streams:
+  doorbell:
+    sources:
+      - "rtsp://198.51.100.42/Preview_01_main"
+      - "ffmpeg:doorbell#audio=opus"
+    keep_warm_secs: 600
+  garden: "rtsp://198.51.100.20/stream"
+  plato:
+    - "rtsp://198.51.100.21/stream"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).expect("Failed to parse YAML");
+
+        let doorbell = cfg.streams.get("doorbell").expect("doorbell stream");
+        assert_eq!(
+            doorbell.to_vec(),
+            vec!["rtsp://198.51.100.42/Preview_01_main", "ffmpeg:doorbell#audio=opus"]
+        );
+        assert_eq!(doorbell.keep_warm_secs(), Some(600));
+
+        // Shorthand forms keep working and report no keep-warm window.
+        let garden = cfg.streams.get("garden").expect("garden stream");
+        assert_eq!(garden.to_vec(), vec!["rtsp://198.51.100.20/stream"]);
+        assert_eq!(garden.keep_warm_secs(), None);
+
+        let plato = cfg.streams.get("plato").expect("plato stream");
+        assert_eq!(plato.to_vec(), vec!["rtsp://198.51.100.21/stream"]);
+        assert_eq!(plato.keep_warm_secs(), None);
+    }
+
+    #[test]
+    fn test_stream_merge_expanded_replaces_shorthand() {
+        let mut base: Config =
+            serde_yaml::from_str("streams:\n  doorbell: \"rtsp://old\"\n").unwrap();
+        let over: Config = serde_yaml::from_str(
+            "streams:\n  doorbell:\n    sources: [\"rtsp://new\"]\n    keep_warm_secs: 60\n",
+        )
+        .unwrap();
+
+        base.merge(over);
+        let doorbell = base.streams.get("doorbell").expect("doorbell stream");
+        assert_eq!(doorbell.to_vec(), vec!["rtsp://new"]);
+        assert_eq!(doorbell.keep_warm_secs(), Some(60));
     }
 }

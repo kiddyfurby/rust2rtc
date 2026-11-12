@@ -271,6 +271,10 @@ impl RtspClient {
         );
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut idle_keepalives = 0u32;
+        // On-demand producers stop after ~50s without consumers by default;
+        // streams with a keep-warm window stay up longer (rounded up to the
+        // 25s keepalive tick) so the GOP cache stays hot for fast SIP pickup.
+        let idle_stop_ticks = idle_stop_ticks(stream.keep_warm_secs);
 
         let read_timeout = tokio::time::sleep(Duration::from_secs(8));
         tokio::pin!(read_timeout);
@@ -362,8 +366,12 @@ impl RtspClient {
                 _ = keepalive_timer.tick() => {
                     if stream.total_consumers().await == 0 {
                         idle_keepalives += 1;
-                        if idle_keepalives >= 2 {
-                            info!(stream = %stream.name, "No active consumers on RTSP stream for 50s, stopping on-demand producer");
+                        if (idle_keepalives as u64) >= idle_stop_ticks {
+                            info!(
+                                stream = %stream.name,
+                                idle_secs = idle_stop_ticks * 25,
+                                "No active consumers on RTSP stream; stopping on-demand producer"
+                            );
                             if let Some(ref sess) = session_id {
                                 let _ = Self::send_raw_request(
                                     &mut tcp,
@@ -691,6 +699,17 @@ fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
     memchr::memmem::find(buf, b"\r\n\r\n")
 }
 
+/// Number of 25s keepalive ticks to wait with zero consumers before stopping
+/// an on-demand producer. `keep_warm_secs == 0` keeps the default ~50s stop;
+/// a positive value is rounded up to whole ticks (25s granularity).
+fn idle_stop_ticks(keep_warm_secs: u64) -> u64 {
+    if keep_warm_secs > 0 {
+        keep_warm_secs.div_ceil(25).max(1)
+    } else {
+        2
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TrackDraft {
     kind: MediaKind,
@@ -888,5 +907,18 @@ a=control:track0\r\n";
         let tracks = parse_sdp_tracks_with_control(sdp, "rtsp://198.51.100.100/stream1/", &existing);
         assert_eq!(tracks.len(), 1);
         assert!(Arc::ptr_eq(&tracks[0].track, &existing_video), "Must reuse the existing Track Arc reference");
+    }
+
+    #[test]
+    fn test_idle_stop_ticks() {
+        // Default: two 25s ticks (~50s) without consumers stops the producer.
+        assert_eq!(idle_stop_ticks(0), 2);
+        // Explicit windows round up to whole 25s ticks.
+        assert_eq!(idle_stop_ticks(1), 1);
+        assert_eq!(idle_stop_ticks(25), 1);
+        assert_eq!(idle_stop_ticks(26), 2);
+        assert_eq!(idle_stop_ticks(50), 2);
+        assert_eq!(idle_stop_ticks(600), 24);
+        assert_eq!(idle_stop_ticks(86400), 3456);
     }
 }

@@ -204,7 +204,7 @@ impl SipCallSession {
         let call_id_audio = call_id.clone();
         tasks.push(tokio::spawn(async move {
             let audio_track = stream_tx
-                .wait_for_track(Duration::from_secs(3), |t| t.kind == MediaKind::Audio)
+                .wait_for_track(Duration::from_secs(8), |t| t.kind == MediaKind::Audio)
                 .await;
             if let Some(audio_track) = audio_track {
                 info!(
@@ -250,7 +250,7 @@ impl SipCallSession {
                 warn!(
                     call_id = %call_id_audio,
                     stream = %stream_tx.name,
-                    "No audio track found on stream after 3s; sending comfort silence"
+                    "No audio track found on stream after 8s; sending comfort silence"
                 );
             }
         }));
