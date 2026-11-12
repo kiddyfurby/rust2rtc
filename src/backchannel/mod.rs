@@ -51,20 +51,32 @@ impl Drop for BackchannelSession {
 }
 
 /// Detect backchannel configuration from stream sources
+///
+/// Priority: `multitrans://`/`tapo://` > `onvif://` > backchannel-marked RTSP URLs.
+/// A doorbell stream typically lists its own internal-RTSP backchannel marker
+/// (`rtsp://<self>:8554/<name>?backchannel=1`) before the real camera
+/// (`onvif://...`), so a first-match scan would pick the self-reference; the
+/// ONVIF DESCRIBE against our own server returns no sendonly audio track and
+/// the backchannel silently fails. Preferring `onvif://` fixes that while
+/// keeping single-source streams (e.g. living's marked camera URL) working.
 pub fn detect_backchannel(sources: &[String]) -> Option<BackchannelKind> {
+    let mut onvif: Option<BackchannelKind> = None;
+    let mut marked_rtsp: Option<BackchannelKind> = None;
     for source in sources {
         if source.starts_with("multitrans://") || source.starts_with("tapo://") {
             return Some(BackchannelKind::Multitrans(source.clone()));
         }
-        if source.starts_with("onvif://")
-            || source.contains("#backchannel=1")
-            || source.contains("?backchannel=1")
-            || source.contains("&backchannel=1")
+        if source.starts_with("onvif://") {
+            onvif = Some(BackchannelKind::Onvif(source.clone()));
+        } else if marked_rtsp.is_none()
+            && (source.contains("#backchannel=1")
+                || source.contains("?backchannel=1")
+                || source.contains("&backchannel=1"))
         {
-            return Some(BackchannelKind::Onvif(source.clone()));
+            marked_rtsp = Some(BackchannelKind::Onvif(source.clone()));
         }
     }
-    None
+    onvif.or(marked_rtsp)
 }
 
 /// Start a live backchannel session for a given stream's sources
@@ -155,5 +167,19 @@ mod tests {
 
         let s3 = vec!["rtsp://192.0.2.50/cam".to_string()];
         assert_eq!(detect_backchannel(&s3), None);
+    }
+
+    #[test]
+    fn test_detect_backchannel_prefers_onvif_over_self_reference() {
+        // Doorbell stream: self-referential marked URL first, real camera second.
+        let doorbell = vec![
+            "rtsp://198.51.100.4:8554/doorbell?backchannel=1#backchannel=1".to_string(),
+            "onvif://admin:pass@198.51.100.42:8000".to_string(),
+            "ffmpeg:doorbell#audio=opus".to_string(),
+        ];
+        assert_eq!(
+            detect_backchannel(&doorbell),
+            Some(BackchannelKind::Onvif("onvif://admin:pass@198.51.100.42:8000".to_string()))
+        );
     }
 }

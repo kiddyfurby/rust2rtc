@@ -119,9 +119,14 @@ impl OnvifBackchannelClient {
         // Parse SDP for backchannel track control URL
         let control_url = parse_backchannel_control(&body, rtsp_url)
             .context("Failed to find backchannel track in camera SDP")?;
-        debug!(control_url = %control_url, "Found ONVIF backchannel control URL");
+        info!(control_url = %control_url, "Found ONVIF backchannel control URL");
 
         // 2. SETUP
+        // Strip any userinfo from the control URL: the Reolink camera rejects
+        // SETUP request lines carrying `user:pass@host` with 400 Bad Request
+        // (the DESCRIBE tolerates it, but SETUP does not). Credentials travel
+        // in the Digest Authorization header instead.
+        let control_url = strip_userinfo(&control_url);
         let mut setup_req = format!(
             "SETUP {} RTSP/1.0\r\n\
             CSeq: {}\r\n\
@@ -139,9 +144,13 @@ impl OnvifBackchannelClient {
         setup_req.push_str("\r\n");
         stream.write_all(setup_req.as_bytes()).await?;
 
-        let (setup_status, setup_headers, _) = read_rtsp_response(&mut stream).await?;
+        let (setup_status, setup_headers, setup_body) = read_rtsp_response(&mut stream).await?;
         if setup_status != 200 {
-            bail!("RTSP SETUP for backchannel failed with status {}", setup_status);
+            bail!(
+                "RTSP SETUP for backchannel failed with status {} (body: {})",
+                setup_status,
+                setup_body.trim()
+            );
         }
 
         let session = setup_headers
@@ -336,6 +345,22 @@ fn resolve_control_url(control: &str, base_url: &str) -> String {
     }
 }
 
+/// Remove `user:pass@` userinfo from an RTSP URL (`rtsp://u:p@host/path` ->
+/// `rtsp://host/path`). Cameras like Reolink reject SETUP request lines that
+/// embed credentials even though DESCRIBE tolerates them.
+fn strip_userinfo(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        // userinfo ends at the first `@` that precedes the first `/`.
+        let authority_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        if let Some(at_pos) = after_scheme[..authority_end].find('@') {
+            let host_and_path = &after_scheme[at_pos + 1..];
+            return format!("{}{}", &url[..scheme_end + 3], host_and_path);
+        }
+    }
+    url.to_string()
+}
+
 async fn read_rtsp_response(
     stream: &mut TcpStream,
 ) -> Result<(u16, HashMap<String, String>, String)> {
@@ -458,6 +483,20 @@ a=control:track3\r\n";
             ctrl,
             Some("rtsp://192.0.2.25/ch0_0.h264/track3".to_string())
         );
+    }
+
+    #[test]
+    fn test_strip_userinfo() {
+        assert_eq!(
+            strip_userinfo("rtsp://admin:pass@192.0.2.42:554/Preview_01_main/track3"),
+            "rtsp://192.0.2.42:554/Preview_01_main/track3"
+        );
+        assert_eq!(
+            strip_userinfo("rtsp://192.0.2.42:554/Preview_01_main"),
+            "rtsp://192.0.2.42:554/Preview_01_main"
+        );
+        assert_eq!(strip_userinfo("rtsp://admin:pass@192.0.2.42/track3"), "rtsp://192.0.2.42/track3");
+        assert_eq!(strip_userinfo("not a url"), "not a url");
     }
 
     #[tokio::test]
