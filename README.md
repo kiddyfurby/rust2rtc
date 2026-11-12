@@ -260,6 +260,7 @@ sip:
   auto_register_streams: true # Automatically assigns SIP extensions to camera streams
   base_extension: 101
   auto_password: "YourSecurePasswordHere"
+  max_call_duration_secs: 43200 # Max call duration before auto-hangup (default: 12h)
   names:
     doorbell: "Front Door"
     driveway: "Driveway"

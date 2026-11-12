@@ -85,6 +85,9 @@ sip:
   auto_register_streams: true # Automatically assign SIP extensions to camera streams
   base_extension: 101         # Starting extension number (e.g. 101, 102, ...)
   auto_password: "YourSecurePasswordHere"
+  # Maximum SIP call duration before the call is terminated with BYE (seconds).
+  # Default: 43200 (12 hours). Per-account override: accounts.<name>.max_call_duration_secs
+  max_call_duration_secs: 43200
 
   # Friendly names shown on SIP phone screens during incoming calls
   names:

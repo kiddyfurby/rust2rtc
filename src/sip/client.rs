@@ -20,6 +20,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
+/// Default maximum duration for a SIP call (12 hours) before the watchdog
+/// terminates the dialog with BYE. Configurable via `sip.max_call_duration_secs`
+/// (global) or `sip.accounts.<name>.max_call_duration_secs` (per-account).
+pub const DEFAULT_MAX_CALL_DURATION_SECS: u64 = 12 * 60 * 60;
+
 /// Helper to extract SIP URI and optional tag from headers like `<sip:user@host>;tag=xxx`
 pub fn extract_uri_and_tag(header: &str) -> (String, Option<String>) {
     let uri = if let Some(start) = header.find('<')
@@ -762,7 +767,10 @@ impl SipCameraAccount {
         // Spawn maximum call duration watchdog
         let call_account = Arc::clone(self);
         let call_id_timeout = call_id.clone();
-        let max_secs = self.config.max_call_duration_secs.unwrap_or(180);
+        let max_secs = self
+            .config
+            .max_call_duration_secs
+            .unwrap_or(DEFAULT_MAX_CALL_DURATION_SECS);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(max_secs)).await;
             let mut active = call_account.active_call.lock().await;
@@ -1194,7 +1202,10 @@ impl SipCameraAccount {
             // Spawn maximum call duration watchdog
             let call_account = Arc::clone(self);
             let call_id_timeout = winning_leg.call_id.clone();
-            let max_secs = self.config.max_call_duration_secs.unwrap_or(180);
+            let max_secs = self
+                .config
+                .max_call_duration_secs
+                .unwrap_or(DEFAULT_MAX_CALL_DURATION_SECS);
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(max_secs)).await;
                 let mut active = call_account.active_call.lock().await;

@@ -398,7 +398,7 @@ async fn async_main(config: Config) -> Result<()> {
                 max_call_duration_secs: acc_cfg
                     .max_call_duration_secs
                     .or(sip_cfg.max_call_duration_secs)
-                    .or(Some(180)),
+                    .or(Some(sip::client::DEFAULT_MAX_CALL_DURATION_SECS)),
             };
             if let Err(e) = sip_manager.add_account(client_cfg).await {
                 error!(stream = %stream_name, "Failed to initialize SIP account: {}", e);
@@ -434,7 +434,9 @@ async fn async_main(config: Config) -> Result<()> {
                     auto_answer: true,
                     local_ip: local_ip.to_string(),
                     ha_client: ha_client.clone(),
-                    max_call_duration_secs: sip_cfg.max_call_duration_secs.or(Some(180)),
+                    max_call_duration_secs: sip_cfg
+                        .max_call_duration_secs
+                        .or(Some(sip::client::DEFAULT_MAX_CALL_DURATION_SECS)),
                 };
                 if let Err(e) = sip_manager.add_account(client_cfg).await {
                     error!(stream = %stream_name, "Failed to auto-register SIP account: {}", e);
