@@ -9,6 +9,7 @@ use crate::mp4::{
 use crate::streams::Stream;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -534,12 +535,8 @@ pub fn run_ffmpeg_shim(args: Vec<String>) -> ! {
         camera
     );
 
-    // 4. Block waiting for SIGINT, SIGTERM, or SIGHUP
-    wait_for_shutdown_signal();
-
-    eprintln!("[rust2rtc ffmpeg-shim] Stopping in-process recording for '{}'", camera);
-    let _ = call_rust2rtc_record_api(&camera, "stop");
-    std::process::exit(0);
+    // 4. Supervise the recorder until SIGINT, SIGTERM, or SIGHUP
+    run_recorder_supervisor(&camera);
 }
 
 fn exec_real_ffmpeg(real_ffmpeg: &str, args: &[String]) -> ! {
@@ -594,26 +591,115 @@ fn call_rust2rtc_record_api(stream: &str, action: &str) -> bool {
     false
 }
 
-fn wait_for_shutdown_signal() {
+/// Set by the shim's signal handlers; checked by the supervisor loop.
+static SHIM_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn shim_on_signal(_: std::os::raw::c_int) {
+    SHIM_SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// How often the supervisor re-checks the recorder status (seconds).
+const RECORDER_POLL_SECS: usize = 10;
+
+/// Keep the in-process recorder alive across rust2rtc restarts.
+///
+/// The shim is spawned by Frigate and outlives rust2rtc: config reloads,
+/// redeploys, or crashes drop the in-process recorders while the shim keeps
+/// standing by, silently stopping all recordings (Frigate's watchdog only
+/// reacts to process death, and the shim never dies). Poll the record API and
+/// re-request recording whenever the recorder is gone, until SIGINT, SIGTERM,
+/// or SIGHUP arrives.
+fn run_recorder_supervisor(camera: &str) -> ! {
     #[cfg(unix)]
-    {
-        extern "C" fn on_sig(_: std::os::raw::c_int) {}
-        unsafe {
-            libc::signal(libc::SIGINT, on_sig as *const () as usize);
-            libc::signal(libc::SIGTERM, on_sig as *const () as usize);
-            libc::signal(libc::SIGHUP, on_sig as *const () as usize);
-            libc::pause();
+    unsafe {
+        libc::signal(libc::SIGINT, shim_on_signal as *const () as usize);
+        libc::signal(libc::SIGTERM, shim_on_signal as *const () as usize);
+        libc::signal(libc::SIGHUP, shim_on_signal as *const () as usize);
+    }
+
+    while !SHIM_SHUTDOWN.load(Ordering::SeqCst) {
+        // Recorder gone (e.g. rust2rtc restarted)? Ask for it again.
+        if matches!(call_rust2rtc_record_status(camera), Some(false)) {
+            let _ = call_rust2rtc_record_api(camera, "start");
+        }
+
+        // Sleep in 1s slices so shutdown signals are honoured promptly.
+        for _ in 0..RECORDER_POLL_SECS {
+            if SHIM_SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
-    #[cfg(not(unix))]
-    {
-        std::thread::park();
+
+    eprintln!("[rust2rtc ffmpeg-shim] Stopping in-process recording for '{}'", camera);
+    let _ = call_rust2rtc_record_api(camera, "stop");
+    std::process::exit(0);
+}
+
+/// Query `/api/record?action=status` and report whether the in-process
+/// recorder is currently active. `None` when the API is unreachable or the
+/// response carries no recognisable flag.
+fn call_rust2rtc_record_status(stream: &str) -> Option<bool> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let api_port: u16 = std::env::var("GO2RTC_API_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1984);
+
+    let mut conn = TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], api_port)),
+        Duration::from_millis(500),
+    )
+    .ok()?;
+    let req = format!(
+        "GET /api/record?stream={}&action=status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        stream, api_port
+    );
+    conn.write_all(req.as_bytes()).ok()?;
+
+    let mut reader = BufReader::new(conn);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).ok()?;
+    if !status_line.contains(" 200 ") {
+        return None;
+    }
+    let mut body = String::new();
+    reader.read_to_string(&mut body).ok()?;
+    status_reports_active(&body)
+}
+
+/// Parse the `active` flag from a `/api/record` status response body.
+fn status_reports_active(body: &str) -> Option<bool> {
+    if body.contains("\"active\":true") {
+        Some(true)
+    } else if body.contains("\"active\":false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_status_reports_active() {
+        assert_eq!(
+            status_reports_active("{\"stream\":\"doorbell\",\"configured\":true,\"active\":true}"),
+            Some(true)
+        );
+        assert_eq!(
+            status_reports_active("{\"stream\":\"doorbell\",\"configured\":true,\"active\":false}"),
+            Some(false)
+        );
+        assert_eq!(status_reports_active("not json at all"), None);
+        assert_eq!(status_reports_active(""), None);
+    }
 
     #[tokio::test]
     async fn test_record_manager_is_configured_defaults() {
