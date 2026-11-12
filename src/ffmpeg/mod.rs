@@ -539,6 +539,12 @@ impl FfmpegManager {
             args.extend([
                 "-rtsp_transport".to_string(),
                 "tcp".to_string(),
+                // Ignore source RTP timestamps: stale or discontinuous RTP timestamps
+                // (e.g. a cached-GOP replay starting with an old parameter-set packet)
+                // make the frame sync duplicate frames to fill phantom gaps.
+                // Arrival-time pacing is what we want for a live MJPEG feed.
+                "-use_wallclock_as_timestamps".to_string(),
+                "1".to_string(),
             ]);
         }
 

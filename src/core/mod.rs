@@ -312,8 +312,14 @@ impl Track {
                 gop.bytes = 0;
                 let ps = self.param_sets.read().unwrap();
                 for ps_pkt in &ps.rtp_packets {
-                    gop.bytes += ps_pkt.raw.len();
-                    gop.packets.push(ps_pkt.clone());
+                    // Align the param-set RTP timestamp with the keyframe. The cached
+                    // STAP-A keeps the timestamp from whenever the SPS/PPS first arrived
+                    // (possibly minutes ago); replaying it unchanged in front of a current
+                    // keyframe makes consumers see a huge RTP timestamp jump, which
+                    // ffmpeg-based consumers "fix" by duplicating frames to fill the gap.
+                    let pkt = align_param_set_timestamp(ps_pkt, packet.timestamp);
+                    gop.bytes += pkt.raw.len();
+                    gop.packets.push(pkt);
                 }
                 gop.bytes += pkt_len;
                 gop.packets.push(packet.clone());
@@ -345,6 +351,20 @@ impl Track {
 
     pub fn get_param_sets(&self) -> Vec<RtpPacket> {
         self.param_sets.read().unwrap().rtp_packets.clone()
+    }
+
+    /// Param-set RTP packets with timestamps aligned to `timestamp`.
+    ///
+    /// The cached STAP-A carries the RTP timestamp from when the SPS/PPS were
+    /// first seen, which can be arbitrarily old. Callers that prepend these
+    /// packets before a current keyframe must align the timestamp, otherwise
+    /// consumers observe a large forward jump in the RTP timeline.
+    pub fn get_param_sets_aligned(&self, timestamp: u32) -> Vec<RtpPacket> {
+        let ps = self.param_sets.read().unwrap();
+        ps.rtp_packets
+            .iter()
+            .map(|p| align_param_set_timestamp(p, timestamp))
+            .collect()
     }
 
     pub fn get_gop_packets(&self) -> Vec<RtpPacket> {
@@ -625,6 +645,26 @@ pub fn unpack_h265_ap(payload: &[u8]) -> Vec<Vec<u8>> {
     nals
 }
 
+/// Return `ps_pkt` with its RTP timestamp rewritten to `timestamp`.
+///
+/// The cached STAP-A holds the timestamp of the packet that first delivered the
+/// SPS/PPS, which can be minutes old. Consumers prepend it before a current
+/// keyframe, so the timestamp must be aligned to keep the RTP timeline
+/// monotonic across the replay.
+fn align_param_set_timestamp(ps_pkt: &RtpPacket, timestamp: u32) -> RtpPacket {
+    if ps_pkt.timestamp == timestamp {
+        return ps_pkt.clone();
+    }
+    RtpPacket::create(
+        ps_pkt.payload_type,
+        ps_pkt.sequence_number,
+        timestamp,
+        ps_pkt.ssrc,
+        ps_pkt.marker,
+        ps_pkt.payload(),
+    )
+}
+
 pub fn is_keyframe_or_param_set(is_hevc: bool, payload: &[u8]) -> (bool, bool) {
     if payload.is_empty() {
         return (false, false);
@@ -818,6 +858,9 @@ mod tests {
 
         let gop = track.get_gop_packets();
         assert_eq!(gop.len(), 4); // STAP-A parameter set + IDR + P1 + P2
+        // The cached STAP-A must carry the keyframe's timestamp, not the
+        // timestamp from when the SPS/PPS were first seen (1000).
+        assert_eq!(gop[0].timestamp, 3000);
 
         let kf = track.get_keyframe_packets();
         assert_eq!(kf.len(), 2); // STAP-A parameter set + IDR
@@ -829,7 +872,13 @@ mod tests {
 
         let gop2 = track.get_gop_packets();
         assert_eq!(gop2.len(), 2); // STAP-A + new IDR
+        assert_eq!(gop2[0].timestamp, 12000);
         assert_eq!(gop2[1].timestamp, 12000);
+
+        // Aligned param sets follow the requested timestamp
+        let aligned = track.get_param_sets_aligned(12000);
+        assert_eq!(aligned.len(), 1);
+        assert_eq!(aligned[0].timestamp, 12000);
     }
 
     #[test]

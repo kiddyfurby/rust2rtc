@@ -211,6 +211,12 @@ impl RtspClient {
             bail!("Failed to SETUP any media tracks on camera {}", clean_url);
         }
 
+        // Drop any GOP cached from a previous session so subscribers never get
+        // a replay mixing old-session and new-session RTP timelines.
+        for t in &registered_tracks {
+            t.clear_gop_cache();
+        }
+
         // 4. Update Stream with native tracks (reusing existing if unchanged)
         let current_tracks = stream.get_tracks().await;
         let same = current_tracks.len() == registered_tracks.len()

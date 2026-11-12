@@ -377,7 +377,7 @@ impl RtspServer {
                                                             continue;
                                                         }
                                                         if is_keyframe {
-                                                            for ps_pkt in track_clone.get_param_sets() {
+                                                            for ps_pkt in track_clone.get_param_sets_aligned(packet.timestamp) {
                                                                 let _ = tx_clone.send(RtspOutgoing::Rtp(ch, ps_pkt.raw)).await;
                                                             }
                                                             waiting_for_keyframe = false;
