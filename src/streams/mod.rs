@@ -32,6 +32,38 @@ pub struct Stream {
     pub mjpeg_broadcaster: Arc<Mutex<Option<broadcast::Sender<Bytes>>>>,
 }
 
+/// Pick the primary media producer source from a stream's configured sources.
+///
+/// Skips sources that cannot provide primary media:
+/// - `multitrans://` / `tapo://` backchannel-only producers
+/// - `#video=mjpeg` transcode directives
+/// - `ffmpeg:` sources
+/// - backchannel-marked entries (`?backchannel=1` / `#backchannel=1`): these only
+///   provide the two-way audio channel. A doorbell stream that lists its own
+///   internal-RTSP backchannel URL first would otherwise make the producer pull
+///   from the internal server (circular - no live media) instead of the real
+///   camera source listed below it.
+///
+/// Falls back to any non-multitrans source (e.g. a stream whose only real camera
+///   source is backchannel-marked, like `living`), then to the first source.
+fn select_primary_source(sources: &[String]) -> &String {
+    sources
+        .iter()
+        .find(|s| {
+            !s.starts_with("multitrans://")
+                && !s.starts_with("tapo://")
+                && !s.contains("#video=mjpeg")
+                && !s.starts_with("ffmpeg:")
+                && !s.contains("backchannel=1")
+        })
+        .or_else(|| {
+            sources
+                .iter()
+                .find(|s| !s.starts_with("multitrans://") && !s.starts_with("tapo://"))
+        })
+        .unwrap_or(&sources[0])
+}
+
 impl Stream {
     pub fn new(name: String, sources: Vec<String>) -> Self {
         let (track_count_tx, _) = watch::channel(0);
@@ -395,12 +427,7 @@ impl Stream {
             return Ok(());
         }
 
-        let source = self
-            .sources
-            .iter()
-            .find(|s| !s.starts_with("multitrans://") && !s.contains("#video=mjpeg") && !s.starts_with("ffmpeg:"))
-            .or_else(|| self.sources.iter().find(|s| !s.starts_with("multitrans://")))
-            .unwrap_or(&self.sources[0]);
+        let source = select_primary_source(&self.sources);
 
         let resolved = crate::ffmpeg::resolve_source(source, rtsp_port);
 
@@ -760,6 +787,63 @@ impl StreamManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn srcs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_select_primary_source_skips_backchannel_and_transcode_sources() {
+        // doorbell-style: own internal-RTSP backchannel URL first, real camera below
+        let sources = srcs(&[
+            "rtsp://198.51.100.4:8554/doorbell?backchannel=1#backchannel=1",
+            "onvif://admin:pass@198.51.100.42:8000",
+            "ffmpeg:doorbell#audio=opus",
+            "ffmpeg:doorbell#video=mjpeg#height=480#raw=-r 15 -q:v 3",
+        ]);
+        assert_eq!(
+            select_primary_source(&sources),
+            "onvif://admin:pass@198.51.100.42:8000"
+        );
+    }
+
+    #[test]
+    fn test_select_primary_source_falls_back_to_backchannel_marked_camera() {
+        // living-style: the only real camera source is backchannel-marked
+        let sources = srcs(&[
+            "rtsp://192.0.2.25/ch0_0.h264#backchannel=1",
+            "ffmpeg:living#audio=opus",
+        ]);
+        assert_eq!(
+            select_primary_source(&sources),
+            "rtsp://192.0.2.25/ch0_0.h264#backchannel=1"
+        );
+    }
+
+    #[test]
+    fn test_select_primary_source_prefers_direct_rtsp_over_multitrans() {
+        let sources = srcs(&[
+            "rtsp://admin:pass@192.0.2.28:554/stream1",
+            "multitrans://admin:pass@192.0.2.28:554/",
+            "ffmpeg:driveway#video=mjpeg#raw=-r 15 -q:v 3",
+        ]);
+        assert_eq!(
+            select_primary_source(&sources),
+            "rtsp://admin:pass@192.0.2.28:554/stream1"
+        );
+    }
+
+    #[test]
+    fn test_select_primary_source_tapo_skipped_when_direct_available() {
+        let sources = srcs(&[
+            "tapo://admin:hash@192.0.2.27",
+            "rtsp://frigate:pass@192.0.2.27/stream2",
+        ]);
+        assert_eq!(
+            select_primary_source(&sources),
+            "rtsp://frigate:pass@192.0.2.27/stream2"
+        );
+    }
 
     #[tokio::test]
     async fn test_go2rtc_stream_schema() {
