@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,8 @@ pub struct Config {
     pub doorbells: HashMap<String, DoorbellConfig>,
     #[serde(default)]
     pub record: Option<RecordConfig>,
+    #[serde(default)]
+    pub warmup: Option<WarmupConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,10 +92,66 @@ fn default_doorbell_cooldown() -> u64 {
 pub struct WebRtcConfig {
     #[serde(default)]
     pub candidates: Vec<String>,
+    /// Local addresses the WebRTC media sockets bind on (one socket each).
+    /// Empty (default): every interface, which advertises a host candidate
+    /// per interface on multi-homed hosts. Set to a single address to keep
+    /// ICE negotiation on that interface.
+    #[serde(default)]
+    pub bind_ips: Vec<IpAddr>,
     #[serde(default)]
     pub engine: Option<String>,
     #[serde(default)]
     pub max_payload_size: Option<usize>,
+}
+
+/// Periodic pre-warm of Frigate's ONVIF camera caches.
+///
+/// Frigate initializes each camera's ONVIF controller lazily: the first
+/// `ptz/info` request after a (re)start pays a one-time SOAP initialization
+/// (seconds for PTZ cameras) that blocks the API event loop, which is what
+/// makes the first post-restart dashboard load slow. The warm-up task
+/// requests `ptz/info` for the configured cameras locally and periodically
+/// so the caches are already warm when a browser connects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmupConfig {
+    #[serde(default = "default_warmup_enabled")]
+    pub enabled: bool,
+    /// Base URL of the Frigate HTTP API.
+    #[serde(default = "default_warmup_url")]
+    pub url: String,
+    /// Value for the `remote-user` proxy auth header.
+    #[serde(default = "default_warmup_user")]
+    pub user: String,
+    /// Value for the `remote-role` proxy auth header; the role needs
+    /// camera read access.
+    #[serde(default = "default_warmup_role")]
+    pub role: String,
+    /// Cameras to warm. When empty, the camera list is read from Frigate.
+    #[serde(default)]
+    pub cameras: Vec<String>,
+    /// Seconds between warm-up cycles.
+    #[serde(default = "default_warmup_interval_secs")]
+    pub interval_secs: u64,
+}
+
+fn default_warmup_enabled() -> bool {
+    true
+}
+
+fn default_warmup_url() -> String {
+    "http://127.0.0.1:5001".to_string()
+}
+
+fn default_warmup_user() -> String {
+    "rust2rtc".to_string()
+}
+
+fn default_warmup_role() -> String {
+    "viewer".to_string()
+}
+
+fn default_warmup_interval_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -302,6 +361,11 @@ impl Config {
                         our_webrtc.candidates.push(cand);
                     }
                 }
+                for ip in webrtc.bind_ips {
+                    if !our_webrtc.bind_ips.contains(&ip) {
+                        our_webrtc.bind_ips.push(ip);
+                    }
+                }
                 if webrtc.engine.is_some() {
                     our_webrtc.engine = webrtc.engine;
                 }
@@ -323,6 +387,9 @@ impl Config {
         }
         if let Some(record) = other.record {
             self.record = Some(record);
+        }
+        if let Some(warmup) = other.warmup {
+            self.warmup = Some(warmup);
         }
     }
 

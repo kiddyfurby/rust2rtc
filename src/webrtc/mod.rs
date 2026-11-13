@@ -5,6 +5,7 @@ use crate::streams::Stream;
 use anyhow::Result;
 
 use bytes::Bytes;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -40,6 +41,8 @@ pub struct WebRtcManager {
     #[allow(dead_code)]
     pub engine: String,
     candidates: Vec<String>,
+    /// Local addresses the WebRTC media sockets bind on (one socket each).
+    bind_ips: Vec<IpAddr>,
     #[allow(dead_code)]
     pub rtsp_port: u16,
     #[allow(dead_code)]
@@ -51,11 +54,12 @@ pub struct WebRtcManager {
 impl WebRtcManager {
     #[allow(dead_code)]
     pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String, engine: String) -> Self {
-        Self::with_max_payload_size(candidates, rtsp_port, ffmpeg_bin, engine, 1200)
+        Self::with_max_payload_size(candidates, Vec::new(), rtsp_port, ffmpeg_bin, engine, 1200)
     }
 
     pub fn with_max_payload_size(
         candidates: Vec<String>,
+        bind_ips: Vec<IpAddr>,
         rtsp_port: u16,
         ffmpeg_bin: String,
         engine: String,
@@ -64,6 +68,7 @@ impl WebRtcManager {
         Self {
             engine,
             candidates,
+            bind_ips,
             rtsp_port,
             ffmpeg_bin,
             max_payload_size,
@@ -97,6 +102,7 @@ impl WebRtcManager {
             Arc::clone(&stream),
             offer_sdp,
             &self.candidates,
+            &self.bind_ips,
             self.max_payload_size,
         )
         .await?;

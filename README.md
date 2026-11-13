@@ -226,21 +226,36 @@ webrtc:
   candidates:
     - "198.51.100.4:8555"
     - "stun:stun.l.google.com:19302"
+  bind_ips: # Optional: bind media sockets to specific local addresses (one socket each)
+    - 198.51.100.4
 
-# 3. Ports & Network Services
+# 3. Frigate ONVIF Warm-up (Optional)
+# Pre-warms Frigate's lazily initialized ONVIF camera caches so the first
+# dashboard load after a Frigate restart does not pay the SOAP init.
+warmup:
+  enabled: true
+  url: "http://127.0.0.1:5001" # Frigate API
+  user: "rust2rtc" # remote-user proxy auth header
+  role: "viewer" # needs camera read access
+  cameras:
+    - doorbell
+    - driveway
+  interval_secs: 60
+
+# 4. Ports & Network Services
 api:
   listen: ":1984" # Web dashboard, REST API & WebSocket signaling
 
 rtsp:
   listen: ":8554" # Embedded RTSP server for Frigate, Home Assistant, VLC
 
-# 4. FFmpeg & Hardware Acceleration
+# 5. FFmpeg & Hardware Acceleration
 ffmpeg:
   bin: "ffmpeg"
   # Hardware profile: "rkmpp" (Rockchip RK3588), "vaapi" (Intel/AMD), "cuda" (Nvidia)
   hardware: "rkmpp"
 
-# 5. In-Process MP4 Recording for Frigate (Optional)
+# 6. In-Process MP4 Recording for Frigate (Optional)
 # NOTE: In-process progressive MP4 segment recording is ENABLED BY DEFAULT for
 # ALL streams when using the FFmpeg shim. You do NOT need to include this section
 # unless you want to customize the cache directory or restrict recording:
@@ -251,7 +266,7 @@ ffmpeg:
 #   # streams:                # Optional whitelist. If omitted, ALL streams are recorded!
 #   #   - doorbell
 
-# 6. Built-in SIP PBX / Intercom Server (Optional)
+# 7. Built-in SIP PBX / Intercom Server (Optional)
 sip:
   server: "198.51.100.4:5060"
   domain: "198.51.100.4"
@@ -265,7 +280,7 @@ sip:
     doorbell: "Front Door"
     driveway: "Driveway"
 
-# 7. Automated Doorbell Calling (Optional)
+# 8. Automated Doorbell Calling (Optional)
 doorbells:
   doorbell:
     entity: "binary_sensor.front_doorbell_visitor" # Home Assistant binary sensor

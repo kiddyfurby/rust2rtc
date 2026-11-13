@@ -10,6 +10,7 @@ mod record;
 mod rtsp;
 mod sip;
 mod streams;
+mod warmup;
 mod webrtc;
 
 use anyhow::{Context, Result};
@@ -292,6 +293,11 @@ async fn async_main(config: Config) -> Result<()> {
         .as_ref()
         .map(|w| w.candidates.clone())
         .unwrap_or_default();
+    let webrtc_bind_ips = config
+        .webrtc
+        .as_ref()
+        .map(|w| w.bind_ips.clone())
+        .unwrap_or_default();
     let webrtc_engine = config
         .webrtc
         .as_ref()
@@ -308,11 +314,20 @@ async fn async_main(config: Config) -> Result<()> {
 
     let webrtc_manager = Arc::new(webrtc::WebRtcManager::with_max_payload_size(
         webrtc_candidates,
+        webrtc_bind_ips,
         rtsp_port,
         ffmpeg_manager.bin().to_string(),
         webrtc_engine,
         webrtc_max_payload,
     ));
+
+    // Pre-warm Frigate's ONVIF camera caches so the first dashboard load
+    // after a (re)start does not pay the lazy ONVIF initialization.
+    if let Some(warmup_cfg) = &config.warmup
+        && let Some(task) = warmup::WarmupTask::from_config(warmup_cfg)
+    {
+        tokio::spawn(task.run());
+    }
 
     // Initialize SIP Manager
     let sip_manager = Arc::new(sip::SipManager::new(

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -32,6 +33,7 @@ impl RustRtcSession {
         stream: Arc<Stream>,
         offer_sdp: &str,
         candidates: &[String],
+        bind_ips: &[IpAddr],
         max_payload_size: usize,
     ) -> Result<(Self, String)> {
         let offer = SessionDescription::parse(SdpType::Offer, offer_sdp)?;
@@ -47,6 +49,10 @@ impl RustRtcSession {
                 config.external_ips.push(ip);
             }
         }
+
+        // Bind the media sockets to the configured local addresses (if
+        // any) instead of every interface.
+        config.bind_ips = bind_ips.to_vec();
 
         // Detect video codec from stream tracks
         let tracks = stream.get_tracks().await;
@@ -640,7 +646,7 @@ a=rtcp-mux\r\n\
 a=rtpmap:96 H264/90000\r\n\
 a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
 
-        let (session, answer_sdp) = RustRtcSession::create(stream, offer_sdp, &[], 1200).await.unwrap();
+        let (session, answer_sdp) = RustRtcSession::create(stream, offer_sdp, &[], &[], 1200).await.unwrap();
         assert!(!session.session_id.is_empty());
         assert!(answer_sdp.contains("v=0"));
         assert!(answer_sdp.contains("m=video"));

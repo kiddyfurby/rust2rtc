@@ -36,9 +36,40 @@ webrtc:
   candidates:
     - "198.51.100.4:8555"
     - "stun:stun.l.google.com:19302"
+  # Local addresses the WebRTC media sockets bind on (one socket each).
+  # Default (empty): every interface, which advertises a host candidate per
+  # interface on multi-homed hosts. Set to the LAN address to keep ICE
+  # negotiation to a single interface:
+  bind_ips:
+    - 198.51.100.4
 
 # ------------------------------------------------------------------------------
-# 3. Network Services (API & RTSP)
+# 3. Frigate ONVIF Warm-up (Optional)
+# ------------------------------------------------------------------------------
+# Frigate initializes each camera's ONVIF controller lazily: the first
+# ptz/info request after a Frigate restart pays a one-time SOAP
+# initialization (seconds for PTZ cameras) that blocks Frigate's API event
+# loop — and with it the dashboard's signaling — until it finishes. This
+# task requests ptz/info for the cameras below over loopback every
+# interval_secs so the first dashboard load after a restart is already warm.
+#
+# The requests authenticate with Frigate's proxy auth headers
+# (remote-user/remote-role), so no credentials are stored here. `role` needs
+# camera read access.
+warmup:
+  enabled: true
+  url: "http://127.0.0.1:5001" # Frigate API base URL
+  user: "rust2rtc" # remote-user header value
+  role: "viewer" # remote-role header value
+  # Cameras to warm. When omitted/empty, the camera list is read from
+  # Frigate's own config.
+  cameras:
+    - front_door
+    - driveway
+  interval_secs: 60 # Seconds between warm-up cycles
+
+# ------------------------------------------------------------------------------
+# 4. Network Services (API & RTSP)
 # ------------------------------------------------------------------------------
 api:
   listen: ":1984" # Web dashboard, REST API, and WebSocket signaling
@@ -47,7 +78,7 @@ rtsp:
   listen: ":8554" # Embedded RTSP server for Frigate, Home Assistant, and VLC
 
 # ------------------------------------------------------------------------------
-# 4. FFmpeg & Hardware Acceleration
+# 5. FFmpeg & Hardware Acceleration
 # ------------------------------------------------------------------------------
 ffmpeg:
   bin: "ffmpeg"
@@ -58,7 +89,7 @@ ffmpeg:
   hardware: "rkmpp"
 
 # ------------------------------------------------------------------------------
-# 5. In-Process Recording for Frigate (Optional)
+# 6. In-Process Recording for Frigate (Optional)
 # ------------------------------------------------------------------------------
 # NOTE: In-process progressive MP4 segment recording is ENABLED BY DEFAULT for
 # ALL streams when using the rust2rtc FFmpeg shim!
@@ -73,7 +104,7 @@ ffmpeg:
 #   #   - driveway
 
 # ------------------------------------------------------------------------------
-# 6. SIP Softphone & Intercom Server (Optional)
+# 7. SIP Softphone & Intercom Server (Optional)
 # ------------------------------------------------------------------------------
 # rust2rtc includes a built-in SIP PBX/gateway that enables VoIP desk phones
 # and mobile SIP apps (Grandstream, Linphone, etc.) to view video and talk.
@@ -105,7 +136,7 @@ sip:
       auto_answer: true
 
 # ------------------------------------------------------------------------------
-# 7. Doorbells & Call Automation (Optional)
+# 8. Doorbells & Call Automation (Optional)
 # ------------------------------------------------------------------------------
 # Listen to Home Assistant doorbell button events and trigger SIP calls to phones
 doorbells:
