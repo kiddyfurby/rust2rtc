@@ -1,4 +1,5 @@
 pub mod rustrtc_backend;
+pub mod sps_vui;
 
 use crate::core::MediaKind;
 use crate::streams::Stream;
@@ -303,6 +304,59 @@ fn forward_webrtc_payload_inner(
             return true;
         } else if matches!(nalu_type, 32 | 33 | 34 | 39 | 40) && payload_len <= max_chunk {
             return emit(raw_packet.slice(payload_offset..payload_offset + payload_len), false);
+        }
+    }
+
+    // For H.264, repair junk SPS VUI colour signalling (matrix_coefficients=0
+    // "identity"/GBR, transfer_characteristics=0 "reserved") that Chrome's
+    // WebRTC receive path honours literally, rendering the stream green-tinted.
+    // The MSE path ignores H.264 VUI colour info and already looks correct, so
+    // only SPS NALs forwarded over WebRTC are rewritten (see sps_vui docs).
+    if !is_hevc {
+        let nal_type = payload[0] & 0x1F;
+        if nal_type == 7 {
+            // Single NAL Unit packet carrying an SPS
+            if let Some(rewritten) = sps_vui::rewrite_sps_color_if_junk(payload) {
+                return emit(Bytes::from(rewritten), marker);
+            }
+        } else if nal_type == 24 && payload_len > 3 {
+            // STAP-A: may aggregate an SPS sub-NAL. If one needs a rewrite,
+            // repacketize the whole STAP-A into single NAL unit packets.
+            let mut offset = 1;
+            let mut sub_nals = Vec::new();
+            while offset + 2 <= payload_len {
+                let size = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if size > 0 && offset + size <= payload_len {
+                    sub_nals.push((payload_offset + offset, size));
+                    offset += size;
+                } else {
+                    break;
+                }
+            }
+            let needs_rewrite = sub_nals.iter().any(|&(off, len)| {
+                (raw_packet[off] & 0x1F) == 7
+                    && sps_vui::rewrite_sps_color_if_junk(&raw_packet[off..off + len]).is_some()
+            });
+            if needs_rewrite {
+                let total = sub_nals.len();
+                for (i, (sub_off, sub_len)) in sub_nals.into_iter().enumerate() {
+                    let sub = &raw_packet[sub_off..sub_off + sub_len];
+                    let sub_marker = marker && i == total - 1;
+                    if (sub[0] & 0x1F) == 7 {
+                        if let Some(rewritten) = sps_vui::rewrite_sps_color_if_junk(sub) {
+                            if !emit(Bytes::from(rewritten), sub_marker) {
+                                return false;
+                            }
+                            continue;
+                        }
+                    }
+                    if !emit(raw_packet.slice(sub_off..sub_off + sub_len), sub_marker) {
+                        return false;
+                    }
+                }
+                return true;
+            }
         }
     }
 
@@ -617,5 +671,80 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         assert_eq!(emitted_1400[0].0.len(), 1400);
         assert_eq!(emitted_1400[0].1, true);
         assert_eq!(emitted_1400[0].0.as_ptr(), raw_1400_bytes.as_ptr());
+    }
+
+    #[test]
+    fn test_forward_webrtc_payload_rewrites_junk_sps_vui() {
+        // Living camera SPS: full_range=1, primaries=1, transfer=0, matrix=0
+        let living_sps: Vec<u8> = vec![
+            0x67, 0x4d, 0x00, 0x20, 0x96, 0x54, 0x01, 0x20, 0x05, 0x19, 0x37, 0x01, 0x00, 0x00,
+            0x40, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x13, 0x88, 0x21,
+        ];
+
+        // Single NAL SPS -> rewritten (transfer=1, matrix=5), marker preserved
+        let raw = Bytes::from(living_sps.clone());
+        let mut emitted = Vec::new();
+        forward_webrtc_payload(false, &raw, 0, raw.len(), true, 1200, |chunk, marker| {
+            emitted.push((chunk, marker));
+            true
+        });
+        assert_eq!(emitted.len(), 1);
+        assert!(emitted[0].1);
+        assert_eq!(
+            &emitted[0].0[..],
+            &[
+                0x67, 0x4d, 0x00, 0x20, 0x96, 0x54, 0x01, 0x20, 0x05, 0x19, 0x37, 0x01, 0x01,
+                0x05, 0x40, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x13, 0x88, 0x21,
+            ][..]
+        );
+        assert_ne!(emitted[0].0.as_ptr(), raw.as_ptr()); // rewritten copy, not zero-copy
+
+        // Sane SPS (no VUI): zero-copy passthrough
+        let doorbell_sps: Vec<u8> =
+            vec![0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x01, 0x20, 0x05, 0x19, 0x37];
+        let raw_ok = Bytes::from(doorbell_sps.clone());
+        let mut emitted_ok = Vec::new();
+        forward_webrtc_payload(false, &raw_ok, 0, raw_ok.len(), false, 1200, |chunk, marker| {
+            emitted_ok.push((chunk, marker));
+            true
+        });
+        assert_eq!(emitted_ok.len(), 1);
+        assert!(!emitted_ok[0].1);
+        assert_eq!(emitted_ok[0].0.as_ptr(), raw_ok.as_ptr());
+
+        // STAP-A aggregating the junk SPS + a slice NAL: repacketized into
+        // single NALs, SPS rewritten, marker only on the last sub-NAL
+        let slice_nal: Vec<u8> = vec![0x41, 0x9a, 0x11, 0x22, 0x33];
+        let mut stap = vec![0x78]; // STAP-A NAL header (type 24, NRI 3)
+        stap.extend_from_slice(&(living_sps.len() as u16).to_be_bytes());
+        stap.extend_from_slice(&living_sps);
+        stap.extend_from_slice(&(slice_nal.len() as u16).to_be_bytes());
+        stap.extend_from_slice(&slice_nal);
+        let raw_stap = Bytes::from(stap);
+        let mut emitted_stap = Vec::new();
+        forward_webrtc_payload(false, &raw_stap, 0, raw_stap.len(), true, 1200, |chunk, marker| {
+            emitted_stap.push((chunk, marker));
+            true
+        });
+        assert_eq!(emitted_stap.len(), 2);
+        assert!(!emitted_stap[0].1);
+        assert!(emitted_stap[1].1);
+        assert_eq!(emitted_stap[0].0[0], 0x67); // SPS NAL header
+        assert_eq!(emitted_stap[0].0[12], 0x01); // transfer rewritten
+        assert_eq!(emitted_stap[0].0[13], 0x05); // matrix rewritten
+        assert_eq!(&emitted_stap[1].0[..], &slice_nal[..]);
+
+        // STAP-A with a sane SPS: untouched zero-copy passthrough
+        let mut stap_ok = vec![0x78];
+        stap_ok.extend_from_slice(&(doorbell_sps.len() as u16).to_be_bytes());
+        stap_ok.extend_from_slice(&doorbell_sps);
+        let raw_stap_ok = Bytes::from(stap_ok);
+        let mut emitted_stap_ok = Vec::new();
+        forward_webrtc_payload(false, &raw_stap_ok, 0, raw_stap_ok.len(), true, 1200, |chunk, marker| {
+            emitted_stap_ok.push((chunk, marker));
+            true
+        });
+        assert_eq!(emitted_stap_ok.len(), 1);
+        assert_eq!(emitted_stap_ok[0].0.as_ptr(), raw_stap_ok.as_ptr());
     }
 }
