@@ -14,13 +14,15 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-pub struct SegmentRecorder {
+struct SegmentRecorder {
     pub stream_name: String,
     pub stream: Arc<Stream>,
     pub output_dir: PathBuf,
     pub segment_duration: u32,
     pub rtsp_port: u16,
     pub ffmpeg: Arc<FfmpegManager>,
+    /// Shared sender to the single global writer task (see `spawn_segment_writer`).
+    seg_tx: tokio::sync::mpsc::Sender<SegmentJob>,
 }
 
 struct ActiveSegment {
@@ -39,14 +41,80 @@ struct SegmentJob {
     samples: Vec<VideoSample>,
 }
 
+/// Capacity of the single global segment-writer queue.
+///
+/// This bounds queued segments across ALL recorders (~5 MB each at 4 Mbps /
+/// 10 s), not per-recorder: when the disk falls behind, whichever recorder
+/// hits the full queue first blocks there (see `SEGMENT_QUEUE_BLOCK_WARN`).
+const SEGMENT_QUEUE_CAPACITY: usize = 16;
+
+/// Warn when queueing a finished segment blocks longer than this.
+///
+/// Backpressure blocks the recorder loop at `send`, which stops consuming the
+/// video broadcast until the queue drains — packets lag and recording gaps
+/// appear (see the `Lagged` branch below). Without this warning that failure
+/// mode is silent.
+const SEGMENT_QUEUE_BLOCK_WARN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Spawn the single writer task shared by ALL recorders and return a sender.
+///
+/// Every recorder queues finished segments here, so disk access is serialized
+/// globally: one segment file is written at a time instead of N recorders
+/// interleaving writes on the same device. The returned sender is a spare
+/// kept alive by the caller (`RecordManager`) so the channel never closes
+/// while the manager lives — recorders come and go via `start`/`stop` and
+/// the writer idles on an empty queue in between.
+fn spawn_segment_writer() -> tokio::sync::mpsc::Sender<SegmentJob> {
+    let (seg_tx, mut seg_rx) = tokio::sync::mpsc::channel::<SegmentJob>(SEGMENT_QUEUE_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(job) = seg_rx.recv().await {
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let date_str = job.start_utc.format("%Y%m%d%H%M%S+0000").to_string();
+                let target_file = job.output_dir.join(format!("{}@{}.mp4", job.stream_name, date_str));
+                let tmp_file = job.output_dir.join(format!(".{}@{}.mp4.tmp", job.stream_name, date_str));
+                let write_res = std::fs::File::create(&tmp_file).and_then(|file| {
+                    let mut writer = std::io::BufWriter::with_capacity(65536, file);
+                    let bytes = write_standalone_mp4(&mut writer, &job.codec_config, &job.samples, None)?;
+                    writer.flush()?;
+                    Ok(bytes)
+                });
+                let written_bytes = match write_res {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!(stream = %job.stream_name, error = %e, "Failed to write MP4 segment tmp file");
+                        return;
+                    }
+                };
+                if let Err(e) = std::fs::rename(&tmp_file, &target_file) {
+                    error!(stream = %job.stream_name, error = %e, "Failed to atomically rename MP4 segment");
+                } else {
+                    info!(
+                        stream = %job.stream_name,
+                        path = %target_file.display(),
+                        bytes = written_bytes,
+                        samples = job.samples.len(),
+                        duration = ?job.elapsed,
+                        "Saved MP4 segment for Frigate cache"
+                    );
+                }
+            })
+            .await
+            .ok();
+        }
+    });
+    seg_tx
+}
+
 impl SegmentRecorder {
-    pub fn new(
+    fn new(
         stream_name: String,
         stream: Arc<Stream>,
         output_dir: PathBuf,
         segment_duration: u32,
         rtsp_port: u16,
         ffmpeg: Arc<FfmpegManager>,
+        seg_tx: tokio::sync::mpsc::Sender<SegmentJob>,
     ) -> Self {
         Self {
             stream_name,
@@ -55,10 +123,11 @@ impl SegmentRecorder {
             segment_duration,
             rtsp_port,
             ffmpeg,
+            seg_tx,
         }
     }
 
-    pub async fn run(self: Arc<Self>, mut stop_rx: Option<watch::Receiver<bool>>) {
+    async fn run(self: Arc<Self>, mut stop_rx: Option<watch::Receiver<bool>>) {
         info!(
             stream = %self.stream_name,
             dir = %self.output_dir.display(),
@@ -68,44 +137,10 @@ impl SegmentRecorder {
 
         let _ = tokio::fs::create_dir_all(&self.output_dir).await;
 
-        let (seg_tx, mut seg_rx) = tokio::sync::mpsc::channel::<SegmentJob>(16);
-        tokio::spawn(async move {
-            while let Some(job) = seg_rx.recv().await {
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Write;
-                    let date_str = job.start_utc.format("%Y%m%d%H%M%S+0000").to_string();
-                    let target_file = job.output_dir.join(format!("{}@{}.mp4", job.stream_name, date_str));
-                    let tmp_file = job.output_dir.join(format!(".{}@{}.mp4.tmp", job.stream_name, date_str));
-                    let write_res = std::fs::File::create(&tmp_file).and_then(|file| {
-                        let mut writer = std::io::BufWriter::with_capacity(65536, file);
-                        let bytes = write_standalone_mp4(&mut writer, &job.codec_config, &job.samples, None)?;
-                        writer.flush()?;
-                        Ok(bytes)
-                    });
-                    let written_bytes = match write_res {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error!(stream = %job.stream_name, error = %e, "Failed to write MP4 segment tmp file");
-                            return;
-                        }
-                    };
-                    if let Err(e) = std::fs::rename(&tmp_file, &target_file) {
-                        error!(stream = %job.stream_name, error = %e, "Failed to atomically rename MP4 segment");
-                    } else {
-                        info!(
-                            stream = %job.stream_name,
-                            path = %target_file.display(),
-                            bytes = written_bytes,
-                            samples = job.samples.len(),
-                            duration = ?job.elapsed,
-                            "Saved MP4 segment for Frigate cache"
-                        );
-                    }
-                })
-                .await
-                .ok();
-            }
-        });
+        // Finished segments are queued to the single global writer task shared
+        // by all recorders, so disk writes are serialized across streams
+        // instead of interleaved. The manager keeps the channel alive.
+        let seg_tx = self.seg_tx.clone();
 
         loop {
             if let Some(ref rx) = stop_rx
@@ -326,8 +361,42 @@ impl SegmentRecorder {
                             codec_config,
                             samples: finished_seg.samples,
                         };
-                        if let Err(e) = seg_tx.send(job).await {
-                            error!(stream = %self.stream_name, error = %e, "Failed to queue MP4 segment for background writer");
+                        // Backpressure from a slow disk can block here (global
+                        // writer queue full). While blocked, this recorder stops
+                        // consuming the broadcast, so packets lag and the
+                        // segment gets a gap. Warn once per block episode and
+                        // log the stall duration once it drains.
+                        let block_started = tokio::time::Instant::now();
+                        let mut block_warned = false;
+                        let permit = loop {
+                            match tokio::time::timeout(SEGMENT_QUEUE_BLOCK_WARN, seg_tx.reserve()).await {
+                                Ok(Ok(permit)) => break Some(permit),
+                                Ok(Err(_closed)) => {
+                                    error!(stream = %self.stream_name, "Segment writer queue closed; dropping segment");
+                                    break None;
+                                }
+                                Err(_elapsed) => {
+                                    if !block_warned {
+                                        block_warned = true;
+                                        warn!(
+                                            stream = %self.stream_name,
+                                            threshold_s = SEGMENT_QUEUE_BLOCK_WARN.as_secs(),
+                                            "Blocked queueing MP4 segment: writer queue full for >={}s — disk is falling behind, recorder no longer consuming video and recording gaps are likely",
+                                            SEGMENT_QUEUE_BLOCK_WARN.as_secs()
+                                        );
+                                    }
+                                }
+                            }
+                        };
+                        if let Some(permit) = permit {
+                            permit.send(job);
+                            if block_warned {
+                                info!(
+                                    stream = %self.stream_name,
+                                    waited_ms = block_started.elapsed().as_millis(),
+                                    "Segment writer queue drained; recorder resumed consuming video"
+                                );
+                            }
                         }
                     } else {
                         warn!(stream = %self.stream_name, "Skipping segment write: missing parameter sets (VPS/SPS/PPS)");
@@ -376,6 +445,9 @@ pub struct RecordManager {
     pub enabled: bool,
     configured_streams: RwLock<HashSet<String>>,
     active_recorders: tokio::sync::Mutex<HashMap<String, watch::Sender<bool>>>,
+    /// Spare sender keeping the global writer queue alive for the manager's
+    /// lifetime, even while no recorders are active.
+    seg_tx: tokio::sync::mpsc::Sender<SegmentJob>,
 }
 
 impl RecordManager {
@@ -405,6 +477,7 @@ impl RecordManager {
             enabled,
             configured_streams: RwLock::new(streams),
             active_recorders: tokio::sync::Mutex::new(HashMap::new()),
+            seg_tx: spawn_segment_writer(),
         });
 
         // Auto-start any streams configured in YAML
@@ -475,6 +548,7 @@ impl RecordManager {
                 this.segment_duration,
                 this.rtsp_port,
                 Arc::clone(&this.ffmpeg),
+                this.seg_tx.clone(),
             ));
 
             recorder.run(Some(rx)).await;
