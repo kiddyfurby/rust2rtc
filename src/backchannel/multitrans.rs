@@ -79,28 +79,21 @@ impl MultitransClient {
             let realm = extract_param(&auth_hdr, "realm=").unwrap_or_else(|| "TP-Link IP-Camera".to_string());
             let nonce = extract_param(&auth_hdr, "nonce=").context("Missing nonce in auth header")?;
             let opaque = extract_param(&auth_hdr, "opaque=");
-            let encrypt_type = extract_param(&auth_hdr, "encrypt_type=").unwrap_or_default();
             let qop = extract_param(&auth_hdr, "qop=");
 
             let user = self.url.username();
+            // The camera expects the URL password AS-IS in the digest response
+            // (this mirrors go2rtc pkg/tapo). The SHA256 derivation only
+            // applies to the username-only `tapo://{cloud-password}@host`
+            // form; URLs carrying a pre-hashed password must use it directly.
             let pass = self.url.password().unwrap_or("");
 
-            // When encrypt_type="3", the password must be formatted as 64-character uppercase SHA256 hex
-            let effective_pass = if encrypt_type == "3" {
-                use sha2::{Digest as Sha2Digest, Sha256};
-                let mut hasher = Sha256::new();
-                hasher.update(pass.as_bytes());
-                hex::encode(hasher.finalize()).to_uppercase()
-            } else {
-                pass.to_string()
-            };
-
-            let ha1 = hex_md5(&format!("{}:{}:{}", user, realm, effective_pass));
+            let ha1 = hex_md5(&format!("{}:{}:{}", user, realm, pass));
             let ha2 = hex_md5("POST:/stream");
             let uri = "/stream";
 
             let auth_val = if let Some(ref qop_val) = qop {
-                let cnonce = hex::encode(rand_seed().to_be_bytes());
+                let cnonce = format!("{:08x}{:08x}{:08x}{:08x}", rand_seed(), rand_seed(), rand_seed(), rand_seed());
                 let nc = "00000001";
                 let resp = hex_md5(&format!("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, qop_val, ha2));
                 let mut val = format!(
@@ -108,7 +101,7 @@ impl MultitransClient {
                     user, realm, nonce, uri, resp, qop_val, nc, cnonce
                 );
                 if let Some(op) = &opaque {
-                    val.push_str(&format!(r#", opaque="{}""#, op));
+                    val.push_str(&format!(r#", opaque="{}", algorithm=MD5"#, op));
                 }
                 val
             } else {
@@ -118,39 +111,81 @@ impl MultitransClient {
                     user, realm, nonce, uri, resp
                 );
                 if let Some(op) = &opaque {
-                    val.push_str(&format!(r#", opaque="{}""#, op));
+                    val.push_str(&format!(r#", opaque="{}", algorithm=MD5"#, op));
                 }
                 val
             };
 
-            // 2. Authenticated handshake with multipart JSON
+            // 2. Authenticated request: empty body. The camera replies 200 OK and
+            //    keeps the connection open, switching to multipart part framing.
             let boundary = "----client-stream-boundary--";
-            let json_body = r#"{"params":{"talk":{"mode":"aec"},"method":"get"}}"#;
-            let multipart_data = format!(
-                "--{boundary}\r\nContent-Type: application/json\r\n\r\n{json_body}\r\n--{boundary}--\r\n"
-            );
-
             let req = format!(
                 "POST /stream HTTP/1.1\r\n\
                 Host: {addr}\r\n\
                 Authorization: {auth_val}\r\n\
                 Content-Type: multipart/mixed; boundary={boundary}\r\n\
                 Connection: keep-alive\r\n\
-                Content-Length: {}\r\n\r\n\
-                {}",
-                multipart_data.len(),
-                multipart_data
+                Content-Length: 0\r\n\r\n"
             );
             stream.write_all(req.as_bytes()).await?;
 
-            let (status, resp_headers, body) = read_rtsp_response(&mut stream).await?;
+            let (status, _, _) = read_rtsp_response(&mut stream).await?;
             if status != 200 {
                 bail!("Tapo HTTP Streamd authentication failed with status {}", status);
             }
 
-            let session = extract_session_id(&body)
-                .or_else(|| resp_headers.get("session").cloned())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            // 3. Open the talk channel: JSON request as the first client part
+            //    (mirrors go2rtc pkg/tapo SetupBackchannel -> Request).
+            let talk = r#"{"params":{"talk":{"mode":"aec"},"method":"get"},"seq":3,"type":"request"}"#;
+            let talk_part = format!(
+                "--{boundary}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}\r\n",
+                talk.len(),
+                talk
+            );
+            stream.write_all(talk_part.as_bytes()).await?;
+
+            // 4. Read device parts until the JSON response carrying
+            //    params.session_id (error_code != 0 means the camera rejected
+            //    the talk request).
+            let mut rbuf: Vec<u8> = Vec::new();
+            let session = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match read_streamd_part(&mut stream, &mut rbuf).await? {
+                        None => bail!("Tapo connection closed while opening talk channel"),
+                        Some((part_headers, body)) => {
+                            if part_headers.get("content-type").map(String::as_str)
+                                != Some("application/json")
+                            {
+                                continue;
+                            }
+                            let v: serde_json::Value = match serde_json::from_slice(&body) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let params = v.get("params");
+                            if let Some(ec) = params
+                                .and_then(|p| p.get("error_code"))
+                                .and_then(|e| e.as_i64())
+                                .filter(|ec| *ec != 0)
+                            {
+                                bail!("Tapo talk request rejected (error_code {})", ec);
+                            }
+                            if let Some(sid) = params
+                                .and_then(|p| p.get("session_id"))
+                                .and_then(|s| s.as_str())
+                            {
+                                return Ok::<String, anyhow::Error>(sid.to_string());
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .context("Timed out waiting for Tapo talk session response")??;
+
+            // Go's net package enables TCP_NODELAY by default; without it the
+            // small, 80ms-cadence audio parts can be delayed by Nagle.
+            stream.set_nodelay(true)?;
 
             info!(host = %host, session = %session, "Tapo HTTP Streamd backchannel ready");
             self.stream = Some(stream);
@@ -259,33 +294,62 @@ impl MultitransClient {
 
         let mut scratch = Vec::new();
         if self.is_http_tapo {
+            let session = self
+                .session_id
+                .clone()
+                .context("Missing Tapo Streamd session id")?;
             let boundary = "----client-stream-boundary--";
-            let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes PCMA
 
-            while let Some((payload, is_pcmu)) = rx.recv().await {
-                let chunks = if is_pcmu {
-                    scratch.clear();
-                    scratch.extend_from_slice(&payload);
-                    transcode_ulaw_to_alaw(&mut scratch);
-                    repacker.push_payload(&scratch)
-                } else {
-                    repacker.push_payload(&payload)
-                };
-                for chunk in chunks {
-                    let mut block = Vec::with_capacity(chunk.len() + 128);
-                    block.extend_from_slice(
-                        format!(
-                            "--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
-                            chunk.len()
-                        )
-                        .as_bytes(),
-                    );
-                    block.extend_from_slice(&chunk);
-                    block.extend_from_slice(b"\r\n");
+            // Split the connection: the write half carries our audio parts,
+            // the read half is drained in the loop below. The camera streams
+            // its encrypted downlink (A/V parts) on this same connection; if
+            // we never read it, its TCP send window fills up and the talkback
+            // stalls.
+            let (mut rd, mut wr) = stream.into_split();
+            let mut sink = [0u8; 8192];
 
-                    if let Err(e) = stream.write_all(&block).await {
-                        error!("Error sending Tapo HTTP audio frame: {}", e);
-                        return Err(e.into());
+            // PAT/PMT header goes first, as its own audio/mp2t part
+            // (go2rtc: WriteBackchannel(muxer.GetHeader()) before any audio).
+            let mut muxer = super::mpegts::TapoTsMuxer::new();
+            write_streamd_part(&mut wr, &session, boundary, &muxer.header()).await?;
+
+            let mut repacker = G711Repacker::new(640, 8, 0x11223344); // 640 bytes PCMA (80ms @ 8kHz)
+
+            loop {
+                tokio::select! {
+                    maybe = rx.recv() => {
+                        let (payload, is_pcmu) = match maybe {
+                            Some(p) => p,
+                            None => break,
+                        };
+                        let chunks = if is_pcmu {
+                            scratch.clear();
+                            scratch.extend_from_slice(&payload);
+                            transcode_ulaw_to_alaw(&mut scratch);
+                            repacker.push_payload(&scratch)
+                        } else {
+                            repacker.push_payload(&payload)
+                        };
+                        for pkt in chunks {
+                            // Strip the 12-byte RTP header; the RTP timestamp
+                            // drives the MPEG-TS PTS (go2rtc passes
+                            // packet.Timestamp/packet.Payload to the muxer).
+                            if pkt.len() <= 12 {
+                                continue;
+                            }
+                            let rtp_ts = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                            let ts = muxer.payload(rtp_ts, &pkt[12..]);
+                            if let Err(e) = write_streamd_part(&mut wr, &session, boundary, &ts).await {
+                                error!("Error sending Tapo HTTP audio frame: {}", e);
+                                return Err(e);
+                            }
+                        }
+                    }
+                    read = rd.read(&mut sink) => {
+                        if read.unwrap_or(0) == 0 {
+                            debug!("Tapo HTTP Streamd connection closed by camera");
+                            break;
+                        }
                     }
                 }
             }
@@ -317,6 +381,88 @@ impl MultitransClient {
 
         debug!("MULTITRANS backchannel sender finished");
         Ok(())
+    }
+}
+
+/// Write one client multipart part (Streamd `audio/mp2t` framing), byte-identical
+/// to go2rtc `pkg/tapo` `WriteBackchannel`.
+async fn write_streamd_part<W>(
+    w: &mut W,
+    session: &str,
+    boundary: &str,
+    body: &[u8],
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let head = format!(
+        "--{boundary}\r\nContent-Type: audio/mp2t\r\nX-If-Encrypt: 0\r\nX-Session-Id: {session}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    w.write_all(head.as_bytes()).await?;
+    w.write_all(body).await?;
+    Ok(())
+}
+
+/// Read one multipart part from the camera (device boundary framing), keeping
+/// any unconsumed bytes in `buf` between calls. Returns `None` when the camera
+/// closes the connection.
+async fn read_streamd_part(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+) -> Result<Option<(std::collections::HashMap<String, String>, Vec<u8>)>> {
+    const DEVICE_DELIM: &[u8] = b"----device-stream-boundary--";
+    const DELIM_LINE: &[u8] = b"\r\n----device-stream-boundary--";
+
+    loop {
+        // The buffer always starts at a part boundary (or is empty), so the
+        // first boundary found marks the start of the next part.
+        let delim_at = if buf.starts_with(DEVICE_DELIM) {
+            Some(0)
+        } else {
+            find_subsequence(buf, DELIM_LINE).map(|p| p + 2)
+        };
+
+        if let Some(d) = delim_at {
+            let after = d + DEVICE_DELIM.len();
+            if let Some(rel) = find_subsequence(&buf[after..], b"\r\n") {
+                let headers_start = after + rel + 2;
+                if let Some(rel2) = find_subsequence(&buf[headers_start..], b"\r\n\r\n") {
+                    let body_start = headers_start + rel2 + 4;
+
+                    let mut headers = std::collections::HashMap::new();
+                    for line in String::from_utf8_lossy(&buf[headers_start..body_start - 4]).lines() {
+                        if let Some((k, v)) = line.split_once(':') {
+                            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+                        }
+                    }
+
+                    let content_len = headers
+                        .get("content-length")
+                        .and_then(|v| v.parse::<usize>().ok());
+
+                    if let Some(cl) = content_len {
+                        if buf.len() >= body_start + cl {
+                            let body = buf[body_start..body_start + cl].to_vec();
+                            buf.drain(..body_start + cl);
+                            return Ok(Some((headers, body)));
+                        }
+                    } else if let Some(next) = find_subsequence(&buf[body_start..], DELIM_LINE) {
+                        // No Content-Length: the body runs to the next boundary.
+                        let body = buf[body_start..body_start + next].to_vec();
+                        buf.drain(..body_start + next + 2);
+                        return Ok(Some((headers, body)));
+                    }
+                }
+            }
+        }
+
+        let mut chunk = [0u8; 8192];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -408,7 +554,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn extract_session_id(body: &str) -> Option<String> {
     if let Some(pos) = body.find(r#""session_id""#) {
         let after = &body[pos + 12..];
-        let trimmed = after.trim_start_matches(|c| c == ':' || c == ' ' || c == '"');
+        let trimmed = after.trim_start_matches([':', ' ', '"']);
         if let Some(end) = trimmed.find('"') {
             return Some(trimmed[..end].to_string());
         }
