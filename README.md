@@ -168,6 +168,14 @@ See [`rust2rtc.sample.yaml`](rust2rtc.sample.yaml) for every option — streams,
 
 Issues and PRs are welcome — new protocols, codecs, SIP features, tests, and performance work all help. Open an issue or send a pull request.
 
+## 🙏 Acknowledgements
+
+`rust2rtc` would not exist without [go2rtc](https://github.com/AlexxIT/go2rtc).
+
+go2rtc is a remarkable piece of software: a tiny, fast, multi-protocol streaming gateway that quietly became the backbone of the self-hosted camera world. Its clean streams model, its REST/WebSocket API, and the `ffmpeg:` source syntax are so well designed that an entire ecosystem — Frigate, Home Assistant, Advanced Camera Card — builds on top of them. It is portable, dependable, and astonishingly capable for its size.
+
+Massive thanks to [AlexxIT](https://github.com/AlexxIT) for building and sharing it. `rust2rtc` is an attempt to carry that same spirit forward in Rust: keep the API and the go2rtc way of doing things intact, while pushing performance and adding a SIP intercom bridge. If this project is useful to you, go star [go2rtc](https://github.com/AlexxIT/go2rtc) — it deserves it.
+
 ## License
 
-Released under the [GNU General Public License v3.0](LICENSE). Copyright © 2026 Garfield Ip. Inspired by [AlexxIT](https://github.com/AlexxIT)'s [go2rtc](https://github.com/AlexxIT/go2rtc).
+Released under the [GNU General Public License v3.0](LICENSE). Copyright © 2026 Garfield Ip. Made possible by [AlexxIT](https://github.com/AlexxIT)'s [go2rtc](https://github.com/AlexxIT/go2rtc).
