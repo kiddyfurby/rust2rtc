@@ -6,7 +6,7 @@
 
 Drop-in for [Frigate](https://frigate.video/) &nbsp;·&nbsp; Built for [ESPHome Intercom](https://github.com/n-IA-hane/esphome-intercom) &nbsp;·&nbsp; In-process media pipeline
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust&logoColor=white)
 [![Latest release](https://img.shields.io/github/v/release/kiddyfurby/rust2rtc?color=brightgreen)](https://github.com/kiddyfurby/rust2rtc/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/kiddyfurby/rust2rtc/total?color=blue)](https://github.com/kiddyfurby/rust2rtc/releases)
@@ -170,4 +170,4 @@ Issues and PRs are welcome — new protocols, codecs, SIP features, tests, and p
 
 ## License
 
-Released under the [MIT License](LICENSE). Inspired by [AlexxIT](https://github.com/AlexxIT)'s [go2rtc](https://github.com/AlexxIT/go2rtc).
+Released under the [GNU General Public License v3.0](LICENSE). Copyright © 2026 Garfield Ip. Inspired by [AlexxIT](https://github.com/AlexxIT)'s [go2rtc](https://github.com/AlexxIT/go2rtc).

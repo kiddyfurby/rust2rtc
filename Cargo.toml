@@ -2,6 +2,7 @@
 name = "rust2rtc"
 version = "0.7.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
