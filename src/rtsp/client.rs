@@ -173,7 +173,10 @@ impl RtspClient {
             next_ch += 2;
 
             let transport_header = format!("RTP/AVP/TCP;unicast;interleaved={}-{}", rtp_ch, rtcp_ch);
-            let (_, setup_headers, setup_code) = Self::send_request_with_auth(
+
+            // First attempt: SETUP with current session id (if any)
+            let setup_transport = transport_header.clone();
+            let (_, mut setup_headers, mut setup_code) = Self::send_request_with_auth(
                 &mut tcp,
                 &mut buffer,
                 "SETUP",
@@ -183,10 +186,38 @@ impl RtspClient {
                 &password,
                 &mut auth_info,
                 session_id.as_deref(),
-                Some(&[("Transport", &transport_header)]),
+                Some(&[("Transport", &setup_transport)]),
                 None,
                 None,
             ).await?;
+
+            // If the server returns 454 Session Not Found (e.g. LIVE555 camera
+            // expired the old session), retry SETUP without a session id to
+            // establish a fresh session.
+            if setup_code == 454 && session_id.is_some() {
+                warn!(
+                    stream = %stream.name,
+                    track = %t_info.control,
+                    "RTSP session expired (454), retrying SETUP without session"
+                );
+                session_id = None;
+                let (_, retry_headers, retry_code) = Self::send_request_with_auth(
+                    &mut tcp,
+                    &mut buffer,
+                    "SETUP",
+                    &t_info.control,
+                    &mut cseq,
+                    &username,
+                    &password,
+                    &mut auth_info,
+                    None,
+                    Some(&[("Transport", &setup_transport)]),
+                    None,
+                    None,
+                ).await?;
+                setup_headers = retry_headers;
+                setup_code = retry_code;
+            }
 
             if setup_code != 200 {
                 warn!(
@@ -197,13 +228,30 @@ impl RtspClient {
                 continue;
             }
 
-            if session_id.is_none()
-                && let Some(sess) = setup_headers.get("session") {
-                    let id = sess.split(';').next().unwrap_or(sess).trim().to_string();
-                    session_id = Some(id);
-                }
+            // Always update session_id from every SETUP response. LIVE555-based
+            // cameras (e.g. yi-hack) may return a NEW session id on subsequent
+            // SETUPs; using a stale id causes PLAY to succeed but video RTP to
+            // stop flowing while audio continues.
+            if let Some(sess) = setup_headers.get("session") {
+                let id = sess.split(';').next().unwrap_or(sess).trim().to_string();
+                session_id = Some(id);
+            }
 
-            channel_map.insert(rtp_ch, Arc::clone(&t_info.track));
+            // Honor the interleaved channel values returned by the server in
+            // the Transport header, rather than assuming our requested values.
+            let actual_rtp_ch = setup_headers
+                .get("transport")
+                .and_then(|t| {
+                    t.split(';').find_map(|p| {
+                        let p = p.trim();
+                        p.strip_prefix("interleaved=")
+                            .and_then(|rest| rest.split('-').next())
+                            .and_then(|s| s.parse::<u8>().ok())
+                    })
+                })
+                .unwrap_or(rtp_ch);
+
+            channel_map.insert(actual_rtp_ch, Arc::clone(&t_info.track));
             registered_tracks.push(Arc::clone(&t_info.track));
         }
 
@@ -276,6 +324,15 @@ impl RtspClient {
         // 25s keepalive tick) so the GOP cache stays hot for fast SIP pickup.
         let idle_stop_ticks = idle_stop_ticks(stream.keep_warm_secs);
 
+        // Video-flow watchdog: if no video RTP arrives for N seconds while PLAY
+        // is active and consumers are waiting, the camera's LIVE555 server has
+        // likely stopped sending video (audio-only degradation). Tear down and
+        // reconnect to restore video flow.
+        let has_video = channel_map.values().any(|t| t.kind == MediaKind::Video);
+        let video_watchdog_timeout = Duration::from_secs(10);
+        let video_watchdog = tokio::time::sleep(video_watchdog_timeout);
+        tokio::pin!(video_watchdog);
+
         let read_timeout = tokio::time::sleep(Duration::from_secs(8));
         tokio::pin!(read_timeout);
 
@@ -310,6 +367,12 @@ impl RtspClient {
                     && let Some(rtp) = RtpPacket::parse(packet_bytes) {
                         stream.packets_recv.fetch_add(1, Ordering::Relaxed);
                         stream.bytes_recv.fetch_add(packet_len, Ordering::Relaxed);
+                        // Reset video watchdog when video RTP arrives
+                        if has_video && track.kind == MediaKind::Video {
+                            video_watchdog.as_mut().reset(
+                                tokio::time::Instant::now() + video_watchdog_timeout
+                            );
+                        }
                         track.send(rtp);
                     }
             }
@@ -453,6 +516,13 @@ impl RtspClient {
                 }
                 _ = &mut read_timeout => {
                     warn!(stream = %stream.name, "RTSP stream read timeout (no packets for 8s), reconnecting");
+                    return Ok(false);
+                }
+                _ = &mut video_watchdog, if has_video => {
+                    warn!(
+                        stream = %stream.name,
+                        "No video RTP for 10s while PLAY active (audio-only degradation), reconnecting"
+                    );
                     return Ok(false);
                 }
             }
