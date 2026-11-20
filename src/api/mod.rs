@@ -260,6 +260,93 @@ const INDEX_HTML: &str = concat!(
         .netinfo-details .value.good { color: var(--green); }
         .netinfo-details .value.warn { color: #d29922; }
         .preview {
+            position: relative;
+        }
+        .play-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            background: rgba(0, 0, 0, 0);
+            transition: background 0.15s;
+        }
+        .play-overlay:hover {
+            background: rgba(0, 0, 0, 0.25);
+        }
+        .play-overlay .play-circle {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            background: rgba(35, 134, 54, 0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+            transition: transform 0.15s, background 0.15s;
+        }
+        .play-overlay:hover .play-circle {
+            transform: scale(1.08);
+            background: #2ea043;
+        }
+        .play-overlay .play-circle svg {
+            width: 28px;
+            height: 28px;
+            margin-left: 4px;
+            fill: #fff;
+        }
+        .play-overlay.playing .play-circle {
+            background: rgba(248, 81, 73, 0.9);
+        }
+        .play-overlay.playing:hover .play-circle {
+            background: #f85149;
+        }
+        .card-menu {
+            position: relative;
+        }
+        .card-menu-btn {
+            background: #21262d;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 16px;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .card-menu-btn:hover {
+            background: #30363d;
+        }
+        .card-menu-panel {
+            display: none;
+            position: absolute;
+            right: 0;
+            top: 100%;
+            margin-top: 4px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+            min-width: 110px;
+            z-index: 10;
+            overflow: hidden;
+        }
+        .card-menu-panel.open {
+            display: block;
+        }
+        .card-menu-panel a {
+            display: block;
+            padding: 8px 14px;
+            color: var(--accent);
+            text-decoration: none;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .card-menu-panel a:hover {
+            background: #30363d;
+        }
+        .preview {
             width: 100%;
             height: 200px;
             background: #000;
@@ -379,13 +466,37 @@ const INDEX_HTML: &str = concat!(
     <script>
         const activePeerConnections = new Map();
 
-        async function playWebRtc(streamName, previewEl) {
-            try {
-                if (activePeerConnections.has(streamName)) {
-                    activePeerConnections.get(streamName).close();
-                    activePeerConnections.delete(streamName);
-                }
+        function setLiveBadge(streamName, live) {
+            const badge = document.getElementById(`badge-${streamName}`);
+            if (badge) {
+                badge.textContent = live ? 'LIVE' : 'IDLE';
+                badge.style.background = live ? '#238636' : '#6e7681';
+            }
+            const overlay = document.getElementById(`play-${streamName}`);
+            if (overlay) {
+                overlay.classList.toggle('playing', live);
+                overlay.title = live ? 'Stop live' : 'Play live';
+            }
+        }
 
+        function stopWebRtc(streamName, previewEl) {
+            if (activePeerConnections.has(streamName)) {
+                activePeerConnections.get(streamName).close();
+                activePeerConnections.delete(streamName);
+            }
+            setLiveBadge(streamName, false);
+            previewEl.innerHTML = `<img src="/api/frame.jpeg?src=${encodeURIComponent(streamName)}" onerror="this.style.display='none'" alt="Snapshot" />
+                <div class="play-overlay" id="play-${streamName}" onclick="playWebRtc('${streamName}', document.getElementById('preview-${streamName}'))" title="Play live">
+                    <div class="play-circle"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div>
+                </div>`;
+        }
+
+        async function playWebRtc(streamName, previewEl) {
+            if (activePeerConnections.has(streamName)) {
+                stopWebRtc(streamName, previewEl);
+                return;
+            }
+            try {
                 previewEl.innerHTML = '<video autoplay playsinline muted controls style="width:100%; height:100%; object-fit:cover; background:#000;"></video>';
                 const videoEl = previewEl.querySelector('video');
 
@@ -480,6 +591,14 @@ const INDEX_HTML: &str = concat!(
 
                 const answerSdp = await res.text();
                 await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+                setLiveBadge(streamName, true);
+
+                pc.onconnectionstatechange = () => {
+                    const st = pc.connectionState;
+                    if (st === 'failed' || st === 'disconnected' || st === 'closed') {
+                        setLiveBadge(streamName, false);
+                    }
+                };
             } catch (err) {
                 console.error(err);
                 previewEl.innerHTML = `<div style="color:#f85149; padding:12px; font-size:12px;">WebRTC Error: ${err.message}</div>`;
@@ -527,8 +646,7 @@ const INDEX_HTML: &str = concat!(
                 const data = await res.json();
                 const container = document.getElementById('streams');
 
-                const streams = Array.isArray(data) ? data : Object.entries(data).map(([name, s]) => {
-                    const isLive = s.producers && s.producers.some(p => p.recv > 0 || (p.medias && p.medias.length > 0));
+                let raw = Array.isArray(data) ? data : Object.entries(data).map(([name, s]) => {
                     const totalConsumers = s.consumers ? s.consumers.length : 0;
                     const recvBytes = s.producers ? s.producers.reduce((acc, p) => acc + (p.recv || 0), 0) : 0;
                     const recvPackets = s.producers ? s.producers.reduce((acc, p) => acc + (p.recv_packets || 0), 0) : 0;
@@ -537,22 +655,46 @@ const INDEX_HTML: &str = concat!(
                         const parts = m.split(',').map(p => p.trim());
                         return { kind: parts[0] || 'video', codec: parts[2] || parts[1] || '' };
                     });
-                    return {
-                        name,
-                        active: isLive,
-                        consumers: totalConsumers,
-                        bytes_recv: recvBytes,
-                        packets_recv: recvPackets,
-                        tracks
-                    };
+                    return { name, consumers: totalConsumers, bytes_recv: recvBytes, packets_recv: recvPackets, tracks };
                 });
 
+                // Group substreams (name_sub) into their base stream (name).
+                // Merge stats but keep a single card with one play button.
+                const byName = new Map();
+                raw.forEach(s => byName.set(s.name, s));
+                const merged = [];
+                const consumed = new Set();
+                raw.forEach(s => {
+                    if (consumed.has(s.name)) return;
+                    consumed.add(s.name);
+                    if (s.name.endsWith('_sub')) return; // orphan sub, show standalone
+                    const subName = s.name + '_sub';
+                    const sub = byName.get(subName);
+                    if (sub) {
+                        consumed.add(subName);
+                        merged.push({
+                            name: s.name,
+                            consumers: s.consumers + sub.consumers,
+                            bytes_recv: s.bytes_recv + sub.bytes_recv,
+                            packets_recv: s.packets_recv + sub.packets_recv,
+                            tracks: [...s.tracks, ...sub.tracks],
+                            hasSub: true
+                        });
+                    } else {
+                        merged.push({ ...s, hasSub: false });
+                    }
+                });
+
+                const streams = merged;
                 if (streams.length === 0) {
                     container.innerHTML = '<div style="color: #8b949e">No streams configured.</div>';
                     return;
                 }
 
-                // If already initialized cards, only update dynamic numbers to avoid resetting active video players
+                const isPlaying = (name) => activePeerConnections.has(name);
+
+                // If already initialized cards, only update dynamic numbers and
+                // the LIVE/IDLE badge (driven by active playback, not producers).
                 if (container.querySelectorAll('.card').length === streams.length) {
                     streams.forEach(s => {
                         const metaEl = document.getElementById(`meta-${s.name}`);
@@ -562,32 +704,40 @@ const INDEX_HTML: &str = concat!(
                                 <div>Packets: <b>${s.packets_recv}</b> | Bytes: <b>${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</b></div>
                             `;
                         }
+                        setLiveBadge(s.name, isPlaying(s.name));
                     });
                     return;
                 }
 
                 container.innerHTML = streams.map(s => {
                     const tracksHtml = s.tracks.map(t => `<span class="badge">${t.kind}: ${t.codec}</span>`).join(' ');
+                    const subBadge = s.hasSub ? '<span class="badge" style="background:#1f6feb">main+sub</span>' : '';
+                    const playing = isPlaying(s.name);
                     return `
                     <div class="card" id="card-${s.name}">
                         <div class="card-header">
                             <span>${s.name}</span>
-                            <span class="badge" style="background: ${s.active ? '#238636' : '#6e7681'}">${s.active ? 'LIVE' : 'IDLE'}</span>
+                            <span class="badge" id="badge-${s.name}" style="background: ${playing ? '#238636' : '#6e7681'}">${playing ? 'LIVE' : 'IDLE'}</span>
                         </div>
                         <div class="preview" id="preview-${s.name}">
                             <img src="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" onerror="this.style.display='none'" alt="Snapshot" />
+                            <div class="play-overlay" id="play-${s.name}" onclick="playWebRtc('${s.name}', document.getElementById('preview-${s.name}'))" title="Play live">
+                                <div class="play-circle"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div>
+                            </div>
                         </div>
                         <div class="card-body">
-                            <div>${tracksHtml || '<span class="badge">on-demand</span>'}</div>
+                            <div>${tracksHtml || '<span class="badge">on-demand</span>'} ${subBadge}</div>
                             <div class="meta" id="meta-${s.name}">
                                 <div>Consumers: <b>${s.consumers}</b></div>
                                 <div>Packets: <b>${s.packets_recv}</b> | Bytes: <b>${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</b></div>
                             </div>
-                            <div class="links">
-                                <button class="btn btn-primary" onclick="playWebRtc('${s.name}', document.getElementById('preview-${s.name}'))">▶ WebRTC Live</button>
-                                <a class="btn" href="/api/stream.mjpeg?src=${encodeURIComponent(s.name)}" target="_blank">MJPEG</a>
-                                <a class="btn" href="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" target="_blank">Snapshot</a>
-                                <a class="btn" href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP</a>
+                            <div class="card-menu">
+                                <button class="card-menu-btn" onclick="toggleMenu('${s.name}', event)" title="More">⋮</button>
+                                <div class="card-menu-panel" id="menu-${s.name}">
+                                    <a href="/api/stream.mjpeg?src=${encodeURIComponent(s.name)}" target="_blank">MJPEG</a>
+                                    <a href="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" target="_blank">Snapshot</a>
+                                    <a href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP</a>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -597,6 +747,19 @@ const INDEX_HTML: &str = concat!(
                 console.error(e);
             }
         }
+
+        function toggleMenu(name, ev) {
+            ev.stopPropagation();
+            const panel = document.getElementById(`menu-${name}`);
+            if (!panel) return;
+            const isOpen = panel.classList.contains('open');
+            document.querySelectorAll('.card-menu-panel.open').forEach(p => p.classList.remove('open'));
+            if (!isOpen) panel.classList.add('open');
+        }
+
+        document.addEventListener('click', () => {
+            document.querySelectorAll('.card-menu-panel.open').forEach(p => p.classList.remove('open'));
+        });
         loadStreams();
         loadNetInfo();
         setInterval(loadStreams, 3000);
