@@ -357,23 +357,14 @@ const INDEX_HTML: &str = concat!(
             font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
         }
         .seg {
-            padding: 2px 8px;
             font-size: 11px;
             line-height: 1.6;
-            background: #21262d;
             color: var(--text);
-            border-right: 1px solid var(--border);
-            display: inline-flex;
-            align-items: center;
             white-space: nowrap;
         }
-        .seg:last-child {
-            border-right: none;
-        }
         .seg.sub {
-            background: #1f6feb;
-            color: #fff;
-            border-right-color: rgba(255, 255, 255, 0.25);
+            color: #58a6ff;
+            font-weight: 600;
         }
         .card-menu-panel {
             display: none;
@@ -770,21 +761,18 @@ const INDEX_HTML: &str = concat!(
                     return segs;
                 }
 
-                function segHtml(kind, codec) {
-                    return `<span class="seg ${kind}" title="${kind}">${codec}</span>`;
-                }
-
                 function tracksHtml(s) {
                     const mainSegs = trackSegments(s.tracks);
                     const subSegs = s.subTracks && s.subTracks.length > 0 ? trackSegments(s.subTracks) : [];
+                    const fmt = segs => segs.map(t => `<span class="seg ${t.kind}" title="${t.kind}">${t.codec}</span>`).join('/');
                     let html = '';
                     if (mainSegs.length) {
-                        html += `<span class="seg-group">${mainSegs.map(t => segHtml(t.kind, t.codec)).join('')}</span>`;
+                        html += `<span class="seg-group">${fmt(mainSegs)}</span>`;
                     } else {
                         html += '<span class="badge">on-demand</span>';
                     }
                     if (subSegs.length) {
-                        html += `<span class="seg-group sub-group"><span class="seg sub" title="Substream">sub</span>${subSegs.map(t => segHtml(t.kind, t.codec)).join('')}</span>`;
+                        html += `<span class="seg-group sub-group"><span class="seg sub" title="Substream">sub</span>/${fmt(subSegs)}</span>`;
                     }
                     return html;
                 }
