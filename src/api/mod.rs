@@ -208,7 +208,7 @@ const INDEX_HTML: &str = concat!(
             background: var(--card);
             border: 1px solid var(--border);
             border-radius: 8px;
-            overflow: hidden;
+            overflow: visible;
             display: flex;
             flex-direction: column;
         }
@@ -220,6 +220,7 @@ const INDEX_HTML: &str = concat!(
             justify-content: space-between;
             align-items: center;
             font-weight: 600;
+            border-radius: 8px 8px 0 0;
         }
         .card-body {
             padding: 16px;
@@ -317,6 +318,26 @@ const INDEX_HTML: &str = concat!(
         }
         .card-menu-btn:hover {
             background: #30363d;
+        }
+        .card-meta-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .card-meta-row .badge {
+            font-size: 11px;
+            margin-right: 4px;
+        }
+        .card-meta-row .meta {
+            font-size: 12px;
+            color: #8b949e;
+            margin: 0;
+            font-variant-numeric: tabular-nums;
+        }
+        .card-meta-row .card-menu {
+            margin-left: auto;
         }
         .card-menu-panel {
             display: none;
@@ -677,11 +698,12 @@ const INDEX_HTML: &str = concat!(
                             consumers: s.consumers + sub.consumers,
                             bytes_recv: s.bytes_recv + sub.bytes_recv,
                             packets_recv: s.packets_recv + sub.packets_recv,
-                            tracks: [...s.tracks, ...sub.tracks],
+                            tracks: s.tracks,
+                            subTracks: sub.tracks,
                             hasSub: true
                         });
                     } else {
-                        merged.push({ ...s, hasSub: false });
+                        merged.push({ ...s, subTracks: null, hasSub: false });
                     }
                 });
 
@@ -693,25 +715,41 @@ const INDEX_HTML: &str = concat!(
 
                 const isPlaying = (name) => activePeerConnections.has(name);
 
+                function fmtTracks(tracks) {
+                    // Collapse multiple tracks of the same kind into codec strings:
+                    // video codec + audio codec -> "H265|PCMA"
+                    let video = [], audio = [];
+                    tracks.forEach(t => {
+                        const codec = (t.codec || '').replace(/\/\d+$/, '');
+                        if (t.kind === 'video') video.push(codec);
+                        else if (t.kind === 'audio') audio.push(codec);
+                    });
+                    const parts = [];
+                    if (video.length) parts.push(video.join('/'));
+                    if (audio.length) parts.push(audio.join('/'));
+                    return parts.join('|') || 'on-demand';
+                }
+
+                function metaHtml(s) {
+                    return `<span>👥 ${s.consumers}</span> <span>📦 ${s.packets_recv}</span> <span>💾 ${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</span>`;
+                }
+
                 // If already initialized cards, only update dynamic numbers and
                 // the LIVE/IDLE badge (driven by active playback, not producers).
                 if (container.querySelectorAll('.card').length === streams.length) {
                     streams.forEach(s => {
                         const metaEl = document.getElementById(`meta-${s.name}`);
-                        if (metaEl) {
-                            metaEl.innerHTML = `
-                                <div>Consumers: <b>${s.consumers}</b></div>
-                                <div>Packets: <b>${s.packets_recv}</b> | Bytes: <b>${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</b></div>
-                            `;
-                        }
+                        if (metaEl) metaEl.innerHTML = metaHtml(s);
                         setLiveBadge(s.name, isPlaying(s.name));
                     });
                     return;
                 }
 
                 container.innerHTML = streams.map(s => {
-                    const tracksHtml = s.tracks.map(t => `<span class="badge">${t.kind}: ${t.codec}</span>`).join(' ');
-                    const subBadge = s.hasSub ? '<span class="badge" style="background:#1f6feb">main+sub</span>' : '';
+                    const mainTracks = fmtTracks(s.tracks);
+                    const subTracks = s.subTracks ? fmtTracks(s.subTracks) : '';
+                    const tracksHtml = `<span class="badge">${mainTracks}</span>` +
+                        (subTracks ? ` <span class="badge" style="background:#1f6feb">sub: ${subTracks}</span>` : '');
                     const playing = isPlaying(s.name);
                     return `
                     <div class="card" id="card-${s.name}">
@@ -726,17 +764,16 @@ const INDEX_HTML: &str = concat!(
                             </div>
                         </div>
                         <div class="card-body">
-                            <div>${tracksHtml || '<span class="badge">on-demand</span>'} ${subBadge}</div>
-                            <div class="meta" id="meta-${s.name}">
-                                <div>Consumers: <b>${s.consumers}</b></div>
-                                <div>Packets: <b>${s.packets_recv}</b> | Bytes: <b>${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</b></div>
-                            </div>
-                            <div class="card-menu">
-                                <button class="card-menu-btn" onclick="toggleMenu('${s.name}', event)" title="More">⋮</button>
-                                <div class="card-menu-panel" id="menu-${s.name}">
-                                    <a href="/api/stream.mjpeg?src=${encodeURIComponent(s.name)}" target="_blank">MJPEG</a>
-                                    <a href="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" target="_blank">Snapshot</a>
-                                    <a href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP</a>
+                            <div class="card-meta-row">
+                                <div>${tracksHtml || '<span class="badge">on-demand</span>'}</div>
+                                <div class="meta" id="meta-${s.name}">${metaHtml(s)}</div>
+                                <div class="card-menu">
+                                    <button class="card-menu-btn" onclick="toggleMenu('${s.name}', event)" title="More">⋮</button>
+                                    <div class="card-menu-panel" id="menu-${s.name}">
+                                        <a href="/api/stream.mjpeg?src=${encodeURIComponent(s.name)}" target="_blank">MJPEG</a>
+                                        <a href="/api/frame.jpeg?src=${encodeURIComponent(s.name)}" target="_blank">Snapshot</a>
+                                        <a href="rtsp://${window.location.hostname}:8554/${s.name}">RTSP</a>
+                                    </div>
                                 </div>
                             </div>
                         </div>
