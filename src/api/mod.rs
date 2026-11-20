@@ -154,8 +154,15 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index_handler() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header("Pragma", "no-cache")
+        .header("Expires", "0")
+        .body(axum::body::Body::from(INDEX_HTML))
+        .unwrap()
 }
 
 const INDEX_HTML: &str = concat!(
