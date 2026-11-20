@@ -747,9 +747,10 @@ const INDEX_HTML: &str = concat!(
 
                 container.innerHTML = streams.map(s => {
                     const mainTracks = fmtTracks(s.tracks);
-                    const subTracks = s.subTracks ? fmtTracks(s.subTracks) : '';
+                    const hasSubTracks = s.subTracks && s.subTracks.length > 0;
+                    const subTracks = hasSubTracks ? fmtTracks(s.subTracks) : '';
                     const tracksHtml = `<span class="badge">${mainTracks}</span>` +
-                        (subTracks ? ` <span class="badge" style="background:#1f6feb">sub: ${subTracks}</span>` : '');
+                        (hasSubTracks ? ` <span class="badge" style="background:#1f6feb">sub: ${subTracks}</span>` : '');
                     const playing = isPlaying(s.name);
                     return `
                     <div class="card" id="card-${s.name}">
