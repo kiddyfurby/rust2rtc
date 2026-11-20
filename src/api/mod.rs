@@ -365,17 +365,10 @@ const INDEX_HTML: &str = concat!(
             border-right: 1px solid var(--border);
             display: inline-flex;
             align-items: center;
-            gap: 4px;
             white-space: nowrap;
         }
         .seg:last-child {
             border-right: none;
-        }
-        .seg svg {
-            width: 11px;
-            height: 11px;
-            fill: #8b949e;
-            flex: none;
         }
         .seg.sub {
             background: #1f6feb;
@@ -758,9 +751,6 @@ const INDEX_HTML: &str = concat!(
 
                 const isPlaying = (name) => activePeerConnections.has(name);
 
-                const ICON_VIDEO = '<svg viewBox="0 0 24 24"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>';
-                const ICON_AUDIO = '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
-
                 function trackSegments(tracks) {
                     // [{kind: 'video'|'audio', codec: 'H265'}]
                     const segs = [];
@@ -773,8 +763,7 @@ const INDEX_HTML: &str = concat!(
                 }
 
                 function segHtml(kind, codec) {
-                    const icon = kind === 'video' ? ICON_VIDEO : kind === 'audio' ? ICON_AUDIO : '';
-                    return `<span class="seg ${kind}" title="${kind}">${icon}${codec}</span>`;
+                    return `<span class="seg ${kind}" title="${kind}">${codec}</span>`;
                 }
 
                 function tracksHtml(s) {
@@ -792,16 +781,44 @@ const INDEX_HTML: &str = concat!(
                     return html;
                 }
 
-                function metaHtml(s) {
-                    return `<span title="Consumers">👥 ${s.consumers}</span> <span title="Packets received">📦 ${s.packets_recv}</span> <span title="Bytes received">💾 ${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</span>`;
+                function metaHtml(s, bitrate) {
+                    const bytesTitle = bitrate != null
+                        ? `Bytes received — ${fmtBitrate(bitrate)}`
+                        : 'Bytes received';
+                    return `<span title="Number of consumers">👥 ${s.consumers}</span> <span title="Packets received">📦 ${s.packets_recv}</span> <span title="${bytesTitle}">💾 ${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</span>`;
+                }
+
+                // Client-side bitrate: delta of received bytes between polls.
+                const prevStats = new Map(); // name -> { bytes, ts }
+
+                function updateRate(s) {
+                    const prev = prevStats.get(s.name);
+                    const now = Date.now();
+                    let bitrate = null;
+                    if (prev) {
+                        const dt = (now - prev.ts) / 1000;
+                        if (dt >= 0.5) {
+                            const db = s.bytes_recv - prev.bytes;
+                            if (db >= 0) bitrate = db * 8 / dt; // bits/sec
+                        }
+                    }
+                    prevStats.set(s.name, { bytes: s.bytes_recv, ts: now });
+                    return bitrate;
+                }
+
+                function fmtBitrate(bps) {
+                    if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' Mbps';
+                    if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' kbps';
+                    return bps.toFixed(0) + ' bps';
                 }
 
                 // If already initialized cards, only update dynamic numbers,
                 // tracks, and the LIVE/IDLE badge (driven by active playback).
                 if (container.querySelectorAll('.card').length === streams.length) {
                     streams.forEach(s => {
+                        const bitrate = updateRate(s);
                         const metaEl = document.getElementById(`meta-${s.name}`);
-                        if (metaEl) metaEl.innerHTML = metaHtml(s);
+                        if (metaEl) metaEl.innerHTML = metaHtml(s, bitrate);
                         const tracksEl = document.getElementById(`tracks-${s.name}`);
                         if (tracksEl) tracksEl.innerHTML = tracksHtml(s);
                         setLiveBadge(s.name, isPlaying(s.name));
@@ -810,6 +827,7 @@ const INDEX_HTML: &str = concat!(
                 }
 
                 container.innerHTML = streams.map(s => {
+                    updateRate(s); // seed rate tracking before first refresh
                     const playing = isPlaying(s.name);
                     return `
                     <div class="card" id="card-${s.name}">
