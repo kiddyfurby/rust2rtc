@@ -751,13 +751,21 @@ const INDEX_HTML: &str = concat!(
 
                 const isPlaying = (name) => activePeerConnections.has(name);
 
+                const CODEC_LABELS = {
+                    'MPEG4-GENERIC': 'm4a',
+                    'MP4A-LATM': 'm4a',
+                };
+
                 function trackSegments(tracks) {
                     // [{kind: 'video'|'audio', codec: 'H265'}]
                     const segs = [];
                     tracks.forEach(t => {
-                        const codec = (t.codec || '').replace(/\/\d+$/, '');
+                        let codec = (t.codec || '').replace(/\/\d+$/, '');
                         const kind = (t.kind || '').toLowerCase();
-                        if (codec && (kind === 'video' || kind === 'audio')) segs.push({ kind, codec });
+                        if (codec && (kind === 'video' || kind === 'audio')) {
+                            const label = CODEC_LABELS[codec.toUpperCase()];
+                            segs.push({ kind, codec: label || codec });
+                        }
                     });
                     return segs;
                 }
