@@ -308,22 +308,32 @@ impl Track {
             let mut gop = self.gop_cache.write().unwrap();
             let pkt_len = packet.raw.len();
             if is_keyframe {
-                gop.packets.clear();
-                gop.bytes = 0;
-                let ps = self.param_sets.read().unwrap();
-                for ps_pkt in &ps.rtp_packets {
-                    // Align the param-set RTP timestamp with the keyframe. The cached
-                    // STAP-A keeps the timestamp from whenever the SPS/PPS first arrived
-                    // (possibly minutes ago); replaying it unchanged in front of a current
-                    // keyframe makes consumers see a huge RTP timestamp jump, which
-                    // ffmpeg-based consumers "fix" by duplicating frames to fill the gap.
-                    let pkt = align_param_set_timestamp(ps_pkt, packet.timestamp);
-                    gop.bytes += pkt.raw.len();
-                    gop.packets.push(pkt);
+                // A keyframe may be split across multiple RTP packets (multi-slice
+                // IDR, each slice as its own type-5 NAL, or FU-A fragments). All
+                // packets of the same access unit share an RTP timestamp, so only
+                // clear the cache on the first keyframe packet of a new access
+                // unit — otherwise each subsequent slice would wipe the earlier
+                // slices and the cached GOP replay would only contain the last
+                // slice, leaving the rest of the frame green for new consumers.
+                let is_new_access_unit = gop.keyframe_ts != Some(packet.timestamp);
+                if is_new_access_unit {
+                    gop.packets.clear();
+                    gop.bytes = 0;
+                    let ps = self.param_sets.read().unwrap();
+                    for ps_pkt in &ps.rtp_packets {
+                        // Align the param-set RTP timestamp with the keyframe. The cached
+                        // STAP-A keeps the timestamp from whenever the SPS/PPS first arrived
+                        // (possibly minutes ago); replaying it unchanged in front of a current
+                        // keyframe makes consumers see a huge RTP timestamp jump, which
+                        // ffmpeg-based consumers "fix" by duplicating frames to fill the gap.
+                        let pkt = align_param_set_timestamp(ps_pkt, packet.timestamp);
+                        gop.bytes += pkt.raw.len();
+                        gop.packets.push(pkt);
+                    }
+                    gop.keyframe_ts = Some(packet.timestamp);
                 }
                 gop.bytes += pkt_len;
                 gop.packets.push(packet.clone());
-                gop.keyframe_ts = Some(packet.timestamp);
                 gop.keyframe_end = gop.packets.len();
             } else if !gop.packets.is_empty() {
                 if gop.packets.len() < Self::MAX_GOP_PACKETS && gop.bytes + pkt_len <= Self::MAX_GOP_BYTES {
@@ -879,6 +889,61 @@ mod tests {
         let aligned = track.get_param_sets_aligned(12000);
         assert_eq!(aligned.len(), 1);
         assert_eq!(aligned[0].timestamp, 12000);
+    }
+
+    #[test]
+    fn test_track_gop_multi_slice_keyframe_keeps_all_slices() {
+        // Regression: cameras that encode a keyframe as multiple IDR slices
+        // (each slice a separate type-5 NAL with the same RTP timestamp) must
+        // keep *all* slices in the GOP cache. The old logic cleared the cache
+        // on every type-5 packet, leaving only the last slice — new WebRTC
+        // consumers replayed a truncated keyframe and saw green macroblocks.
+        let codec = Codec::new_h264();
+        let track = Track::new(codec, MediaKind::Video, 100);
+
+        // Pre-cache SPS / PPS
+        let sps_payload = vec![0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01, 0xed];
+        track.send(RtpPacket::create(96, 1, 1000, 0x1234, false, &sps_payload));
+        let pps_payload = vec![0x68, 0xce, 0x38, 0x80];
+        track.send(RtpPacket::create(96, 2, 1000, 0x1234, false, &pps_payload));
+
+        // Multi-slice IDR: three type-5 NALs, all timestamp 5000,
+        // marker only on the last slice.
+        let slice1 = vec![0x65, 0x88, 0x84, 0x00, 0x01];
+        let slice2 = vec![0x65, 0x88, 0x84, 0x00, 0x02];
+        let slice3 = vec![0x65, 0x88, 0x84, 0x00, 0x03];
+        track.send(RtpPacket::create(96, 3, 5000, 0x1234, false, &slice1));
+        track.send(RtpPacket::create(96, 4, 5000, 0x1234, false, &slice2));
+        track.send(RtpPacket::create(96, 5, 5000, 0x1234, true, &slice3));
+
+        // A trailing P-frame in the same access unit's GOP
+        let p1 = vec![0x41, 0x9a, 0x12, 0x34];
+        track.send(RtpPacket::create(96, 6, 8000, 0x1234, true, &p1));
+
+        let gop = track.get_gop_packets();
+        // STAP-A + 3 IDR slices + P1 = 5 packets
+        assert_eq!(gop.len(), 5, "all IDR slices must survive in the GOP cache");
+        // First packet is the aligned STAP-A
+        assert_eq!(gop[0].timestamp, 5000);
+        // The three slices follow, in order
+        assert_eq!(gop[1].payload()[4], 0x01);
+        assert_eq!(gop[2].payload()[4], 0x02);
+        assert_eq!(gop[3].payload()[4], 0x03);
+        // P-frame last
+        assert_eq!(gop[4].payload()[0] & 0x1F, 1);
+
+        // keyframe_packets must return only the keyframe portion (STAP-A + 3 slices)
+        let kf = track.get_keyframe_packets();
+        assert_eq!(kf.len(), 4);
+        assert_eq!(kf[3].payload()[4], 0x03);
+
+        // A new keyframe at a different timestamp must reset the cache
+        let idr2 = vec![0x65, 0x88, 0x84, 0x00, 0xFF];
+        track.send(RtpPacket::create(96, 7, 12000, 0x1234, true, &idr2));
+        let gop2 = track.get_gop_packets();
+        assert_eq!(gop2.len(), 2, "new access unit clears the old GOP");
+        assert_eq!(gop2[0].timestamp, 12000);
+        assert_eq!(gop2[1].payload()[4], 0xFF);
     }
 
     #[test]
