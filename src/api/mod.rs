@@ -346,6 +346,42 @@ const INDEX_HTML: &str = concat!(
         .card-meta-row .card-menu {
             margin-left: auto;
         }
+        .seg-group {
+            display: inline-flex;
+            align-items: stretch;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            overflow: hidden;
+            vertical-align: middle;
+            margin-right: 6px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        }
+        .seg {
+            padding: 2px 8px;
+            font-size: 11px;
+            line-height: 1.6;
+            background: #21262d;
+            color: var(--text);
+            border-right: 1px solid var(--border);
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            white-space: nowrap;
+        }
+        .seg:last-child {
+            border-right: none;
+        }
+        .seg svg {
+            width: 11px;
+            height: 11px;
+            fill: #8b949e;
+            flex: none;
+        }
+        .seg.sub {
+            background: #1f6feb;
+            color: #fff;
+            border-right-color: rgba(255, 255, 255, 0.25);
+        }
         .card-menu-panel {
             display: none;
             position: absolute;
@@ -722,28 +758,38 @@ const INDEX_HTML: &str = concat!(
 
                 const isPlaying = (name) => activePeerConnections.has(name);
 
-                function fmtTracks(tracks) {
-                    // Collapse multiple tracks of the same kind into codec strings:
-                    // video codec + audio codec -> "H265|PCMA"
-                    let video = [], audio = [];
+                const ICON_VIDEO = '<svg viewBox="0 0 24 24"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>';
+                const ICON_AUDIO = '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>';
+
+                function trackSegments(tracks) {
+                    // [{kind: 'video'|'audio', codec: 'H265'}]
+                    const segs = [];
                     tracks.forEach(t => {
                         const codec = (t.codec || '').replace(/\/\d+$/, '');
                         const kind = (t.kind || '').toLowerCase();
-                        if (kind === 'video') video.push(codec);
-                        else if (kind === 'audio') audio.push(codec);
+                        if (codec && (kind === 'video' || kind === 'audio')) segs.push({ kind, codec });
                     });
-                    const parts = [];
-                    if (video.length) parts.push(video.join('/'));
-                    if (audio.length) parts.push(audio.join('/'));
-                    return parts.join('|') || 'on-demand';
+                    return segs;
+                }
+
+                function segHtml(kind, codec) {
+                    const icon = kind === 'video' ? ICON_VIDEO : kind === 'audio' ? ICON_AUDIO : '';
+                    return `<span class="seg ${kind}" title="${kind}">${icon}${codec}</span>`;
                 }
 
                 function tracksHtml(s) {
-                    const mainTracks = fmtTracks(s.tracks);
-                    const hasSubTracks = s.subTracks && s.subTracks.length > 0;
-                    const subTracks = hasSubTracks ? fmtTracks(s.subTracks) : '';
-                    return `<span class="badge">${mainTracks}</span>` +
-                        (hasSubTracks ? ` <span class="badge" style="background:#1f6feb">sub: ${subTracks}</span>` : '');
+                    const mainSegs = trackSegments(s.tracks);
+                    const subSegs = s.subTracks && s.subTracks.length > 0 ? trackSegments(s.subTracks) : [];
+                    let html = '';
+                    if (mainSegs.length) {
+                        html += `<span class="seg-group">${mainSegs.map(t => segHtml(t.kind, t.codec)).join('')}</span>`;
+                    } else {
+                        html += '<span class="badge">on-demand</span>';
+                    }
+                    if (subSegs.length) {
+                        html += `<span class="seg-group sub-group"><span class="seg sub" title="Substream">sub</span>${subSegs.map(t => segHtml(t.kind, t.codec)).join('')}</span>`;
+                    }
+                    return html;
                 }
 
                 function metaHtml(s) {
