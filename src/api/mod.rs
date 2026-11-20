@@ -65,6 +65,7 @@ pub struct AppState {
     pub sip: Arc<crate::sip::SipManager>,
     pub record: Arc<crate::record::RecordManager>,
     pub rtsp_port: u16,
+    pub api_listen: String,
     pub snapshots: Arc<SnapshotManager>,
 }
 
@@ -224,6 +225,40 @@ const INDEX_HTML: &str = concat!(
             padding: 16px;
             flex: 1;
         }
+        .netinfo {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 20px;
+            font-size: 13px;
+        }
+        .netinfo-summary {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+            user-select: none;
+        }
+        .netinfo-summary .arrow {
+            transition: transform 0.2s;
+            color: #8b949e;
+        }
+        .netinfo-summary .arrow.open { transform: rotate(180deg); }
+        .netinfo-details {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
+            display: none;
+            grid-template-columns: auto 1fr;
+            gap: 4px 16px;
+            font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+        }
+        .netinfo-details.open { display: grid; }
+        .netinfo-details .label { color: #8b949e; }
+        .netinfo-details .value { color: var(--text); }
+        .netinfo-details .value.good { color: var(--green); }
+        .netinfo-details .value.warn { color: #d29922; }
         .preview {
             width: 100%;
             height: 200px;
@@ -307,6 +342,22 @@ const INDEX_HTML: &str = concat!(
         </div>
         <div id="status" class="tag">Active</div>
     </header>
+
+    <div class="netinfo" id="netinfo">
+        <div class="netinfo-summary" onclick="toggleNetInfo()">
+            <span>🌐 <b>Network & Transport</b></span>
+            <span class="arrow" id="netinfo-arrow">▾</span>
+        </div>
+        <div class="netinfo-details" id="netinfo-details">
+            <span class="label">API listening on</span><span class="value" id="ni-api">—</span>
+            <span class="label">RTSP listening on</span><span class="value" id="ni-rtsp">—</span>
+            <span class="label">WebRTC engine</span><span class="value" id="ni-engine">—</span>
+            <span class="label">WebRTC transport</span><span class="value" id="ni-transport">—</span>
+            <span class="label">WebRTC bind IPs</span><span class="value" id="ni-bind">—</span>
+            <span class="label">ICE candidates</span><span class="value" id="ni-candidates">—</span>
+            <span class="label">Active WebRTC peers</span><span class="value" id="ni-peers">—</span>
+        </div>
+    </div>
 
     <div id="streams" class="stream-grid">Loading streams...</div>
 
@@ -435,6 +486,41 @@ const INDEX_HTML: &str = concat!(
             }
         }
 
+        function toggleNetInfo() {
+            const details = document.getElementById('netinfo-details');
+            const arrow = document.getElementById('netinfo-arrow');
+            details.classList.toggle('open');
+            arrow.classList.toggle('open');
+            if (details.classList.contains('open')) loadNetInfo();
+        }
+
+        async function loadNetInfo() {
+            try {
+                const res = await fetch('/api');
+                const info = await res.json();
+                const get = (id, val, cls) => {
+                    const el = document.getElementById(id);
+                    if (el) { el.textContent = val; el.className = 'value' + (cls ? ' ' + cls : ''); }
+                };
+                const listen = info.listen || {};
+                const webrtc = info.webrtc || {};
+                get('ni-api', listen.api || '—');
+                get('ni-rtsp', listen.rtsp || '—');
+                get('ni-engine', webrtc.engine || '—');
+                get('ni-transport', webrtc.transport || '—', 'good');
+                const bind = Array.isArray(listen.webrtc_bind_ips) && listen.webrtc_bind_ips.length
+                    ? listen.webrtc_bind_ips.join(', ') : '(all interfaces)';
+                get('ni-bind', bind);
+                const cands = Array.isArray(webrtc.candidates) && webrtc.candidates.length
+                    ? webrtc.candidates.join(', ') : '(none)';
+                get('ni-candidates', cands);
+                const peers = webrtc.active_peer_connections;
+                get('ni-peers', peers != null ? String(peers) : '—', peers > 0 ? 'good' : '');
+            } catch (e) {
+                console.warn('Failed to load network info:', e);
+            }
+        }
+
         async function loadStreams() {
             try {
                 const res = await fetch('/api/streams');
@@ -512,19 +598,35 @@ const INDEX_HTML: &str = concat!(
             }
         }
         loadStreams();
+        loadNetInfo();
         setInterval(loadStreams, 3000);
+        setInterval(loadNetInfo, 5000);
     </script>
 </body>
 </html>"#
 );
 
 async fn api_info_handler(State(state): State<AppState>) -> Response {
+    let sessions = state.webrtc.sessions.read().await;
+    let active_peers = sessions.len();
+    drop(sessions);
     let resp = serde_json::json!({
         "version": "1.9.14",
         "revision": concat!("rust2rtc-", env!("CARGO_PKG_VERSION")),
         "rust2rtc_version": env!("CARGO_PKG_VERSION"),
         "commit": env!("GIT_HASH"),
         "host": "127.0.0.1:1984",
+        "listen": {
+            "api": state.api_listen,
+            "rtsp": format!(":{}", state.rtsp_port),
+            "webrtc_bind_ips": state.webrtc.bind_ips(),
+        },
+        "webrtc": {
+            "engine": state.webrtc.engine,
+            "transport": "UDP/TLS/RTP/SAVPF (DTLS-SRTP, rtcp-mux)",
+            "candidates": state.webrtc.candidates(),
+            "active_peer_connections": active_peers,
+        },
         "rtsp": {
             "listen": format!(":{}", state.rtsp_port),
             "default_query": "video&audio"

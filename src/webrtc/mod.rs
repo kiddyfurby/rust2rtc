@@ -53,6 +53,13 @@ pub struct WebRtcManager {
 }
 
 impl WebRtcManager {
+    pub fn candidates(&self) -> &[String] {
+        &self.candidates
+    }
+
+    pub fn bind_ips(&self) -> &[IpAddr] {
+        &self.bind_ips
+    }
     #[allow(dead_code)]
     pub fn new(candidates: Vec<String>, rtsp_port: u16, ffmpeg_bin: String, engine: String) -> Self {
         Self::with_max_payload_size(candidates, Vec::new(), rtsp_port, ffmpeg_bin, engine, 1200)

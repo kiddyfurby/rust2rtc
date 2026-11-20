@@ -500,6 +500,7 @@ async fn async_main(config: Config) -> Result<()> {
         sip: Arc::clone(&sip_manager),
         record: record_manager,
         rtsp_port,
+        api_listen: api_listen.clone(),
         snapshots: Arc::new(api::SnapshotManager::new()),
     };
 
