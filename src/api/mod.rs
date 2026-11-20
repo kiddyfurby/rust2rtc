@@ -681,7 +681,7 @@ const INDEX_HTML: &str = concat!(
                     const medias = (s.producers && s.producers[0] && s.producers[0].medias) || [];
                     const tracks = medias.map(m => {
                         const parts = m.split(',').map(p => p.trim());
-                        return { kind: parts[0] || 'video', codec: parts[2] || parts[1] || '' };
+                        return { kind: (parts[0] || 'video').toLowerCase(), codec: parts[2] || parts[1] || '' };
                     });
                     return { name, consumers: totalConsumers, bytes_recv: recvBytes, packets_recv: recvPackets, tracks };
                 });
@@ -728,8 +728,9 @@ const INDEX_HTML: &str = concat!(
                     let video = [], audio = [];
                     tracks.forEach(t => {
                         const codec = (t.codec || '').replace(/\/\d+$/, '');
-                        if (t.kind === 'video') video.push(codec);
-                        else if (t.kind === 'audio') audio.push(codec);
+                        const kind = (t.kind || '').toLowerCase();
+                        if (kind === 'video') video.push(codec);
+                        else if (kind === 'audio') audio.push(codec);
                     });
                     const parts = [];
                     if (video.length) parts.push(video.join('/'));
@@ -737,27 +738,32 @@ const INDEX_HTML: &str = concat!(
                     return parts.join('|') || 'on-demand';
                 }
 
+                function tracksHtml(s) {
+                    const mainTracks = fmtTracks(s.tracks);
+                    const hasSubTracks = s.subTracks && s.subTracks.length > 0;
+                    const subTracks = hasSubTracks ? fmtTracks(s.subTracks) : '';
+                    return `<span class="badge">${mainTracks}</span>` +
+                        (hasSubTracks ? ` <span class="badge" style="background:#1f6feb">sub: ${subTracks}</span>` : '');
+                }
+
                 function metaHtml(s) {
                     return `<span title="Consumers">👥 ${s.consumers}</span> <span title="Packets received">📦 ${s.packets_recv}</span> <span title="Bytes received">💾 ${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</span>`;
                 }
 
-                // If already initialized cards, only update dynamic numbers and
-                // the LIVE/IDLE badge (driven by active playback, not producers).
+                // If already initialized cards, only update dynamic numbers,
+                // tracks, and the LIVE/IDLE badge (driven by active playback).
                 if (container.querySelectorAll('.card').length === streams.length) {
                     streams.forEach(s => {
                         const metaEl = document.getElementById(`meta-${s.name}`);
                         if (metaEl) metaEl.innerHTML = metaHtml(s);
+                        const tracksEl = document.getElementById(`tracks-${s.name}`);
+                        if (tracksEl) tracksEl.innerHTML = tracksHtml(s);
                         setLiveBadge(s.name, isPlaying(s.name));
                     });
                     return;
                 }
 
                 container.innerHTML = streams.map(s => {
-                    const mainTracks = fmtTracks(s.tracks);
-                    const hasSubTracks = s.subTracks && s.subTracks.length > 0;
-                    const subTracks = hasSubTracks ? fmtTracks(s.subTracks) : '';
-                    const tracksHtml = `<span class="badge">${mainTracks}</span>` +
-                        (hasSubTracks ? ` <span class="badge" style="background:#1f6feb">sub: ${subTracks}</span>` : '');
                     const playing = isPlaying(s.name);
                     return `
                     <div class="card" id="card-${s.name}">
@@ -773,7 +779,7 @@ const INDEX_HTML: &str = concat!(
                         </div>
                         <div class="card-body">
                             <div class="card-meta-row">
-                                <div>${tracksHtml || '<span class="badge">on-demand</span>'}</div>
+                                <div id="tracks-${s.name}">${tracksHtml(s)}</div>
                                 <div class="meta" id="meta-${s.name}">${metaHtml(s)}</div>
                                 <div class="card-menu">
                                     <button class="card-menu-btn" onclick="toggleMenu('${s.name}', event)" title="More">⋮</button>
