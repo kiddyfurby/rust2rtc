@@ -752,8 +752,8 @@ const INDEX_HTML: &str = concat!(
                 const isPlaying = (name) => activePeerConnections.has(name);
 
                 const CODEC_LABELS = {
-                    'MPEG4-GENERIC': 'm4a',
-                    'MP4A-LATM': 'm4a',
+                    'MPEG4-GENERIC': 'AAC',
+                    'MP4A-LATM': 'AAC',
                 };
 
                 function trackSegments(tracks) {
