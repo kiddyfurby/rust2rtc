@@ -731,7 +731,7 @@ const INDEX_HTML: &str = concat!(
                 }
 
                 function metaHtml(s) {
-                    return `<span>👥 ${s.consumers}</span> <span>📦 ${s.packets_recv}</span> <span>💾 ${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</span>`;
+                    return `<span title="Consumers">👥 ${s.consumers}</span> <span title="Packets received">📦 ${s.packets_recv}</span> <span title="Bytes received">💾 ${(s.bytes_recv / 1024 / 1024).toFixed(2)} MB</span>`;
                 }
 
                 // If already initialized cards, only update dynamic numbers and
